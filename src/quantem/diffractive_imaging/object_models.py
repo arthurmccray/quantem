@@ -15,6 +15,7 @@ from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.blocks import reset_weights
 from quantem.core.ml.loss_functions import get_loss_function
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.profiling import nvtx_range
 from quantem.core.utils.rng import RNGMixin
 from quantem.core.utils.validators import (
     validate_arr_gt,
@@ -1056,43 +1057,46 @@ class ObjectDIP(ObjectConstraints):
         apply_constraints: bool = False,
         show: bool = True,
         device: str | None = None,  # allow overwriting of device
+        profile: bool = False,
     ):
-        if device is not None:
-            self.to(device)
+        with nvtx_range(profile, "object model pretrain"):
+            if device is not None:
+                self.to(device)
 
-        if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
+            if optimizer_params is not None:
+                self.set_optimizer(optimizer_params)
 
-        if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_iters)
+            if scheduler_params is not None:
+                self.set_scheduler(scheduler_params, num_iters)
 
-        if reset:
-            self.model.apply(reset_weights)
-            self._pretrain_losses = []
-            self._pretrain_lrs = []
+            if reset:
+                self.model.apply(reset_weights)
+                self._pretrain_losses = []
+                self._pretrain_lrs = []
 
-        if model_input is not None:
-            self.model_input = model_input
-        if pretrain_target is not None:
-            if pretrain_target.shape[-3:] != self.model_input.shape[-3:]:
+            if model_input is not None:
+                self.model_input = model_input
+            if pretrain_target is not None:
+                if pretrain_target.shape[-3:] != self.model_input.shape[-3:]:
+                    raise ValueError(
+                        f"Model target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
+                    )
+                self.pretrain_target = pretrain_target.clone().detach().to(self.device)
+            elif self.pretrain_target.numel() == 0:
+                # self.pretrain_target = self.model_input.clone().detach().to(self.device)
                 raise ValueError(
-                    f"Model target shape {pretrain_target.shape} does not match model input shape {self.model_input.shape}"
+                    "No pretrain target set. Provide pretrain_target or set it beforehand."
                 )
-            self.pretrain_target = pretrain_target.clone().detach().to(self.device)
-        elif self.pretrain_target.numel() == 0:
-            # self.pretrain_target = self.model_input.clone().detach().to(self.device)
-            raise ValueError(
-                "No pretrain target set. Provide pretrain_target or set it beforehand."
-            )
 
-        loss_fn = get_loss_function(loss_fn, self.dtype)
-        self._pretrain(
-            num_iters=num_iters,
-            loss_fn=loss_fn,
-            apply_constraints=apply_constraints,
-            show=show,
-        )
-        self._set_pretrained_weights(self.model)
+            loss_fn = get_loss_function(loss_fn, self.dtype)
+            self._pretrain(
+                num_iters=num_iters,
+                loss_fn=loss_fn,
+                apply_constraints=apply_constraints,
+                show=show,
+                profile=profile,
+            )
+            self._set_pretrained_weights(self.model)
 
     def _pretrain(
         self,
@@ -1100,6 +1104,7 @@ class ObjectDIP(ObjectConstraints):
         loss_fn: Callable,
         apply_constraints: bool = False,
         show: bool = False,
+        profile: bool = False,
     ):
         """Pretrain the DIP model."""
         if self.pretrain_target is None:
@@ -1115,40 +1120,52 @@ class ObjectDIP(ObjectConstraints):
         output = self.obj
 
         for a0 in pbar:
-            if self._input_noise_std > 0.0:
-                noise = (
-                    torch.randn(
-                        self.model_input.shape,
-                        dtype=self.dtype,
-                        device=self.device,
-                        generator=self._rng_torch,
-                    )
-                    * self._input_noise_std
-                )
-                model_input = self.model_input + noise
-            else:
-                model_input = self.model_input
-
-            if apply_constraints:
-                output = self.apply_hard_constraints(self.model(model_input)[0])
-                if self.obj_type == "pure_phase":
-                    output = output.angle()
-            else:
-                output = self.model(model_input)[0]
-            loss: torch.Tensor = loss_fn(output, self.pretrain_target)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-            if scheduler is not None:
-                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    scheduler.step(loss.item())
+            with nvtx_range(profile, f"iter_{a0}"):
+                if self._input_noise_std > 0.0:
+                    with nvtx_range(profile, "input_noise"):
+                        noise = (
+                            torch.randn(
+                                self.model_input.shape,
+                                dtype=self.dtype,
+                                device=self.device,
+                                generator=self._rng_torch,
+                            )
+                            * self._input_noise_std
+                        )
+                    model_input = self.model_input + noise
                 else:
-                    scheduler.step()
+                    model_input = self.model_input
 
-            self._pretrain_losses.append(loss.item())
-            self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
-            pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
+                if apply_constraints:
+                    with nvtx_range(profile, "model foward with constraints"):
+                        output = self.apply_hard_constraints(self.model(model_input)[0])
+                        if self.obj_type == "pure_phase":
+                            output = output.angle()
+                else:
+                    with nvtx_range(profile, "model forward"):
+                        output = self.model(model_input)[0]
+
+                with nvtx_range(profile, "loss_fn"):
+                    loss: torch.Tensor = loss_fn(output, self.pretrain_target)
+
+                with nvtx_range(profile, "loss.backward"):
+                    loss.backward()
+                with nvtx_range(profile, "optimizer.step"):
+                    optimizer.step()
+                with nvtx_range(profile, "optimizer.zero_grad"):
+                    optimizer.zero_grad()
+
+                if scheduler is not None:
+                    with nvtx_range(profile, "scheduler.step"):
+                        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                            scheduler.step(loss.item())
+                        else:
+                            scheduler.step()
+
+                with nvtx_range(profile, "record_loss"):
+                    self._pretrain_losses.append(loss.item())
+                    self._pretrain_lrs.append(optimizer.param_groups[0]["lr"])
+                    pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {loss.item():.3e}, ")
 
         if show:
             self.visualize_pretrain(output)

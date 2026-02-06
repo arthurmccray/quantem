@@ -11,6 +11,7 @@ from tqdm.auto import tqdm
 
 from quantem.core import config
 from quantem.core.io.serialize import load as autoserialize_load
+from quantem.core.ml.profiling import nvtx_range
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
@@ -158,6 +159,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         loss_type: Literal[
             "l2_amplitude", "l1_amplitude", "l2_intensity", "l1_intensity", "poisson"
         ] = "l2_amplitude",
+        profile: bool = False,
     ) -> Self:
         """
         reason for having a single reconstruct() is so that updating things like constraints
@@ -167,6 +169,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         """
         # TODO maybe make an "process args" method that handles things like:
         # mode, store_iterations, device,
+        if profile:
+            print("Running with profiling enabled")
+
         self._check_preprocessed()
         if device is not None:
             self.to(device)
@@ -206,98 +211,133 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         pbar = tqdm(range(num_iters), disable=not self.verbose)
 
         for a0 in pbar:
-            consistency_loss = 0.0
-            total_loss = 0.0
-            self._reset_iter_constraints()
+            with nvtx_range(profile, f"iter_{a0}"):
+                consistency_loss = torch.tensor(0.0, device=self.device)
+                total_loss = torch.tensor(0.0, device=self.device)
+                self._reset_iter_constraints()
 
-            for batch_indices in batcher:
-                self.zero_grad_all()
-                patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
-                    self.dset.forward(batch_indices, self.obj_padding_px)
-                )
-                shifted_probes = self.probe_model.forward(positions_px_fractional)
-                obj_patches = self.obj_model.forward(patch_indices)
-                propagated_probes, overlap = self.forward_operator(
-                    obj_patches, shifted_probes, descan_shifts
-                )
-                pred_intensities = self.detector_model.forward(overlap)
+                for batch_idx, batch_indices in enumerate(batcher):
+                    with nvtx_range(profile, f"batch_{batch_idx}"):
+                        with nvtx_range(profile, "zero_grad"):
+                            self.zero_grad_all()
 
-                batch_consistency_loss, targets = self.error_estimate(
-                    pred_intensities,
-                    batch_indices,
-                    loss_type=loss_type,
-                )
+                        with nvtx_range(profile, "dset_forward"):
+                            (
+                                patch_indices,
+                                _positions_px,
+                                positions_px_fractional,
+                                descan_shifts,
+                            ) = self.dset.forward(batch_indices, self.obj_padding_px)
 
-                batch_soft_constraint_loss = self._soft_constraints()
-                batch_loss = batch_consistency_loss + batch_soft_constraint_loss
+                        with nvtx_range(profile, "probe_forward"):
+                            shifted_probes = self.probe_model.forward(positions_px_fractional)
 
-                self.backward(
-                    batch_loss,
-                    autograd,
-                    obj_patches,
-                    propagated_probes,
-                    overlap,
-                    patch_indices,
-                    targets,
-                )
-                self.step_optimizers()
-                consistency_loss += batch_consistency_loss.item()
-                total_loss += batch_loss.item()
+                        with nvtx_range(profile, "obj_forward"):
+                            obj_patches = self.obj_model.forward(patch_indices)
 
-            num_batches = len(batcher)
-            total_loss = total_loss / num_batches
-            consistency_loss = consistency_loss / num_batches
+                        with nvtx_range(profile, "ptycho forward_operator"):
+                            propagated_probes, overlap = self.forward_operator(
+                                obj_patches, shifted_probes, descan_shifts
+                            )
 
-            # Validation pass (no gradient, no optimizer steps)
-            val_loss = None
-            if batcher.has_validation:
-                val_consistency_loss = 0.0
-                val_batches = 0
-                with torch.no_grad():
-                    for batch_indices in batcher.iter_val():
-                        patch_indices, _positions_px, positions_px_fractional, descan_shifts = (
-                            self.dset.forward(batch_indices, self.obj_padding_px)
+                        with nvtx_range(profile, "detector_forward"):
+                            pred_intensities = self.detector_model.forward(overlap)
+
+                        with nvtx_range(profile, "error_estimate"):
+                            batch_consistency_loss, targets = self.error_estimate(
+                                pred_intensities,
+                                batch_indices,
+                                loss_type=loss_type,
+                            )
+
+                        with nvtx_range(profile, "soft_constraints"):
+                            batch_soft_constraint_loss = self._soft_constraints()
+                            batch_loss = batch_consistency_loss + batch_soft_constraint_loss
+
+                        # with nvtx_range(profile, "backward"):
+                        # range is in backward method
+                        self.backward(
+                            batch_loss,
+                            autograd,
+                            obj_patches,
+                            propagated_probes,
+                            overlap,
+                            patch_indices,
+                            targets,
+                            profile=profile,
                         )
-                        shifted_probes = self.probe_model.forward(positions_px_fractional)
-                        obj_patches = self.obj_model.forward(patch_indices)
-                        _propagated_probes, overlap = self.forward_operator(
-                            obj_patches, shifted_probes, descan_shifts
+
+                        with nvtx_range(profile, "optimizer_step"):
+                            self.step_optimizers()
+
+                        with nvtx_range(profile, "update_losses"):
+                            consistency_loss += batch_consistency_loss.detach()
+                            total_loss += batch_loss.detach()
+
+                num_batches = len(batcher)
+                with nvtx_range(profile, ".item for total loss"):
+                    total_loss = (total_loss / num_batches).item()
+                with nvtx_range(profile, ".item for consistency loss"):
+                    consistency_loss = (consistency_loss / num_batches).item()
+
+                # Validation pass (no gradient, no optimizer steps)
+                val_loss = None
+                if batcher.has_validation:
+                    with nvtx_range(profile, "validation"):
+                        val_consistency_loss = 0.0
+                        val_batches = 0
+                        with torch.no_grad():
+                            for batch_indices in batcher.iter_val():
+                                (
+                                    patch_indices,
+                                    _positions_px,
+                                    positions_px_fractional,
+                                    descan_shifts,
+                                ) = self.dset.forward(batch_indices, self.obj_padding_px)
+                                shifted_probes = self.probe_model.forward(positions_px_fractional)
+                                obj_patches = self.obj_model.forward(patch_indices)
+                                _propagated_probes, overlap = self.forward_operator(
+                                    obj_patches, shifted_probes, descan_shifts
+                                )
+                                pred_intensities = self.detector_model.forward(overlap)
+                                batch_val_loss, _ = self.error_estimate(
+                                    pred_intensities, batch_indices, loss_type=loss_type
+                                )
+                                val_consistency_loss += batch_val_loss.item()
+                                val_batches += 1
+                        if val_batches > 0:
+                            val_loss = val_consistency_loss / val_batches
+                            self._iter_val_losses.append(val_loss)
+
+                with nvtx_range(profile, "record_iter"):
+                    self._record_iter(total_loss)  # TODO record val loss as well
+
+                with nvtx_range(profile, "step_schedulers"):
+                    # Step schedulers with current loss
+                    self.step_schedulers(total_loss)
+
+                if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
+                    with nvtx_range(profile, "store_snapshot"):
+                        self._store_current_iter_snapshot()
+
+                if self.logger is not None:
+                    with nvtx_range(profile, "logger"):
+                        self.logger.log_iter(
+                            self.obj_model,
+                            self.probe_model,
+                            self.dset,
+                            self.num_iters - 1,
+                            consistency_loss,
+                            num_batches,
+                            self._get_current_lrs(),
                         )
-                        pred_intensities = self.detector_model.forward(overlap)
-                        batch_val_loss, _ = self.error_estimate(
-                            pred_intensities, batch_indices, loss_type=loss_type
-                        )
-                        val_consistency_loss += batch_val_loss.item()
-                        val_batches += 1
-                if val_batches > 0:
-                    val_loss = val_consistency_loss / val_batches
-                    self._iter_val_losses.append(val_loss)
 
-            self._record_iter(total_loss)  # TODO record val loss as well
-
-            # Step schedulers with current loss
-            self.step_schedulers(total_loss)
-
-            if self.store_snapshots and (a0 % self.store_snapshot_every) == 0:
-                self._store_current_iter_snapshot()
-
-            if self.logger is not None:
-                self.logger.log_iter(
-                    self.obj_model,
-                    self.probe_model,
-                    self.dset,
-                    self.num_iters - 1,
-                    consistency_loss,
-                    num_batches,
-                    self._get_current_lrs(),
-                )
-
-            if val_loss is not None:
-                pbar.set_description(
-                    f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
-                )
-            else:
-                pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
+                if val_loss is not None:
+                    pbar.set_description(
+                        f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}, Val: {val_loss:.3e}"
+                    )
+                else:
+                    pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -323,29 +363,36 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         overlap: torch.Tensor,
         patch_indices: torch.Tensor,
         amplitudes: torch.Tensor,
+        profile: bool = False,
     ):
         if autograd:
-            loss.backward()
+            with nvtx_range(profile, "loss.backward"):
+                loss.backward()
             # scaling pixelated ad gradients to closer match analytic
             if isinstance(self.obj_model, ObjectPixelated):
-                obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
-                self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
+                with nvtx_range(profile, "obj_grad_scale"):
+                    obj_grad_scale = self.dset.upsample_factor**2 / 2  # factor of 2 from l2 grad
+                    self.obj_model._obj.grad.mul_(obj_grad_scale)  # type:ignore
 
             if isinstance(self.probe_model, ProbeParametric):
-                probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
-                for par in self.probe_model.params:
-                    par.grad.mul_(probe_grad_scale)  # type:ignore
+                with nvtx_range(profile, "probe_grad_scale"):
+                    probe_grad_scale = np.sqrt(self.probe_model._mean_diffraction_intensity)
+                    for par in self.probe_model.params:
+                        par.grad.mul_(probe_grad_scale)  # type:ignore
 
         else:
-            gradient = self.gradient_step(amplitudes, overlap)
-            prop_gradient = self.obj_model.backward(
-                gradient,
-                obj_patches,
-                propagated_probes,
-                self._propagators,
-                patch_indices,
-            )
-            self.probe_model.backward(prop_gradient, obj_patches)
+            with nvtx_range(profile, "gradient step"):
+                gradient = self.gradient_step(amplitudes, overlap)
+            with nvtx_range(profile, "obj_model.backward"):
+                prop_gradient = self.obj_model.backward(
+                    gradient,
+                    obj_patches,
+                    propagated_probes,
+                    self._propagators,
+                    patch_indices,
+                )
+            with nvtx_range(profile, "probe_model.backward"):
+                self.probe_model.backward(prop_gradient, obj_patches)
 
     def gradient_step(self, amplitudes, overlap):
         """Computes analytical gradient using the Fourier projection modified overlap"""
