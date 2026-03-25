@@ -18,9 +18,9 @@ from quantem.core.visualization.custom_normalizations import CustomNormalization
 
 def array_to_rgba(
     scaled_amplitude: NDArray,
-    scaled_angle: Optional[NDArray] = None,
+    scaled_angle: NDArray | None = None,
     *,
-    cmap: Union[str, colors.Colormap] = "gray",
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1,
 ) -> NDArray:
     """Convert amplitude and angle arrays to an RGBA color array.

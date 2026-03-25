@@ -11,9 +11,11 @@ from quantem.core.datastructures import Dataset2d, Dataset3d, Dataset4d, Dataset
 from quantem.core.fitting.base import (
     AdditiveRenderModel,
     FitBase,
+    OptimizerUnitSpecDict,
     OriginND,
     RenderComponent,
     RenderContext,
+    SchedulerUnitSpecDict,
 )
 from quantem.core.fitting.diffraction import DiskTemplate, SyntheticDiskLattice
 from quantem.core.io.serialize import AutoSerialize
@@ -429,8 +431,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         *,
         n_steps: int = 200,
         reset: bool | Literal["initialized", "mean_refined"] = False,
-        optimizer_params: OptimizerType | dict | None = None,
-        scheduler_params: SchedulerType | dict | None = None,
+        optimizer_params: OptimizerType | dict[str, Any] | None = None,
+        optimizer_by_unit: OptimizerUnitSpecDict | None = None,
+        scheduler_params: SchedulerType | dict[str, Any] | None = None,
+        scheduler_by_unit: SchedulerUnitSpecDict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         progress: bool = True,
@@ -446,8 +450,12 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             Reset behavior before fitting.
         optimizer_params : dict | None, optional
             Optimizer override for this fit call.
+        optimizer_by_unit : dict | None, optional
+            Per-unit optimizer overrides; forwarded to :meth:`FitBase.fit_render`.
         scheduler_params : dict | None, optional
             Scheduler override for this fit call.
+        scheduler_by_unit : dict | None, optional
+            Per-unit scheduler overrides; forwarded to :meth:`FitBase.fit_render`.
         constraint_weight : float, optional
             Global multiplier for soft-constraint loss.
         constraint_params : dict[str, Any] | None, optional
@@ -489,7 +497,9 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             constraint_weight=float(constraint_weight),
             constraint_params=constraint_params,
             optimizer_params=optimizer_params,
+            optimizer_by_unit=optimizer_by_unit,
             scheduler_params=scheduler_params,
+            scheduler_by_unit=scheduler_by_unit,
             progress=bool(progress),
             run_key="mean",
         )

@@ -487,6 +487,9 @@ class SyntheticDiskLattice(RenderComponent):
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
 
+    def optimizer_child_modules(self) -> list[tuple[str, nn.Module]]:
+        return [("disk", self.disk)]
+
     def _enforce_positive_intensity_params(self) -> None:
         """
         Project base intensity parameter(s) to nonnegative values.

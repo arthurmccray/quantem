@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Literal, Self, Sequence, cast
 
@@ -12,8 +13,21 @@ from quantem.core.ml.optimizer_mixin import (
     OptimizerMixin,
     OptimizerParams,
     OptimizerType,
+    SchedulerParams,
     SchedulerType,
 )
+
+
+class _UnsetSentinel:
+    """Marks an optional kwarg as omitted (vs ``None`` or ``{}``)."""
+
+    __slots__ = ()
+
+
+UNSET = _UnsetSentinel()
+
+OptimizerUnitSpecDict = dict[str, OptimizerType | dict[str, Any]]
+SchedulerUnitSpecDict = dict[str, SchedulerType | dict[str, Any]]
 
 
 def parse_bounded_init(
@@ -275,6 +289,18 @@ class RenderComponent(nn.Module):
     ) -> torch.Tensor:
         return torch.zeros((), device=ctx.device, dtype=ctx.dtype)
 
+    def optimizer_child_modules(self) -> list[tuple[str, nn.Module]]:
+        """
+        Submodules that own a separate optimizer parameter partition.
+
+        Each entry is ``(sub_key, module)``; unit keys become
+        ``f"{component_key}/{sub_key}"`` when collecting units for an
+        :class:`AdditiveRenderModel`. The component's remaining trainable
+        parameters (not belonging to any listed child) form a final partition
+        under ``component_key`` alone.
+        """
+        return []
+
 
 class AdditiveRenderModel(nn.Module):
     def __init__(self, *, origin: nn.Module, components: list[RenderComponent]):
@@ -341,6 +367,185 @@ class AdditiveRenderModel(nn.Module):
         return loss
 
 
+def _trainable_parameters(module: nn.Module) -> list[nn.Parameter]:
+    return [p for p in module.parameters() if p.requires_grad]
+
+
+def collect_optimizer_units(
+    model: AdditiveRenderModel,
+) -> list[tuple[str, list[nn.Parameter]]]:
+    """
+    Partition trainable parameters into disjoint optimizer units.
+
+    Units are ordered: ``origin`` (if nonempty), then per component in
+    ``model.components`` — nested child modules first (see
+    :meth:`RenderComponent.optimizer_child_modules`), then a remainder unit for
+    trainable parameters of the component not owned by any listed child.
+    Component keys match :meth:`AdditiveRenderModel._component_constraint_name`.
+    Trainable tensors that also appear under ``model.origin`` are listed only in
+    the ``origin`` unit, even when the same module instance is referenced from a
+    nested component (e.g. shared :class:`OriginND` on a disk template).
+
+    If the same ``nn.Module`` instance is both a top-level component and a nested
+    child (e.g. :class:`DiskTemplate` listed in ``components`` and also exposed
+    via :meth:`SyntheticDiskLattice.optimizer_child_modules`), its parameters are
+    attributed only to the **first** matching unit (the top-level component key).
+    The redundant nested unit (e.g. ``lat0/disk``) is omitted so partitions stay
+    disjoint.
+
+    Raises
+    ------
+    ValueError
+        If child partitions overlap or duplicate ``sub_key`` names appear for one
+        component.
+    """
+    units: list[tuple[str, list[nn.Parameter]]] = []
+    assigned_globally: set[int] = set()
+    origin_params = _trainable_parameters(model.origin)
+    origin_param_ids = {id(p) for p in origin_params}
+    if origin_params:
+        units.append(("origin", origin_params))
+        for p in origin_params:
+            assigned_globally.add(id(p))
+
+    def _trainable_in_partition(module: nn.Module) -> list[nn.Parameter]:
+        """Trainable params for a non-origin unit (skip tensors owned by ``model.origin``)."""
+        return [
+            p for p in module.parameters() if p.requires_grad and id(p) not in origin_param_ids
+        ]
+
+    for idx, module in enumerate(model.components):
+        component = cast(RenderComponent, module)
+        base_key = model._component_constraint_name(component, idx)
+        children = component.optimizer_child_modules()
+        seen_sub_keys: set[str] = set()
+        claimed_ids: set[int] = set()
+        for sub_key, submod in children:
+            sk = str(sub_key)
+            if sk in seen_sub_keys:
+                raise ValueError(
+                    f"Duplicate optimizer_child_modules sub_key {sk!r} on "
+                    f"{component.__class__.__name__} ({base_key!r})."
+                )
+            seen_sub_keys.add(sk)
+            sub_params_full = _trainable_in_partition(submod)
+            if any(id(p) in claimed_ids for p in sub_params_full):
+                raise ValueError(
+                    f"Overlapping trainable parameters between optimizer child modules "
+                    f"on {component.__class__.__name__} ({base_key!r})."
+                )
+            for p in sub_params_full:
+                claimed_ids.add(id(p))
+            sub_params_new = [p for p in sub_params_full if id(p) not in assigned_globally]
+            if sub_params_new:
+                units.append((f"{base_key}/{sk}", sub_params_new))
+                for p in sub_params_new:
+                    assigned_globally.add(id(p))
+
+        remainder = [
+            p
+            for p in component.parameters()
+            if p.requires_grad
+            and id(p) not in claimed_ids
+            and id(p) not in origin_param_ids
+            and id(p) not in assigned_globally
+        ]
+        if remainder:
+            units.append((base_key, remainder))
+            for p in remainder:
+                assigned_globally.add(id(p))
+
+    seen_all: set[int] = set()
+    for key, params in units:
+        for p in params:
+            pid = id(p)
+            if pid in seen_all:
+                raise ValueError(f"Optimizer unit {key!r} repeats a parameter tensor.")
+            seen_all.add(pid)
+
+    return units
+
+
+def _parse_optimizer_spec(spec: OptimizerType | dict[str, Any]) -> OptimizerType:
+    if isinstance(spec, dict):
+        return OptimizerParams.parse_dict(dict(spec))
+    return spec
+
+
+def _torch_optimizer_single(
+    spec: OptimizerType, params: list[nn.Parameter]
+) -> torch.optim.Optimizer:
+    kw = spec.params()
+    match spec:
+        case OptimizerParams.Adam():
+            return torch.optim.Adam(params, **kw)
+        case OptimizerParams.AdamW():
+            return torch.optim.AdamW(params, **kw)
+        case OptimizerParams.SGD():
+            return torch.optim.SGD(params, **kw)
+        case OptimizerParams.NoneOptimizer():
+            raise ValueError("NoneOptimizer cannot build a torch optimizer.")
+        case _:
+            raise NotImplementedError(f"Unknown optimizer type: {spec!r}")
+
+
+def _torch_optimizer_merged(
+    spec0: OptimizerType, param_groups: list[dict[str, Any]]
+) -> torch.optim.Optimizer:
+    match spec0:
+        case OptimizerParams.Adam():
+            return torch.optim.Adam(param_groups)
+        case OptimizerParams.AdamW():
+            return torch.optim.AdamW(param_groups)
+        case OptimizerParams.SGD():
+            return torch.optim.SGD(param_groups)
+        case OptimizerParams.NoneOptimizer():
+            raise ValueError("NoneOptimizer cannot build a torch optimizer.")
+        case _:
+            raise NotImplementedError(f"Unknown optimizer type: {spec0!r}")
+
+
+def _parse_scheduler_spec(spec: SchedulerType | dict[str, Any]) -> SchedulerType:
+    if isinstance(spec, dict):
+        return SchedulerParams.parse_dict(dict(spec))
+    return spec
+
+
+def _scheduler_fingerprint(
+    spec: SchedulerType, num_iter: int | None
+) -> tuple[str, frozenset[tuple[str, Any]]]:
+    s = copy.deepcopy(spec)
+    if isinstance(s, SchedulerParams.NoneScheduler):
+        return "none", frozenset()
+    ctor_kw = s.params(1.0, num_iter=num_iter)
+    return s._name, frozenset(sorted(ctor_kw.items()))
+
+
+def _torch_scheduler_from_spec(
+    spec: SchedulerType,
+    optimizer: torch.optim.Optimizer,
+    num_iter: int | None,
+) -> torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+    s = copy.deepcopy(spec)
+    if isinstance(s, SchedulerParams.NoneScheduler):
+        return None
+    base_lr = float(optimizer.param_groups[0]["lr"])
+    ctor_kw = s.params(base_lr, num_iter=num_iter)
+    match s:
+        case SchedulerParams.Cyclic():
+            return torch.optim.lr_scheduler.CyclicLR(optimizer, **ctor_kw)
+        case SchedulerParams.Plateau():
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, **ctor_kw)
+        case SchedulerParams.Exponential():
+            return torch.optim.lr_scheduler.ExponentialLR(optimizer, **ctor_kw)
+        case SchedulerParams.Linear():
+            return torch.optim.lr_scheduler.LinearLR(optimizer, **ctor_kw)
+        case SchedulerParams.CosineAnnealing():
+            return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **ctor_kw)
+        case _:
+            raise ValueError(f"Unknown scheduler type: {s!r}")
+
+
 @dataclass
 class FitResult:
     losses: list[float]
@@ -367,10 +572,377 @@ class FitBase(OptimizerMixin):
         # Histories/results
         self.fit_history: dict[str, FitResult] = {}
 
-    def get_optimization_parameters(self) -> Any:
+        # Per-unit optimizer overrides (exact keys from collect_optimizer_units); None = broadcast only
+        self._fit_optimizer_by_unit: dict[str, OptimizerType] | None = None
+        self._render_optimizers: list[torch.optim.Optimizer] = []
+        self._optimizer_unit_keys: list[str] = []
+
+        self._fit_scheduler_by_unit: dict[str, SchedulerType] | None = None
+        self._render_schedulers: list[
+            torch.optim.lr_scheduler.LRScheduler
+            | torch.optim.lr_scheduler.ReduceLROnPlateau
+            | None
+        ] = []
+        self._fit_scheduler_last_num_iter: int | None = None
+
+    def get_optimization_parameters(self) -> list[nn.Parameter]:
         if self.model is None:
             return []
         return [p for p in self.model.parameters() if p.requires_grad]
+
+    def _nonempty_optimizer_unit_keys(self) -> set[str]:
+        if self.model is None:
+            return set()
+        return {k for k, ps in collect_optimizer_units(self.model) if ps}
+
+    def _resolve_unit_optimizer_spec(self, unit_key: str) -> OptimizerType:
+        if self._fit_optimizer_by_unit and unit_key in self._fit_optimizer_by_unit:
+            return self._fit_optimizer_by_unit[unit_key]
+        return self._optimizer_params
+
+    def _resolve_unit_scheduler_spec(self, unit_key: str) -> SchedulerType:
+        if self._fit_scheduler_by_unit and unit_key in self._fit_scheduler_by_unit:
+            return self._fit_scheduler_by_unit[unit_key]
+        return self._scheduler_params
+
+    def _build_render_optimizers(self) -> None:
+        """
+        Construct ``_render_optimizers`` from ``collect_optimizer_units`` and stored specs.
+
+        If every unit resolves to the same optimizer class, uses one ``torch.optim``
+        instance with one param group per unit (hyperparameters may differ per group).
+        If classes differ, uses one optimizer per unit (stable unit-key order) and
+        uses one LR scheduler per optimizer instance (see ``set_scheduler``).
+        """
+        self._render_schedulers = []
+        self._scheduler = None
+        self._render_optimizers = []
+        self._optimizer_unit_keys = []
+        self._optimizer = None
+
+        if self.model is None:
+            return
+
+        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+            return
+
+        units = [(k, ps) for k, ps in collect_optimizer_units(self.model) if ps]
+        if not units:
+            return
+
+        if self._fit_optimizer_by_unit:
+            unit_key_set = {k for k, _ in units}
+            stale = set(self._fit_optimizer_by_unit) - unit_key_set
+            if stale:
+                pruned = {
+                    k: v for k, v in self._fit_optimizer_by_unit.items() if k in unit_key_set
+                }
+                self._fit_optimizer_by_unit = pruned if pruned else None
+
+        specs = [self._resolve_unit_optimizer_spec(k) for k, _ in units]
+        for s in specs:
+            if isinstance(s, OptimizerParams.NoneOptimizer):
+                raise ValueError(
+                    "Per-unit or broadcast optimizer spec cannot be NoneOptimizer while training."
+                )
+
+        names = [s._name for s in specs]
+        homogeneous = len(set(names)) == 1
+
+        if homogeneous:
+            param_groups: list[dict[str, Any]] = []
+            for (_key, ps), spec in zip(units, specs):
+                g = dict(spec.params())
+                g["params"] = ps
+                param_groups.append(g)
+            merged = _torch_optimizer_merged(specs[0], param_groups)
+            self._optimizer = merged
+            self._render_optimizers = [merged]
+            self._optimizer_unit_keys = [k for k, _ in units]
+        else:
+            opts: list[torch.optim.Optimizer] = []
+            keys_out: list[str] = []
+            for (key, ps), spec in zip(units, specs):
+                opts.append(_torch_optimizer_single(spec, ps))
+                keys_out.append(key)
+            self._render_optimizers = opts
+            self._optimizer_unit_keys = keys_out
+            self._optimizer = opts[0]
+
+    def _build_render_schedulers(self, num_iter: int | None) -> None:
+        """
+        Build ``_render_schedulers`` aligned with ``_render_optimizers``.
+
+        With one torch optimizer (any number of param groups), PyTorch attaches one
+        LR scheduler to that optimizer; per-unit scheduler specs must then be
+        pairwise equivalent or a ``ValueError`` is raised. With multiple torch
+        optimizers, each instance gets its own scheduler from the matching unit's
+        resolved spec (``None`` scheduler allowed per unit).
+
+        Optimizer and scheduler internal state are reinitialized when this runs
+        (e.g. after trainability changes or ``reconnect_optimizer_to_parameters``).
+        """
+        self._render_schedulers = []
+        self._scheduler = None
+
+        if not self._render_optimizers or not self._optimizer_unit_keys:
+            return
+
+        if self._fit_scheduler_by_unit:
+            valid = set(self._optimizer_unit_keys)
+            stale = set(self._fit_scheduler_by_unit) - valid
+            if stale:
+                pruned = {k: v for k, v in self._fit_scheduler_by_unit.items() if k in valid}
+                self._fit_scheduler_by_unit = pruned if pruned else None
+
+        specs = [self._resolve_unit_scheduler_spec(k) for k in self._optimizer_unit_keys]
+
+        if (
+            isinstance(self._scheduler_params, SchedulerParams.NoneScheduler)
+            and not self._fit_scheduler_by_unit
+        ):
+            return
+
+        if len(self._render_optimizers) == 1:
+            fingerprints = [_scheduler_fingerprint(s, num_iter) for s in specs]
+            if len(set(fingerprints)) > 1:
+                raise ValueError(
+                    "With a single torch optimizer (multiple param groups), per-unit scheduler "
+                    "specs must be equivalent (same type and constructor kwargs after parsing, "
+                    "using a dummy base LR of 1.0). Use different optimizer classes per unit "
+                    "so each unit has its own optimizer and independent scheduler, or use a "
+                    "single broadcast scheduler."
+                )
+            opt = self._render_optimizers[0]
+            sch = _torch_scheduler_from_spec(specs[0], opt, num_iter)
+            if sch is not None:
+                self._render_schedulers = [sch]
+                self._scheduler = sch
+        else:
+            scheds: list[
+                torch.optim.lr_scheduler.LRScheduler
+                | torch.optim.lr_scheduler.ReduceLROnPlateau
+                | None
+            ] = []
+            for opt, spec in zip(self._render_optimizers, specs):
+                scheds.append(_torch_scheduler_from_spec(spec, opt, num_iter))
+            self._render_schedulers = scheds
+            self._scheduler = next((s for s in scheds if s is not None), None)
+
+    def set_optimizer(
+        self,
+        opt_params: OptimizerType | dict[str, Any] | None = None,
+        *,
+        optimizer_by_unit: OptimizerUnitSpecDict | None | _UnsetSentinel = UNSET,
+    ) -> None:
+        """
+        Configure the render optimizer(s) from broadcast and optional per-unit specs.
+
+        Parameters
+        ----------
+        opt_params
+            Broadcast defaults (parsed if dict). If omitted, previous broadcast is kept.
+        optimizer_by_unit
+            Optional mapping from unit keys (as returned by ``collect_optimizer_units``)
+            to optimizer specs; missing units use the broadcast spec. Pass ``{}`` to clear
+            per-unit overrides. When omitted entirely, previous per-unit overrides are
+            unchanged.
+
+        Notes
+        -----
+        **Single vs multiple torch optimizers:** if all units resolve to the same
+        optimizer class (Adam, AdamW, SGD), a single optimizer with one param group
+        per unit is used. If classes differ across units, one optimizer per unit is
+        created and stepped in unit-key order each iteration.
+
+        **Schedulers:** see ``set_scheduler`` for per-unit LR schedules when multiple
+        torch optimizers are active.
+        """
+        if optimizer_by_unit is not UNSET:
+            if optimizer_by_unit:
+                if not isinstance(optimizer_by_unit, dict):
+                    raise TypeError("optimizer_by_unit must be a dict or empty mapping.")
+                self._fit_optimizer_by_unit = {
+                    str(k): _parse_optimizer_spec(v) for k, v in optimizer_by_unit.items()
+                }
+            else:
+                self._fit_optimizer_by_unit = None
+
+        if opt_params is not None:
+            if isinstance(opt_params, dict):
+                opt_params = OptimizerParams.parse_dict(opt_params)
+            if not isinstance(opt_params, OptimizerType):
+                raise TypeError(
+                    f"optimizer parameters must be OptimizerType, got {type(opt_params)}"
+                )
+            self._optimizer_params = opt_params
+
+        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+            self.remove_optimizer()
+            return
+
+        if self.model is None:
+            self._optimizer = None
+            self._render_optimizers = []
+            self._optimizer_unit_keys = []
+            return
+
+        if self._fit_optimizer_by_unit:
+            invalid = set(self._fit_optimizer_by_unit) - self._nonempty_optimizer_unit_keys()
+            if invalid:
+                raise ValueError(
+                    "optimizer_by_unit keys not in current nonempty units: "
+                    + ", ".join(sorted(invalid))
+                )
+
+        self._build_render_optimizers()
+
+    def remove_optimizer(self) -> None:
+        self._render_optimizers = []
+        self._optimizer_unit_keys = []
+        self._fit_optimizer_by_unit = None
+        self._render_schedulers = []
+        self._fit_scheduler_by_unit = None
+        self._fit_scheduler_last_num_iter = None
+        super().remove_optimizer()
+
+    def zero_optimizer_grad(self) -> None:
+        if self._render_optimizers:
+            for opt in self._render_optimizers:
+                opt.zero_grad(set_to_none=True)
+        else:
+            super().zero_optimizer_grad()
+
+    def step_optimizer(self) -> None:
+        if self._render_optimizers:
+            for opt in self._render_optimizers:
+                opt.step()
+        else:
+            super().step_optimizer()
+
+    def get_learning_rates_by_unit(self) -> dict[str, float]:
+        """Current LR per optimizer unit key (empty if no optimizer)."""
+        if not self._render_optimizers or not self._optimizer_unit_keys:
+            return {}
+        if len(self._render_optimizers) == 1:
+            opt = self._render_optimizers[0]
+            out: dict[str, float] = {}
+            for i, key in enumerate(self._optimizer_unit_keys):
+                if i < len(opt.param_groups):
+                    out[key] = float(opt.param_groups[i]["lr"])
+            return out
+        out = {}
+        for key, opt in zip(self._optimizer_unit_keys, self._render_optimizers):
+            out[key] = float(opt.param_groups[0]["lr"])
+        return out
+
+    def get_current_lr(self) -> float:
+        """Mean LR across unit param groups; falls back to mixin behavior if unknown."""
+        by_unit = self.get_learning_rates_by_unit()
+        if by_unit:
+            return float(sum(by_unit.values()) / len(by_unit))
+        return super().get_current_lr()
+
+    def set_scheduler(
+        self,
+        scheduler_params: SchedulerType | dict[str, Any] | None = None,
+        num_iter: int | None = None,
+        *,
+        scheduler_by_unit: SchedulerUnitSpecDict | None | _UnsetSentinel = UNSET,
+    ) -> None:
+        """
+        Configure LR schedulers from broadcast and optional per-unit specs.
+
+        Parameters
+        ----------
+        scheduler_params
+            Broadcast scheduler config (parsed if dict). If omitted, previous broadcast
+            is kept.
+        num_iter
+            Passed to schedulers that need a step count (e.g. ``LinearLR``,
+            ``CosineAnnealingLR``). Stored for rebuilds.
+        scheduler_by_unit
+            Per-unit overrides (keys match ``collect_optimizer_units``). ``{}``
+            clears overrides. When the kwarg is omitted, previous overrides are kept.
+
+        Notes
+        -----
+        **Single torch optimizer:** one ``LRScheduler`` is attached to that optimizer;
+        it updates all param groups together. ``scheduler_by_unit`` is only allowed
+        if every unit's resolved spec is equivalent (see ``_build_render_schedulers``).
+
+        **Multiple torch optimizers:** one scheduler per optimizer, same order as
+        units; each steps in ``step_scheduler`` (``ReduceLROnPlateau`` receives the
+        same ``loss`` float on every instance).
+
+        Requires ``_render_optimizers`` to be nonempty (set optimizers first).
+        """
+        if scheduler_by_unit is not UNSET:
+            if scheduler_by_unit:
+                if not isinstance(scheduler_by_unit, dict):
+                    raise TypeError("scheduler_by_unit must be a dict or empty mapping.")
+                self._fit_scheduler_by_unit = {
+                    str(k): _parse_scheduler_spec(v) for k, v in scheduler_by_unit.items()
+                }
+            else:
+                self._fit_scheduler_by_unit = None
+
+        if scheduler_params is not None:
+            if isinstance(scheduler_params, dict):
+                scheduler_params = SchedulerParams.parse_dict(scheduler_params)
+            if not isinstance(scheduler_params, SchedulerType):
+                raise TypeError(
+                    f"scheduler parameters must be SchedulerType, got {type(scheduler_params)}"
+                )
+            self._scheduler_params = scheduler_params
+
+        if num_iter is not None:
+            self._fit_scheduler_last_num_iter = int(num_iter)
+
+        if not self._render_optimizers:
+            self._render_schedulers = []
+            self._scheduler = None
+            return
+
+        if self._fit_scheduler_by_unit:
+            invalid = set(self._fit_scheduler_by_unit) - set(self._optimizer_unit_keys)
+            if invalid:
+                raise ValueError(
+                    "scheduler_by_unit keys not in current optimizer unit keys: "
+                    + ", ".join(sorted(invalid))
+                )
+
+        self._build_render_schedulers(num_iter)
+
+    def step_scheduler(self, loss: float | None = None) -> None:
+        if self._render_schedulers:
+            for sch in self._render_schedulers:
+                if sch is None:
+                    continue
+                if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    if loss is not None:
+                        sch.step(loss)
+                else:
+                    sch.step()
+            return
+        super().step_scheduler(loss)
+
+    def reconnect_optimizer_to_parameters(self) -> None:
+        """
+        Rebuild optimizers so param references match the live model (e.g. after device moves).
+
+        Optimizer momentum and LR scheduler step counters are not preserved across this
+        rebuild; schedulers are recreated from stored broadcast and per-unit specs using
+        ``_fit_scheduler_last_num_iter`` when set.
+        """
+        if self.model is None:
+            super().reconnect_optimizer_to_parameters()
+            return
+        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+            super().reconnect_optimizer_to_parameters()
+            return
+        self._build_render_optimizers()
+        self._build_render_schedulers(self._fit_scheduler_last_num_iter)
 
     @property
     def state_current(self) -> dict[str, torch.Tensor] | None:
@@ -430,10 +1002,10 @@ class FitBase(OptimizerMixin):
 
         Notes
         -----
-        When rebuilding, the optimizer is reconstructed from stored optimizer
-        parameters if available, otherwise inferred from the current optimizer
-        type and learning rate, else defaults. Scheduler state is cleared
-        predictably by setting scheduler type to ``"none"``.
+        When rebuilding, optimizers are reconstructed from stored broadcast and
+        per-unit optimizer specs. LR schedulers are rebuilt from stored broadcast
+        and per-unit scheduler specs; scheduler step counters reset (see
+        ``_fit_scheduler_last_num_iter``).
         """
         component = self._resolve_component_by_name(component_name)
         for _, param in component.named_parameters(recurse=True):
@@ -475,8 +1047,8 @@ class FitBase(OptimizerMixin):
 
         Notes
         -----
-        When rebuilding, scheduler state is cleared by setting scheduler type
-        to ``"none"``.
+        When rebuilding, optimizers and LR schedulers follow the same rules as
+        :meth:`set_component_trainable` (scheduler step counters reset).
         """
         component = self._resolve_component_by_name(component_name)
         params = dict(component.named_parameters(recurse=True))
@@ -521,6 +1093,11 @@ class FitBase(OptimizerMixin):
             If the model is not defined.
         KeyError
             If any parameter name is unknown.
+
+        Notes
+        -----
+        When rebuilding, optimizers and LR schedulers follow the same rules as
+        :meth:`set_component_trainable` (scheduler step counters reset).
         """
         component = self._resolve_component_by_name(component_name)
         params = dict(component.named_parameters(recurse=True))
@@ -567,8 +1144,10 @@ class FitBase(OptimizerMixin):
         n_steps: int,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
-        optimizer_params: OptimizerType | dict | None = None,
-        scheduler_params: SchedulerType | dict | None = None,
+        optimizer_params: OptimizerType | dict[str, Any] | None = None,
+        optimizer_by_unit: OptimizerUnitSpecDict | None = None,
+        scheduler_params: SchedulerType | dict[str, Any] | None = None,
+        scheduler_by_unit: SchedulerUnitSpecDict | None = None,
         progress: bool = False,
         run_key: str = "default",
         **kwargs: Any,
@@ -589,8 +1168,14 @@ class FitBase(OptimizerMixin):
             optimization starts. If ``None``, existing component constraints are reused.
         optimizer_params : dict | None, optional
             Optimizer configuration override for this call.
+        optimizer_by_unit : dict | None, optional
+            Per-unit optimizer specs (keys match ``collect_optimizer_units``). Omitted
+            entries use ``optimizer_params`` / stored broadcast defaults.
         scheduler_params : dict | None, optional
             Scheduler configuration override for this call.
+        scheduler_by_unit : dict | None, optional
+            Per-unit scheduler specs (same keys as optimizer units). Omitted entries
+            use ``scheduler_params`` / stored broadcast defaults.
         progress : bool, optional
             If ``True``, display a progress bar.
         run_key : str, optional
@@ -619,10 +1204,16 @@ class FitBase(OptimizerMixin):
 
         optimizer_rebuilt = False
         if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
+            obu: OptimizerUnitSpecDict | None | _UnsetSentinel = (
+                optimizer_by_unit if optimizer_by_unit is not None else UNSET
+            )
+            self.set_optimizer(optimizer_params, optimizer_by_unit=obu)
+            optimizer_rebuilt = True
+        elif optimizer_by_unit is not None:
+            self.set_optimizer(None, optimizer_by_unit=optimizer_by_unit)
             optimizer_rebuilt = True
         elif self.optimizer is None:
-            if self.optimizer_params:
+            if not isinstance(self.optimizer_params, OptimizerParams.NoneOptimizer):
                 self.set_optimizer(self.optimizer_params)
             else:
                 self.set_optimizer(
@@ -634,12 +1225,23 @@ class FitBase(OptimizerMixin):
             optimizer_rebuilt = True
 
         n_steps = int(n_steps)
+        scheduler_configured = False
         if scheduler_params is not None:
-            self.set_scheduler(scheduler_params, num_iter=n_steps)
-        elif self.scheduler is None and self.scheduler_params:
+            sbu: SchedulerUnitSpecDict | None | _UnsetSentinel = (
+                scheduler_by_unit if scheduler_by_unit is not None else UNSET
+            )
+            self.set_scheduler(scheduler_params, num_iter=n_steps, scheduler_by_unit=sbu)
+            scheduler_configured = True
+        elif scheduler_by_unit is not None:
+            self.set_scheduler(None, num_iter=n_steps, scheduler_by_unit=scheduler_by_unit)
+            scheduler_configured = True
+        elif not self._render_schedulers and not isinstance(
+            self.scheduler_params, SchedulerParams.NoneScheduler
+        ):
             self.set_scheduler(self.scheduler_params, num_iter=n_steps)
-        elif optimizer_rebuilt and self.scheduler is not None and self.optimizer is not None:
-            self.scheduler.optimizer = self.optimizer
+            scheduler_configured = True
+        elif optimizer_rebuilt and not scheduler_configured:
+            self._build_render_schedulers(n_steps)
 
         pbar = tqdm(range(n_steps), desc="Fit render", disable=not progress)
 
@@ -723,41 +1325,14 @@ class FitBase(OptimizerMixin):
         known = ", ".join(self.get_component_names())
         raise KeyError(f"Component not found: {target}. Known components: {known}")
 
-    def _infer_optimizer_rebuild_params(self) -> dict[str, Any]:
-        if self.optimizer_params:
-            op = self.optimizer_params
-            if isinstance(op, OptimizerParams.NoneOptimizer):
-                return {"type": "none"}
-            out: dict[str, Any] = dict(op.params())
-            out["type"] = op._name
-            return out
-        if self.optimizer is not None:
-            opt_type: str | type[torch.optim.Optimizer]
-            if isinstance(self.optimizer, torch.optim.AdamW):
-                opt_type = "adamw"
-            elif isinstance(self.optimizer, torch.optim.Adam):
-                opt_type = "adam"
-            elif isinstance(self.optimizer, torch.optim.SGD):
-                opt_type = "sgd"
-            else:
-                opt_type = type(self.optimizer)
-            lr = float(
-                self.optimizer.param_groups[0].get(
-                    "lr", getattr(self, "DEFAULT_LR", self.DEFAULT_LR)
-                )
-            )
-            return {"type": opt_type, "lr": lr}
-        return {
-            "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", self.DEFAULT_OPTIMIZER_TYPE),
-            "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
-        }
-
     def _rebuild_optimizer_after_trainability_change(self) -> None:
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
-        rebuild_params = self._infer_optimizer_rebuild_params()
-        self.set_optimizer(rebuild_params)
-        self.set_scheduler({"type": "none"})
+        if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
+            self.remove_optimizer()
+            return
+        self._build_render_optimizers()
+        self._build_render_schedulers(self._fit_scheduler_last_num_iter)
 
     def _clone_state_dict(self, state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {k: v.detach().clone() for k, v in state.items()}
