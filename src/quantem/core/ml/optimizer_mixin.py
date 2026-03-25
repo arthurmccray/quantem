@@ -591,9 +591,11 @@ class OptimizerMixin:
 
     def set_optimizer(self, opt_params: OptimizerType | dict | None = None) -> None:
         """
-        Set the optimizer for this model.
-        Currently supports single LR for all parameters, TODO allow for per parameter LRs by
-        updating get_optimization_parameters to return a list of parameters and their LRs.
+        Set the optimizer. Uses a flat parameter list from ``get_optimization_parameters()``,
+        or — when the host defines ``build_optimizer_param_groups()`` returning a non-``None``
+        list of dicts with ``"params"`` and optional ``"lr"`` — builds a single optimizer with
+        multiple param groups. Shared options (``betas``, ``weight_decay``, …) apply to every
+        group; per-group ``lr`` overrides the constructor default for that group.
         """
         if opt_params is not None:
             self.optimizer_params = opt_params
@@ -604,6 +606,44 @@ class OptimizerMixin:
 
         if isinstance(self._optimizer_params, OptimizerParams.NoneOptimizer):
             self.remove_optimizer()
+            return
+
+        build_fn = getattr(self, "build_optimizer_param_groups", None)
+        custom_groups: list[dict] | None = None
+        if callable(build_fn):
+            built = build_fn()
+            if isinstance(built, list):
+                custom_groups = built
+            elif built is not None:
+                raise TypeError(
+                    "build_optimizer_param_groups must return a list of dicts or None."
+                )
+
+        if custom_groups is not None:
+            if len(custom_groups) == 0:
+                self._optimizer = None
+                return
+            base_kw = dict(self._optimizer_params.params())
+            default_lr = float(base_kw.pop("lr"))
+            merged_groups: list[dict] = []
+            for g in custom_groups:
+                if not isinstance(g, dict) or "params" not in g:
+                    raise TypeError(
+                        "Each optimizer param group must be a dict with a 'params' key."
+                    )
+                entry = dict(base_kw)
+                entry["params"] = g["params"]
+                entry["lr"] = float(g.get("lr", default_lr))
+                merged_groups.append(entry)
+            match self._optimizer_params:
+                case OptimizerParams.Adam():
+                    self._optimizer = torch.optim.Adam(merged_groups)
+                case OptimizerParams.AdamW():
+                    self._optimizer = torch.optim.AdamW(merged_groups)
+                case OptimizerParams.SGD():
+                    self._optimizer = torch.optim.SGD(merged_groups)
+                case _:
+                    raise NotImplementedError(f"Unknown optimizer type: {self._optimizer_params}")
             return
 
         params = self.get_optimization_parameters()
@@ -629,7 +669,13 @@ class OptimizerMixin:
     def set_scheduler(
         self, scheduler_params: SchedulerType | dict | None = None, num_iter: int | None = None
     ) -> None:
-        """Set the scheduler for this model."""
+        """
+        Set the scheduler for this model.
+
+        With multi-group optimizers, schedulers still use ``param_groups[0]["lr"]`` as the
+        nominal base LR passed into scheduler constructors; other groups are not scheduled
+        independently unless you use separate optimizers.
+        """
         if scheduler_params is not None:
             self.scheduler_params = scheduler_params
 
@@ -695,13 +741,18 @@ class OptimizerMixin:
         return self._optimizer is not None
 
     def get_current_lr(self) -> float:
-        """Get the current learning rate."""
+        """Learning rate of param group 0 (not an average over groups)."""
         if self._optimizer is not None:
             return self._optimizer.param_groups[0]["lr"]
         return 0.0
 
     def remove_optimizer(self) -> None:
-        """Remove the optimizer and scheduler."""
+        """
+        Remove the optimizer and scheduler.
+
+        Subclasses (e.g. ``FitBase``) may clear additional optimizer-related state so it does
+        not linger after teardown.
+        """
         self._optimizer = None
         self._optimizer_params = OptimizerParams.NoneOptimizer()
         self._scheduler = None
@@ -720,6 +771,23 @@ class OptimizerMixin:
         """
         if self._optimizer is None:
             return
+
+        build_fn = getattr(self, "build_optimizer_param_groups", None)
+        if callable(build_fn):
+            raw = build_fn()
+            rebuilt: list[dict] | None = raw if isinstance(raw, list) else None
+            if rebuilt is not None:
+                if len(rebuilt) == 0:
+                    self._optimizer = None
+                    return
+                # Full rebuild: remaps state to current tensors; optimizer momentum is reset.
+                saved_opt = self._optimizer_params
+                saved_sched = self._scheduler_params
+                OptimizerMixin.set_optimizer(self, saved_opt)
+                OptimizerMixin.set_scheduler(self, saved_sched)
+                if self._scheduler is not None and self._optimizer is not None:
+                    self._scheduler.optimizer = self._optimizer
+                return
 
         current_params = self.get_optimization_parameters()
         if isinstance(current_params, torch.Tensor):

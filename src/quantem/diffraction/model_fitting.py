@@ -376,6 +376,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         mask: np.ndarray | torch.Tensor | None = None,
         origin_key: str = "origin",
     ) -> "ModelDiffraction":
+        """
+        Replace ``self.model`` / context, reset mean-refined state, clear fit history, and
+        remove the optimizer (including any stored per-unit LR map).
+        """
         if self.image_ref is None:
             self.preprocess()
         if self.image_ref is None:
@@ -421,7 +425,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         self.state_mean_refined = None
         self.mean_refined = False
         self._clear_fit_history_all()
-        self.remove_optimizer()
+        self.remove_optimizer()  # drops optimizer, scheduler, and per-unit LR map (FitBase)
         return self
 
     def fit_mean_diffraction_pattern(
@@ -430,6 +434,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
         n_steps: int = 200,
         reset: bool | Literal["initialized", "mean_refined"] = False,
         optimizer_params: OptimizerType | dict | None = None,
+        optimizer_unit_lrs: dict[str, float] | None = None,
         scheduler_params: SchedulerType | dict | None = None,
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
@@ -446,6 +451,10 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             Reset behavior before fitting.
         optimizer_params : dict | None, optional
             Optimizer override for this fit call.
+        optimizer_unit_lrs : dict[str, float] | None, optional
+            Per-unit learning rates forwarded to ``fit_render``. Valid keys are the same as
+            ``optimizer_unit_names()`` / ``collect_optimizer_units(model)`` (e.g. ``origin``,
+            ``lattice/disk``, ``lattice``).
         scheduler_params : dict | None, optional
             Scheduler override for this fit call.
         constraint_weight : float, optional
@@ -470,7 +479,8 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
 
         Notes
         -----
-        Constraint assignments persist on components across fit calls.
+        Constraint assignments persist on components across fit calls. ``optimizer_unit_lrs``
+        updates the instance the same way as ``fit_render`` (validated keys, then stored).
         """
         if self.model is None or self.ctx is None or self.target_mean is None:
             raise RuntimeError("Call .define_model(...) first.")
@@ -489,6 +499,7 @@ class ModelDiffraction(ModelDiffractionVisualizations, FitBase, AutoSerialize):
             constraint_weight=float(constraint_weight),
             constraint_params=constraint_params,
             optimizer_params=optimizer_params,
+            optimizer_unit_lrs=optimizer_unit_lrs,
             scheduler_params=scheduler_params,
             progress=bool(progress),
             run_key="mean",

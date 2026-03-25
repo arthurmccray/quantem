@@ -487,6 +487,16 @@ class SyntheticDiskLattice(RenderComponent):
     def set_origin(self, origin: OriginND) -> None:
         self.origin = origin
 
+    def trainable_disk_parameters(self) -> list[nn.Parameter]:
+        return [p for p in self.disk.parameters() if p.requires_grad]
+
+    def trainable_lattice_only_parameters(self) -> list[nn.Parameter]:
+        disk_ids = {id(p) for p in self.disk.parameters()}
+        return [p for p in self.parameters() if p.requires_grad and id(p) not in disk_ids]
+
+    def optimizer_submodules(self) -> list[tuple[str, nn.Module]]:
+        return [("disk", self.disk)]
+
     def _enforce_positive_intensity_params(self) -> None:
         """
         Project base intensity parameter(s) to nonnegative values.

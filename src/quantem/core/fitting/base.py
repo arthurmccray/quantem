@@ -105,6 +105,9 @@ class RenderComponent(nn.Module):
         self.soft_constraints: dict[str, Any] = dict(self.DEFAULT_SOFT_CONSTRAINTS)
         self.parameter_bounds: dict[str, tuple[float | None, float | None]] = {}
 
+    def optimizer_submodules(self) -> list[tuple[str, nn.Module]]:
+        return []
+
     @staticmethod
     def parse_bounded_init(
         value: float | int | Sequence[float | int | None], *, name: str
@@ -341,13 +344,107 @@ class AdditiveRenderModel(nn.Module):
         return loss
 
 
+def collect_optimizer_units(model: AdditiveRenderModel) -> list[tuple[str, list[nn.Parameter]]]:
+    """Named optimizer units and their trainable parameters (disk vs lattice split, etc.)."""
+    global_seen: set[int] = set()
+    out: list[tuple[str, list[nn.Parameter]]] = []
+
+    def add_unit(key: str, params: list[nn.Parameter]) -> None:
+        if not params:
+            return
+        ids = {id(p) for p in params}
+        if dup := ids & global_seen:
+            raise ValueError(
+                "The same nn.Parameter appears in more than one optimizer unit "
+                f"(ids overlap: {len(dup)} parameter(s))."
+            )
+        global_seen.update(ids)
+        out.append((key, params))
+
+    add_unit("origin", [p for p in model.origin.parameters() if p.requires_grad])
+
+    for idx, module in enumerate(model.components):
+        component = cast(RenderComponent, module)
+        name = model._component_constraint_name(component, idx)
+        subs = list(component.optimizer_submodules())
+        if not subs:
+            add_unit(
+                name,
+                [
+                    p
+                    for p in component.parameters(recurse=True)
+                    if p.requires_grad and id(p) not in global_seen
+                ],
+            )
+            continue
+
+        seen_sub: set[str] = set()
+        sub_union: set[int] = set()
+        for subname, submod in subs:
+            sn = str(subname)
+            if sn in seen_sub:
+                raise ValueError(
+                    f"Duplicate optimizer_submodules name '{sn}' on component '{name}'."
+                )
+            seen_sub.add(sn)
+            sp = [
+                p
+                for p in submod.parameters(recurse=True)
+                if p.requires_grad and id(p) not in global_seen
+            ]
+            sids = {id(p) for p in sp}
+            if sids & sub_union:
+                raise ValueError(
+                    f"Overlapping parameters between optimizer_submodules entries on '{name}'."
+                )
+            sub_union |= sids
+            add_unit(f"{name}/{sn}", sp)
+
+        remainder = [
+            p
+            for p in component.parameters(recurse=True)
+            if p.requires_grad and id(p) not in sub_union and id(p) not in global_seen
+        ]
+        add_unit(name, remainder)
+
+    return out
+
+
+def additive_render_optimizer_param_groups(
+    model: AdditiveRenderModel,
+    *,
+    default_lr: float,
+    lr_by_unit: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    """Param groups for ``torch.optim.AdamW`` / ``Adam`` / ``SGD`` with per-unit ``lr``."""
+    lr_map = lr_by_unit or {}
+    groups: list[dict[str, Any]] = []
+    for key, params in collect_optimizer_units(model):
+        if not params:
+            continue
+        groups.append({"params": params, "lr": float(lr_map.get(key, default_lr))})
+    return groups
+
+
+_OPTIMIZER_UNIT_LRS_UNSET = object()
+
+
 @dataclass
 class FitResult:
+    """
+    Fit metrics for one ``run_key``.
+
+    ``lrs`` records ``get_current_lr()`` each step (PyTorch param group 0 only). ``lrs_by_unit``
+    has the same length: empty dicts when training flat; otherwise per-step maps from unit
+    name to LR (e.g. ``origin``, ``lattice/disk``, ``lattice``).
+    """
+
     losses: list[float]
     lrs: list[float]
     final_loss: float
     num_steps: int
     metrics: dict[str, list[float]] = field(default_factory=dict)
+    lrs_by_unit: list[dict[str, float]] = field(default_factory=list)
 
 
 class FitBase(OptimizerMixin):
@@ -360,12 +457,92 @@ class FitBase(OptimizerMixin):
         self.loss_fn = torch.nn.MSELoss(reduction="mean")
         self.model: AdditiveRenderModel | None = None
         self.ctx: RenderContext | None = None
+        self._optimizer_unit_lrs: dict[str, float] | None = None
 
         # State/checkpoints
         self.state_initialized: dict[str, torch.Tensor] | None = None
 
         # Histories/results
         self.fit_history: dict[str, FitResult] = {}
+
+    @property
+    def optimizer_unit_lrs(self) -> dict[str, float] | None:
+        return self._optimizer_unit_lrs
+
+    def set_optimizer_unit_lrs(self, lrs: dict[str, float] | None) -> None:
+        self.set_optimizer(None, optimizer_unit_lrs=lrs)
+
+    def set_optimizer(
+        self,
+        opt_params: OptimizerType | dict | None = None,
+        *,
+        optimizer_unit_lrs: Any = _OPTIMIZER_UNIT_LRS_UNSET,
+    ) -> None:
+        if opt_params is not None:
+            self.optimizer_params = opt_params
+        if optimizer_unit_lrs is not _OPTIMIZER_UNIT_LRS_UNSET:
+            if optimizer_unit_lrs is not None:
+                if self.model is None:
+                    raise RuntimeError(
+                        "Call .define_model(...) before setting optimizer_unit_lrs."
+                    )
+                valid = {k for k, ps in collect_optimizer_units(self.model) if ps}
+                unknown = set(optimizer_unit_lrs.keys()) - valid
+                if unknown:
+                    raise ValueError(
+                        "optimizer_unit_lrs keys not in current nonempty units: "
+                        + ", ".join(sorted(unknown))
+                    )
+            self._optimizer_unit_lrs = optimizer_unit_lrs
+        OptimizerMixin.set_optimizer(self, None)
+
+    def build_optimizer_param_groups(self) -> list[dict[str, Any]] | None:
+        if self.model is None or self._optimizer_unit_lrs is None:
+            return None
+        if not self._optimizer_params or isinstance(
+            self._optimizer_params, OptimizerParams.NoneOptimizer
+        ):
+            return None
+        lr = float(self._optimizer_params.lr)
+        return additive_render_optimizer_param_groups(
+            self.model,
+            default_lr=lr,
+            lr_by_unit=self._optimizer_unit_lrs,
+        )
+
+    def get_learning_rates_by_unit(self) -> dict[str, float]:
+        if self._optimizer is None or self.model is None or self._optimizer_unit_lrs is None:
+            return {}
+        units = collect_optimizer_units(self.model)
+        if len(units) != len(self._optimizer.param_groups):
+            return {}
+        return {
+            name: float(pg["lr"]) for (name, _), pg in zip(units, self._optimizer.param_groups)
+        }
+
+    def _prune_optimizer_unit_lrs(self) -> None:
+        if self._optimizer_unit_lrs is None or self.model is None:
+            return
+        valid = {k for k, ps in collect_optimizer_units(self.model) if ps}
+        self._optimizer_unit_lrs = {
+            k: v for k, v in self._optimizer_unit_lrs.items() if k in valid
+        }
+
+    def optimizer_unit_names(self) -> list[str]:
+        """Nonempty optimizer unit keys for the current model (same order as param groups when grouped)."""
+        if self.model is None:
+            raise RuntimeError("Call .define_model(...) first.")
+        return [name for name, ps in collect_optimizer_units(self.model) if ps]
+
+    def remove_optimizer(self) -> None:
+        """
+        Drop optimizer and scheduler and clear ``optimizer_unit_lrs``.
+
+        Aligns “no optimizer” with “no per-unit LR map” so a later ``set_optimizer`` is flat
+        until you set unit LRs again (or pass ``optimizer_unit_lrs`` to ``fit_render``).
+        """
+        super().remove_optimizer()
+        self._optimizer_unit_lrs = None
 
     def get_optimization_parameters(self) -> Any:
         if self.model is None:
@@ -568,6 +745,7 @@ class FitBase(OptimizerMixin):
         constraint_weight: float = 1.0,
         constraint_params: dict[str, Any] | None = None,
         optimizer_params: OptimizerType | dict | None = None,
+        optimizer_unit_lrs: dict[str, float] | None = None,
         scheduler_params: SchedulerType | dict | None = None,
         progress: bool = False,
         run_key: str = "default",
@@ -589,6 +767,10 @@ class FitBase(OptimizerMixin):
             optimization starts. If ``None``, existing component constraints are reused.
         optimizer_params : dict | None, optional
             Optimizer configuration override for this call.
+        optimizer_unit_lrs : dict[str, float] | None, optional
+            If set, same validation and effect as ``set_optimizer(..., optimizer_unit_lrs=...)``:
+            keys must be nonempty units from ``collect_optimizer_units(model)`` (e.g.
+            ``origin``, ``lattice/disk``, ``lattice``). ``None`` leaves the stored map unchanged.
         scheduler_params : dict | None, optional
             Scheduler configuration override for this call.
         progress : bool, optional
@@ -601,7 +783,8 @@ class FitBase(OptimizerMixin):
         Returns
         -------
         FitResult
-            Fit history and final loss metadata for this run key.
+            Fit history for this run key. ``lrs`` is param group 0 each step; ``lrs_by_unit``
+            has the same length (empty dicts when flat; unit name → LR when ``optimizer_unit_lrs`` is set).
 
         Raises
         ------
@@ -618,19 +801,26 @@ class FitBase(OptimizerMixin):
             self.model.apply_constraint_params(constraint_params, strict=True)
 
         optimizer_rebuilt = False
+        ou_kw: Any = (
+            optimizer_unit_lrs if optimizer_unit_lrs is not None else _OPTIMIZER_UNIT_LRS_UNSET
+        )
         if optimizer_params is not None:
-            self.set_optimizer(optimizer_params)
+            self.set_optimizer(optimizer_params, optimizer_unit_lrs=ou_kw)
             optimizer_rebuilt = True
         elif self.optimizer is None:
             if self.optimizer_params:
-                self.set_optimizer(self.optimizer_params)
+                self.set_optimizer(self.optimizer_params, optimizer_unit_lrs=ou_kw)
             else:
                 self.set_optimizer(
                     {
                         "type": getattr(self, "DEFAULT_OPTIMIZER_TYPE", "adamw"),
                         "lr": float(getattr(self, "DEFAULT_LR", self.DEFAULT_LR)),
-                    }
+                    },
+                    optimizer_unit_lrs=ou_kw,
                 )
+            optimizer_rebuilt = True
+        elif optimizer_unit_lrs is not None:
+            self.set_optimizer(None, optimizer_unit_lrs=optimizer_unit_lrs)
             optimizer_rebuilt = True
 
         n_steps = int(n_steps)
@@ -645,6 +835,7 @@ class FitBase(OptimizerMixin):
 
         losses: list[float] = []
         lrs: list[float] = []
+        lrs_by_unit: list[dict[str, float]] = []
         for _ in pbar:
             self.zero_optimizer_grad()
             pred = self._forward_for_fit(target=target, **kwargs)
@@ -660,12 +851,18 @@ class FitBase(OptimizerMixin):
             self.step_scheduler(total_loss_value)
             losses.append(total_loss_value)
             lrs.append(float(self.get_current_lr()))
+            if self._optimizer_unit_lrs is not None:
+                bu = self.get_learning_rates_by_unit()
+                lrs_by_unit.append(dict(bu) if bu else {})
+            else:
+                lrs_by_unit.append({})
 
         key = str(run_key)
         if key in self.fit_history:
             prev = self.fit_history[key]
             prev.losses.extend(losses)
             prev.lrs.extend(lrs)
+            prev.lrs_by_unit.extend(lrs_by_unit)
             prev.final_loss = prev.losses[-1] if prev.losses else float("nan")
             prev.num_steps = len(prev.losses)
             result = prev
@@ -675,6 +872,7 @@ class FitBase(OptimizerMixin):
                 lrs=lrs,
                 final_loss=(losses[-1] if losses else float("nan")),
                 num_steps=n_steps,
+                lrs_by_unit=lrs_by_unit,
             )
             self.fit_history[key] = result
         return result
@@ -755,6 +953,7 @@ class FitBase(OptimizerMixin):
     def _rebuild_optimizer_after_trainability_change(self) -> None:
         if self.model is None:
             raise RuntimeError("Call .define_model(...) first.")
+        self._prune_optimizer_unit_lrs()
         rebuild_params = self._infer_optimizer_rebuild_params()
         self.set_optimizer(rebuild_params)
         self.set_scheduler({"type": "none"})
