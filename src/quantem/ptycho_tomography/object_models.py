@@ -1,17 +1,18 @@
 """Rotated-coordinate 3D object models for joint ptycho-tomography.
 
 The object is a single 3D field in the specimen frame, stored as **phase-density in rad/Å**
-(``obj_type="potential"``) or rad/Å of signable phase (``"pure_phase"``). Per tilt, the multislice
-slab centers are rotated from the beam frame into the specimen frame (``geometry.rot_beam_to_spec``)
-and the field is queried at those coordinates; each slice's transmission is
-``exp(1j * value * slab_thickness)`` (midpoint-rule slab line integral). Because the stored field is
-a density, the representation is independent of the multislice slicing and invariant under
-rotation (path lengths are preserved).
+(``obj_type="potential"``) or rad/Å of signable phase (``"pure_phase"``), on a grid with **cubic
+voxels by default** (z voxel = lateral sampling, matching the tomography module). Per tilt, the
+forward model conceptually *rotates the volume and bins it into the multislice slabs*: each slab's
+transmission is ``exp(1j * mean_k(density at rotated quadrature points) * slab_thickness)``, with
+the quadrature points spaced ~one z-voxel apart through the slab (``samples_per_slab``). Because
+the stored field is a density, the representation is independent of the slicing and invariant
+under rotation (path lengths are preserved).
 
 Backends share the implicit-model contract used across quantem: an ``nn.Module`` mapping ``(N, 3)``
 normalized ``(z, y, x)`` coordinates in ``[-1, 1]^3`` to ``(N, 1)`` values. ``VoxelGrid`` (dense
-trilinear-interpolated voxels, the easy-to-train baseline) is defined here; the K-Planes core model
-already satisfies the contract.
+trilinear-interpolated voxels, the easy-to-train baseline) is defined here; the K-Planes core
+models already satisfy the contract.
 
 Geometry: the object box is the padded 2D ptychography extent (set by ``_initialize_obj`` during
 preprocessing) crossed with ``thickness_A`` along z. Coordinates are rotated in physical Å and then
@@ -19,11 +20,20 @@ renormalized **per axis** to the box (the normalized coordinates are anisotropic
 multislice slab stack spans the same ``thickness_A``, which covers the rotated object support as
 long as the support fits in a ball of diameter <= thickness_A (true for the isolated round v1
 samples; revisit for planar/extended samples).
+
+Note on lineage: ``ObjectPtychoTomoBase`` deliberately duplicates the coordinate-queried-model
+plumbing of ``diffractive_imaging.ObjectINR`` (model wrapper, reset/pretrain machinery, display
+gauge) rather than subclassing it — a voxel grid is not an INR, and the shared machinery really
+belongs to a "coordinate-queried object" base that doesn't exist yet. Extracting one (from which
+``ObjectINR`` and this class would both derive) means refactoring ``diffractive_imaging`` and is
+deferred.
 """
 
+from copy import deepcopy
 from typing import Callable, Sequence, cast
 from warnings import warn
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +41,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from quantem.core import config
+from quantem.core.ml.constraints import BaseConstraints
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.models.kplanes import CPTilted, KPlanes, KPlanesTILTED, KPlanesType
 from quantem.core.ml.optimizer_mixin import (
@@ -38,7 +49,14 @@ from quantem.core.ml.optimizer_mixin import (
     OptimizerParamsType,
     SchedulerParamsType,
 )
-from quantem.diffractive_imaging.object_models import ObjectINR, object_type
+from quantem.core.utils.validators import validate_tensor
+from quantem.core.visualization import show_2d
+from quantem.core.visualization.custom_normalizations import CustomNormalization
+from quantem.diffractive_imaging.object_models import (
+    ObjectBase,
+    PtychoObjConstraintParams,
+    object_type,
+)
 from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, slab_z_centers
 
 
@@ -79,21 +97,27 @@ class VoxelGrid(nn.Module):
         return vals.view(-1, 1)
 
 
-class ObjectPtychoTomoBase(ObjectINR):
+class ObjectPtychoTomoBase(BaseConstraints[PtychoObjConstraintParams.INR], ObjectBase):
     """Base for joint ptycho-tomography object models (rotated-coordinate query).
 
-    Subclasses ``ObjectINR`` to inherit the implicit-object plumbing (``is_implicit`` wiring,
-    optimizer/reset/pretrained-weights machinery, INR-style soft-constraint routing and the
-    ``PtychoObjConstraintParams.INR`` constraint set). The differences:
-
-    - ``forward`` consumes a :class:`PtychoTomoPatchData` payload (beam-frame patch coordinates +
-      per-element beam->specimen rotations) instead of bare 2D coordinates.
-    - z is the **specimen** axis of a real 3D volume, decoupled from the multislice slab count
-      ``num_slices``; the model stores phase-density (rad/Å) and ``forward`` multiplies by the
-      slab thickness.
-    - the materialized object (``.obj`` / ``.volume``) is the specimen-frame volume on the
-      ``volume_shape`` grid, not a per-slice stack.
+    Wraps a coordinate-queried ``nn.Module`` backend (``(N, 3)`` normalized ``(z, y, x)`` ->
+    ``(N, 1)`` density) representing one 3D specimen volume. ``forward`` consumes a
+    :class:`PtychoTomoPatchData` payload (beam-frame patch coordinates + per-element
+    beam->specimen rotations) and returns multislice transmission patches; each slab integrates
+    the rotated density over ``samples_per_slab`` quadrature points ("rotate the volume, then bin
+    it to slices"). Soft constraints are evaluated at sampled coordinates (the paired
+    ``PtychoTomography._soft_constraints`` never materializes the volume per batch); hard
+    constraints are a display gauge on the materialized volume. Reuses the
+    ``PtychoObjConstraintParams.INR`` constraint set (sampled-coordinate TV + soft positivity).
     """
+
+    DEFAULT_LRS = {"object": 3e-4}  # calibrated for density (rad/Å) units; see nb05
+    DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.INR = PtychoObjConstraintParams.INR()
+
+    # Quadrature points per multislice slab for the slab-binning integral. None -> automatic:
+    # ~one sample per z-voxel (round(slab_thickness / z_voxel)), the "rotate then bin" limit.
+    # Compute scales linearly with this; set to 1 for fast midpoint-rule prototyping.
+    samples_per_slab: int | None = None
 
     def __init__(
         self,
@@ -107,23 +131,37 @@ class ObjectPtychoTomoBase(ObjectINR):
         rng: np.random.Generator | int | None = None,
         _token: object | None = None,
     ):
+        super().__init__(device=device, obj_type=obj_type, rng=rng, _token=_token)
+        if self.obj_type == "complex":
+            raise NotImplementedError(
+                "ptycho-tomography objects are real-valued densities; use 'potential' or "
+                "'pure_phase'"
+            )
+        if num_slices < 1:
+            raise ValueError(f"num_slices must be greater than 0, got {num_slices}")
         thickness_A = float(thickness_A)
         if thickness_A <= 0:
             raise ValueError(f"thickness_A must be > 0, got {thickness_A}")
-        super().__init__(
-            model=model,
-            num_slices=num_slices,
-            slice_thicknesses=thickness_A / num_slices if num_slices > 1 else None,
-            obj_type=obj_type,
-            device=device,
-            rng=rng,
-            _token=_token,
-        )
+        self._num_slices = int(num_slices)
+        self._model = model.to(self._device)
+        self.slice_thicknesses = thickness_A / num_slices if num_slices > 1 else None
+        self._set_pretrained_weights(self._model)
         self._thickness_A = thickness_A
         self._num_z_voxels = int(num_z_voxels) if num_z_voxels is not None else None
+
+        # Padded object extent [num_slices, H, W]; set in _initialize_obj. Defines the lateral
+        # [-1, 1] coordinate domain.
+        self._obj_shape: tuple[int, int, int] | None = None
+        # Lazily materialized specimen volume (detached); invalidated each forward().
+        self._obj_cache: torch.Tensor | None = None
+        # Pretraining state.
+        self.register_buffer("_pretrain_target", torch.tensor([]))
+        self._pretrain_losses: list[float] = []
+        self._pretrain_lrs: list[float] = []
+
         # Explicit volume_shape (e.g. wrapping an existing array) is kept as-is; otherwise the
         # lateral grid is matched to the padded 2D object at preprocess (_initialize_obj) and the
-        # z count defaults to ~cubic voxels (or num_z_voxels).
+        # z count defaults to CUBIC voxels (z voxel = mean lateral sampling) unless num_z_voxels.
         self._volume_shape_explicit = volume_shape is not None
         self._volume_shape: tuple[int, int, int] | None = None
         if volume_shape is not None:
@@ -136,6 +174,58 @@ class ObjectPtychoTomoBase(ObjectINR):
     @property
     def name(self) -> str:
         return "ObjectPtychoTomoBase"
+
+    @property
+    def is_implicit(self) -> bool:
+        """Coordinate-queried (the paired dataset emits continuous coordinates)."""
+        return True
+
+    @property
+    def num_slices(self) -> int:
+        return self._num_slices
+
+    @property
+    def model(self) -> nn.Module:
+        return self._model
+
+    @property
+    def params(self) -> list[nn.Parameter]:
+        """optimization parameters"""
+        return list(self._model.parameters())
+
+    @property
+    def pretrained_weights(self) -> dict[str, torch.Tensor]:
+        return self._pretrained_weights
+
+    def _set_pretrained_weights(self, model: nn.Module) -> None:
+        self._pretrained_weights = deepcopy(model.state_dict())
+
+    @property
+    def pretrain_target(self) -> torch.Tensor:
+        """Target volume (density, ``volume_shape``) fitted by ``pretrain()``."""
+        return self._pretrain_target
+
+    @pretrain_target.setter
+    def pretrain_target(self, target: torch.Tensor | np.ndarray | None) -> None:
+        if target is None:
+            self._pretrain_target = torch.tensor([], device=self.device)
+            return
+        t = validate_tensor(
+            target,
+            name="pretrain_target",
+            ndim=3,
+            dtype=config.get("dtype_real"),
+            expand_dims=True,
+        )
+        self._pretrain_target = t.to(self.device)
+
+    @property
+    def pretrain_losses(self) -> np.ndarray:
+        return np.array(self._pretrain_losses)
+
+    @property
+    def pretrain_lrs(self) -> np.ndarray:
+        return np.array(self._pretrain_lrs)
 
     @property
     def thickness_A(self) -> float:
@@ -151,6 +241,11 @@ class ObjectPtychoTomoBase(ObjectINR):
                 "(which matches the lateral grid to the padded object)."
             )
         return self._volume_shape
+
+    @property
+    def z_voxel_A(self) -> float:
+        """Specimen-frame z voxel size of the volume grid (Å)."""
+        return self._thickness_A / self.volume_shape[0]
 
     @property
     def slab_thickness_A(self) -> float:
@@ -182,52 +277,26 @@ class ObjectPtychoTomoBase(ObjectINR):
         )
 
     @property
+    def obj(self) -> torch.Tensor:
+        """Materialized specimen-frame volume ``(D, H, W)`` (display gauge applied).
+
+        Cold-path only (display / logging / serialization); the training loop queries the model
+        directly via ``forward``. Cached and invalidated on each ``forward`` call.
+        """
+        if self._obj_cache is None:
+            raw = self._materialize_obj()
+            self._obj_cache = self.apply_hard_constraints(raw, mask=self.mask)
+        return self._obj_cache
+
+    @property
     def volume(self) -> torch.Tensor:
-        """Materialized specimen-frame volume ``(D, H, W)`` (display gauge applied)."""
+        """Alias of ``obj``: the materialized specimen-frame volume."""
         return self.obj
 
     # endregion --- properties ---
 
-    def forward(self, patch_data: PtychoTomoPatchData, /) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride] -- payload seam
-        """Rotated-coordinate object query.
-
-        Builds beam-frame physical coordinates for every multislice slab center over each patch,
-        rotates them into the specimen frame, queries the model, masks outside the object box to
-        vacuum, and returns complex transmission patches ``exp(1j * value * slab_thickness)`` of
-        shape ``(num_slices, batch, Hroi, Wroi)``.
-        """
-        self._invalidate_obj_cache()
-        coords = patch_data.coords_yx  # (B, Hroi, Wroi, 2) normalized beam-frame (row, col)
-        rot = patch_data.rotations.to(device=coords.device, dtype=coords.dtype)  # (B, 3, 3)
-        h_z, h_y, h_x = self._box_half_extents
-        y_b = coords[..., 0] * h_y  # (B, Hroi, Wroi), physical Å
-        x_b = coords[..., 1] * h_x
-        if (
-            patch_data.shifts_px is not None
-        ):  # per-tilt alignment shifts (beam frame, pre-rotation)
-            samp = self.sampling
-            y_b = y_b - (patch_data.shifts_px[:, 0] * float(samp[0])).view(-1, 1, 1)
-            x_b = x_b - (patch_data.shifts_px[:, 1] * float(samp[1])).view(-1, 1, 1)
-        z_centers = self._slab_z_centers_t.to(coords.dtype)  # (S,)
-        t_slab = self.slab_thickness_A
-
-        r = rot.view(-1, 3, 3)
-        rzz, rzy, rzx = (r[:, 0, i].view(-1, 1, 1) for i in range(3))
-        ryz, ryy, ryx = (r[:, 1, i].view(-1, 1, 1) for i in range(3))
-        rxz, rxy, rxx = (r[:, 2, i].view(-1, 1, 1) for i in range(3))
-
-        phases = []
-        for s in range(self.num_slices):
-            z_s = z_centers[s]
-            n_z = (rzz * z_s + rzy * y_b + rzx * x_b) / h_z
-            n_y = (ryz * z_s + ryy * y_b + ryx * x_b) / h_y
-            n_x = (rxz * z_s + rxy * y_b + rxx * x_b) / h_x
-            inside = (n_z.abs() <= 1.0) & (n_y.abs() <= 1.0) & (n_x.abs() <= 1.0)
-            pts = torch.stack([n_z, n_y, n_x], dim=-1).reshape(-1, 3)
-            vals = self._model(pts).reshape(coords.shape[:3])
-            phases.append(vals * inside.to(vals.dtype) * t_slab)
-        phase = torch.stack(phases, dim=0)  # (S, B, Hroi, Wroi)
-        return torch.exp(1.0j * phase)
+    def _invalidate_obj_cache(self) -> None:
+        self._obj_cache = None
 
     def _initialize_obj(
         self,
@@ -238,15 +307,21 @@ class ObjectPtychoTomoBase(ObjectINR):
 
         When ``volume_shape`` was not given explicitly, the volume's lateral grid is matched to
         the padded 2D object (so the materialized volume lives in the same pixel space as the
-        scan positions and the inherited cropping works) and the z count defaults to ~cubic
-        voxels (``thickness_A / mean(sampling)``) unless ``num_z_voxels`` was set.
+        scan positions and the inherited cropping works) and the z count defaults to **cubic
+        voxels** (``thickness_A / mean(sampling)``) unless ``num_z_voxels`` was set.
         """
-        super()._initialize_obj(shape, sampling)
+        if sampling is not None:
+            self.sampling = sampling
+        shape_t = tuple(int(x) for x in shape)
+        if shape_t[0] != self.num_slices:
+            raise ValueError(
+                f"shape[0] ({shape_t[0]}) does not match num_slices ({self.num_slices})"
+            )
+        self._obj_shape = shape_t  # type: ignore[assignment]
+        self._invalidate_obj_cache()
         lat = (int(shape[1]), int(shape[2]))
         if self._volume_shape_explicit:
             if self._volume_shape is not None and self._volume_shape[1:] != lat:
-                from warnings import warn
-
                 warn(
                     f"explicit volume_shape lateral dims {self._volume_shape[1:]} differ from "
                     f"the padded object grid {lat}; obj_cropped/snapshot cropping will be "
@@ -276,6 +351,97 @@ class ObjectPtychoTomoBase(ObjectINR):
         """
         return
 
+    def reset(self) -> None:
+        """Reset the model weights to their initial (or pretrained) state."""
+        self._model.load_state_dict(deepcopy(self._pretrained_weights))
+        self._invalidate_obj_cache()
+
+    def to(self, *args, **kwargs):
+        """Move all relevant tensors to a different device."""
+        super().to(*args, **kwargs)
+        self._model = self._model.to(*args, **kwargs)
+        device = kwargs.get("device", args[0] if args else None)
+        if device is not None:
+            self.device = device
+            self._rng_to_device(device)
+            self.reconnect_optimizer_to_parameters()
+        self._invalidate_obj_cache()
+        return self
+
+    def backward(self, *args, **kwargs):
+        raise NotImplementedError(
+            f"Analytical gradients are not implemented for {self.name}, use autograd=True"
+        )
+
+    # region --- forward ---
+    def _slab_sample_offsets(self) -> torch.Tensor:
+        """Physical z offsets (Å) of the quadrature points within one slab, shape ``(K,)``.
+
+        ``K = samples_per_slab`` (or automatically ~one sample per z-voxel); points are placed at
+        sub-slab midpoints so ``K=1`` reduces to the midpoint rule at the slab center.
+        """
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        k = self.samples_per_slab
+        if k is None:
+            k = max(1, round(self.slab_thickness_A / self.z_voxel_A))
+        k = max(1, int(k))
+        t = self.slab_thickness_A
+        return ((torch.arange(k, device=self.device, dtype=real_dtype) + 0.5) / k) * t - t / 2.0
+
+    def forward(self, patch_data: PtychoTomoPatchData, /) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride] -- payload seam
+        """Rotated-coordinate object query with slab binning.
+
+        For every multislice slab, builds beam-frame physical coordinates at the slab's
+        quadrature z-points over each patch, rotates them into the specimen frame, queries the
+        model, masks outside the object box to vacuum, and integrates across the slab. Returns
+        complex transmission patches ``exp(1j * slab_mean_density * slab_thickness)`` of shape
+        ``(num_slices, batch, Hroi, Wroi)``.
+        """
+        self._invalidate_obj_cache()
+        coords = patch_data.coords_yx  # (B, Hroi, Wroi, 2) normalized beam-frame (row, col)
+        rot = patch_data.rotations.to(device=coords.device, dtype=coords.dtype)  # (B, 3, 3)
+        h_z, h_y, h_x = self._box_half_extents
+        y_b = coords[..., 0] * h_y  # (B, Hroi, Wroi), physical Å
+        x_b = coords[..., 1] * h_x
+        if (
+            patch_data.shifts_px is not None
+        ):  # per-tilt alignment shifts (beam frame, pre-rotation)
+            samp = self.sampling
+            y_b = y_b - (patch_data.shifts_px[:, 0] * float(samp[0])).view(-1, 1, 1)
+            x_b = x_b - (patch_data.shifts_px[:, 1] * float(samp[1])).view(-1, 1, 1)
+        z_centers = self._slab_z_centers_t.to(coords.dtype)  # (S,)
+        z_offsets = self._slab_sample_offsets().to(coords.dtype)  # (K,)
+        t_slab = self.slab_thickness_A
+
+        r = rot.view(-1, 3, 3)
+        rzz, rzy, rzx = (r[:, 0, i].view(-1, 1, 1) for i in range(3))
+        ryz, ryy, ryx = (r[:, 1, i].view(-1, 1, 1) for i in range(3))
+        rxz, rxy, rxx = (r[:, 2, i].view(-1, 1, 1) for i in range(3))
+        # lateral contributions are z-independent: compute once per batch
+        lat_z = rzy * y_b + rzx * x_b  # (B, H, W)
+        lat_y = ryy * y_b + ryx * x_b
+        lat_x = rxy * y_b + rxx * x_b
+
+        phases = []
+        for s in range(self.num_slices):
+            acc = None
+            for z_off in z_offsets:  # K is small; loop keeps per-call memory at (B, H, W)
+                z_k = z_centers[s] + z_off
+                n_z = (rzz * z_k + lat_z) / h_z
+                n_y = (ryz * z_k + lat_y) / h_y
+                n_x = (rxz * z_k + lat_x) / h_x
+                inside = (n_z.abs() <= 1.0) & (n_y.abs() <= 1.0) & (n_x.abs() <= 1.0)
+                pts = torch.stack([n_z, n_y, n_x], dim=-1).reshape(-1, 3)
+                vals = self._model(pts).reshape(coords.shape[:3]) * inside.to(coords.dtype)
+                acc = vals if acc is None else acc + vals
+            assert acc is not None
+            phases.append(acc * (t_slab / len(z_offsets)))
+        phase = torch.stack(phases, dim=0)  # (S, B, Hroi, Wroi)
+        return torch.exp(1.0j * phase)
+
+    # endregion --- forward ---
+
+    # region --- materialization ---
     def _query_volume_grid(self, max_chunk_points: int = 4_000_000) -> torch.Tensor:
         """Query the model on the full ``volume_shape`` grid (differentiable), ``(D, H, W)``."""
         d, hh, ww = self.volume_shape
@@ -295,6 +461,8 @@ class ObjectPtychoTomoBase(ObjectINR):
         with torch.no_grad():
             return self._query_volume_grid()
 
+    # endregion --- materialization ---
+
     # region --- pretraining ---
     def pretrain(
         self,
@@ -310,8 +478,7 @@ class ObjectPtychoTomoBase(ObjectINR):
         """Warm-start the model by regressing it onto a specimen-frame volume.
 
         ``pretrain_target`` must have shape ``volume_shape`` (density in rad/Å). The fitted
-        weights become the reset state. Mirrors ``ObjectINR.pretrain`` with the full-grid query
-        replaced by the volume-grid query.
+        weights become the reset state.
         """
         if device is not None:
             dev, _ = config.validate_device(device)
@@ -370,17 +537,98 @@ class ObjectPtychoTomoBase(ObjectINR):
         if show:
             self.visualize_pretrain(output.detach(), normalize_object_plotting)
 
+    def visualize_pretrain(
+        self, pred_obj: torch.Tensor, normalize_object_plotting: bool = True
+    ) -> None:
+        """Plot the pretraining loss / LR curves and the pred vs target volume projections."""
+        import matplotlib.gridspec as gridspec
+
+        fig = plt.figure(figsize=(12, 6))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.3)
+        ax = fig.add_subplot(gs[0])
+        lines = []
+        lines.extend(
+            ax.semilogy(
+                np.arange(len(self._pretrain_losses)), self._pretrain_losses, c="k", label="loss"
+            )
+        )
+        ax.set_ylabel("Loss", color="k")
+        ax.set_xlabel("Iterations")
+        nx = ax.twinx()
+        nx.spines["left"].set_visible(False)
+        lines.extend(
+            nx.semilogy(
+                np.arange(len(self._pretrain_lrs)), self._pretrain_lrs, c="tab:orange", label="LR"
+            )
+        )
+        labs = [lin.get_label() for lin in lines]
+        nx.legend(lines, labs, loc="upper center")
+        nx.set_ylabel("LRs")
+
+        gs_bot = gridspec.GridSpecFromSubplotSpec(1, 2, subplot_spec=gs[1])
+        axs_bot = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(2)])
+        target = self._pretrain_target
+        norm = None
+        if normalize_object_plotting:
+            target_mean = target.mean(0).cpu().detach().numpy()
+            target_norm = CustomNormalization(interval_type="quantile", data=target_mean)
+            norm = {
+                "interval_type": "manual",
+                "vmin": target_norm.vmin,
+                "vmax": target_norm.vmax,
+            }
+        show_2d(
+            [
+                pred_obj.mean(0).cpu().detach().numpy(),
+                target.mean(0).cpu().detach().numpy(),
+            ],
+            figax=(fig, axs_bot),
+            title=[f"Pred volume ({self.obj_type})", f"Target volume ({self.obj_type})"],
+            cmap="magma",
+            cbar=True,
+            norm=norm,
+        )
+        plt.suptitle(
+            f"Final loss: {self._pretrain_losses[-1]:.3e} | Iters: {len(self._pretrain_losses)}",
+            fontsize=14,
+            y=0.94,
+        )
+        plt.show()
+
     # endregion --- pretraining ---
 
     # region --- constraints ---
+    def apply_hard_constraints(
+        self, raw: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Project the materialized volume (display only).
+
+        For ``pure_phase`` the density is recentered to zero mean (a global-phase gauge). For
+        ``potential``, if ``fix_potential_baseline`` is set, subtract a background offset (mask
+        background mean, else the global min) scaled by ``fix_potential_baseline_factor`` and
+        clamp ``>= 0``. A constant offset is a global phase (diffraction-invariant), so this does
+        not affect the reconstruction.
+        """
+        with torch.no_grad():
+            if self.obj_type == "pure_phase":
+                return raw - raw.mean()
+            if self.constraints.fix_potential_baseline:
+                if mask is not None and mask.numel() and (mask < 0.5 * mask.max()).any():
+                    offset = raw[mask < 0.5 * mask.max()].mean()
+                else:
+                    offset = raw.amin()
+                offset = offset * self.constraints.fix_potential_baseline_factor
+                return torch.clamp(raw - offset, min=0.0)
+            return raw
+
     def apply_soft_constraints(
         self, obj: torch.Tensor | None = None, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Coordinate-sampled 3D TV + positivity penalties over the specimen volume.
 
-        Unlike the 2.5D ``ObjectINR`` version, ``tv_weight_z`` penalizes the specimen z axis of
-        the volume (always meaningful, independent of the multislice slab count) and
-        ``tv_weight_xy`` the lateral axes.
+        ``tv_weight_z`` penalizes the specimen z axis (independent of the multislice slab count),
+        ``tv_weight_xy`` the lateral axes. Evaluated at randomly sampled coordinates so the
+        penalty is differentiable without materializing the volume.
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
@@ -477,7 +725,7 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
         self._invalidate_obj_cache()
 
     @classmethod
-    def from_uniform(  # pyright: ignore[reportIncompatibleMethodOverride] -- model-family factory
+    def from_uniform(
         cls,
         volume_shape: tuple[int, int, int] | None = None,
         thickness_A: float = 1.0,
@@ -491,7 +739,7 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
 
         With ``volume_shape=None`` (the usual reconstruction path) the grid is allocated at
         preprocess time: lateral dims match the padded object and the z count is ``num_z_voxels``
-        (default ~cubic voxels). Pass an explicit ``volume_shape`` for standalone use.
+        (default cubic voxels). Pass an explicit ``volume_shape`` for standalone use.
         """
         real_dtype = getattr(torch, config.get("dtype_real"))
         shape = tuple(int(s) for s in volume_shape) if volume_shape is not None else (1, 1, 1)
@@ -553,7 +801,9 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
 
         Shape must match ``volume_shape`` (e.g. a ground-truth phantom resampled onto the
         preprocess-time grid, for forward-model validation or warm starts). With
-        ``set_as_initial`` the loaded volume becomes the ``reset()`` state.
+        ``set_as_initial`` the loaded volume becomes the ``reset()`` state — pass ``False`` for
+        transient loads (e.g. evaluating the loss at the ground truth) so ``reset()`` still
+        returns to the original (vacuum/pretrained) state.
         """
         real_dtype = getattr(torch, config.get("dtype_real"))
         vol = torch.as_tensor(np.asarray(volume), dtype=real_dtype)
@@ -641,7 +891,7 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         return obj
 
     @classmethod
-    def from_uniform(  # pyright: ignore[reportIncompatibleMethodOverride] -- model-family factory
+    def from_uniform(
         cls,
         thickness_A: float,
         num_slices: int = 8,

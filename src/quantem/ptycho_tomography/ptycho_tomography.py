@@ -23,8 +23,10 @@ Typical use::
 from pathlib import Path
 from typing import Literal, Self, Sequence, cast
 
+import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from quantem.core import config
 from quantem.core.visualization import show_2d
@@ -179,6 +181,20 @@ class PtychoTomography(Ptychography):
 
     # endregion --- preprocessing ---
 
+    def _soft_constraints(self) -> torch.Tensor:
+        """Soft constraints with the object's penalties evaluated at sampled coordinates.
+
+        Replaces the base class's ``isinstance(obj_model, ObjectINR)`` branch: every
+        ptycho-tomography object model is coordinate-queried, so its soft constraints never
+        require the materialized volume (which would force a full-grid query each batch).
+        """
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
+        total_loss = total_loss + obj_model.apply_soft_constraints(mask=obj_model.mask)
+        total_loss = total_loss + self.probe_model.apply_soft_constraints(self.probe_model.probe)
+        total_loss = total_loss + self.dset.apply_soft_constraints(self.dset.descan_shifts)
+        return total_loss
+
     # region --- properties ---
     @property
     def obj_shape_crop(self) -> np.ndarray:
@@ -283,36 +299,50 @@ class PtychoTomography(Ptychography):
         plt.show()
 
     def visualize(self, cbar: bool = True, return_fig: bool = False, *, cmap: str = "magma"):
-        """Loss curve + central volume cross-sections + probe intensity."""
-        fig = plt.figure(figsize=(12, 7))
-        gs = fig.add_gridspec(2, 4, height_ratios=[1, 2])
-        ax_loss = fig.add_subplot(gs[0, :])
-        losses = np.asarray(self._iter_losses)
-        if losses.size:
-            ax_loss.semilogy(np.arange(len(losses)), losses, c="k")
-        ax_loss.set_xlabel("iteration")
-        ax_loss.set_ylabel("loss")
+        """Losses + learning rates, central volume cross-sections, and the centered complex probe.
 
+        Mirrors the ptychography ``visualize`` layout: the top panel reuses the inherited
+        ``plot_losses`` (loss + LR curves); the probe is shown centered (fftshift) as a complex
+        image, matching the ptychography probe display.
+        """
+        fig = plt.figure(figsize=(13, 7))
+        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.35)
+        ax_top = fig.add_subplot(gs[0])
+        if len(self._iter_losses):
+            self.plot_losses(figax=(fig, ax_top))
+        else:
+            ax_top.text(0.5, 0.5, "no iterations yet", ha="center", va="center")
+            ax_top.set_axis_off()
+
+        gs_bot = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs[1])
+        axs = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(4)])
         secs = self._volume_sections()
         titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
         z_aspect = self.z_sampling / float(np.mean(self.sampling))
-        axs = []
         for i, (sec, title) in enumerate(zip(secs, titles)):
-            ax = fig.add_subplot(gs[1, i])
-            im = ax.imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
-            ax.set_title(title)
+            im = axs[i].imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
+            axs[i].set_title(title)
+            axs[i].set_axis_off()
             if cbar:
-                plt.colorbar(im, ax=ax, fraction=0.046)
-            axs.append(ax)
+                plt.colorbar(im, ax=axs[i], fraction=0.046)
 
-        ax_p = fig.add_subplot(gs[1, 3])
         probe = self.probe
-        probe0 = probe[0] if probe.ndim == 3 else probe
-        show_2d(np.abs(probe0) ** 2, figax=(fig, ax_p), title="probe intensity", cbar=cbar)
-        axs.append(ax_p)
-        plt.tight_layout()
+        probe0 = probe.sum(0) if probe.ndim == 3 else probe
+        show_2d(
+            np.fft.fftshift(probe0),  # centered, complex (amplitude+phase rendering)
+            figax=(fig, axs[3]),
+            title="Probe",
+            cbar=cbar,
+            scalebar={"sampling": float(self.sampling[0]), "units": "Å"},
+        )
+        if len(self._iter_losses):
+            plt.suptitle(
+                f"Final loss: {self._iter_losses[-1]:.3e} | Iters: {len(self._iter_losses)}",
+                fontsize=14,
+                y=0.97,
+            )
         if return_fig:
-            return fig, (ax_loss, np.asarray(axs))
+            return fig, (ax_top, axs)
         plt.show()
 
     # endregion --- visualization ---
