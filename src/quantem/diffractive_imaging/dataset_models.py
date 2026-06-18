@@ -173,6 +173,7 @@ class PtychographyDatasetBase(
         )
         self.register_buffer("_last_patch_positions_px", torch.zeros(self.num_gpts, 2))
         self.register_buffer("_detector_mask", torch.ones(*self.roi_shape))
+        self.positions_mask = torch.ones(self.num_gpts, dtype=torch.bool)
         self.detector_mask = detector_mask
         self._constraints = {}
         self._probe_energy = None
@@ -251,7 +252,7 @@ class PtychographyDatasetBase(
             shifts,
             name="descan_shifts",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._descan_shifts.data = shifts.to(self.device)
 
@@ -273,7 +274,7 @@ class PtychographyDatasetBase(
             positions,
             name="scan_positions_px",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._scan_positions_px.data = positions.to(self.device)
 
@@ -321,7 +322,7 @@ class PtychographyDatasetBase(
             shifts,
             name="initial_descan_shifts",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._initial_descan_shifts = shifts
 
@@ -336,7 +337,7 @@ class PtychographyDatasetBase(
             positions,
             name="initial_scan_positions_px",
             dtype=getattr(torch, config.get("dtype_real")),
-            shape=(self.num_gpts, 2),
+            shape=(self.num_positions, 2),
         )
         self._initial_scan_positions_px = positions
 
@@ -386,7 +387,7 @@ class PtychographyDatasetBase(
 
     # region --- torch.utils.data.Dataset interface ---
     def __len__(self) -> int:
-        return self.num_gpts
+        return self.num_positions
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """Return one sample for the DataLoader.
@@ -424,7 +425,7 @@ class PtychographyDatasetBase(
             name="centered_amplitudes",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._centered_amplitudes = arr
 
@@ -440,7 +441,7 @@ class PtychographyDatasetBase(
             name="amplitudes",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._amplitudes = arr
 
@@ -458,7 +459,7 @@ class PtychographyDatasetBase(
             name="centered_intensities",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._centered_intensities = arr
 
@@ -474,9 +475,27 @@ class PtychographyDatasetBase(
             name="intensities",
             dtype=getattr(torch, config.get("dtype_real")),
             ndim=3,
-            shape=(self.num_gpts, *self.roi_shape),
+            shape=(self.num_positions, *self.roi_shape),
         )
         self._intensities = arr
+
+    @property
+    def positions_mask(self) -> torch.Tensor:
+        """1D boolean mask (length ``num_gpts``) of scan positions kept in the reconstruction.
+        Initialized to all-True. Masked-out (False) positions are dropped from the targets,
+        scan positions, descan shifts, and patch indices during preprocessing.
+        """
+        return self._positions_mask
+
+    @positions_mask.setter
+    def positions_mask(self, mask: torch.Tensor | np.ndarray) -> None:
+        # accept a 2D real-space mask (gpts) or any array-like; flatten to the raster order
+        mask = validate_tensor(mask, name="positions_mask", dtype=torch.bool).reshape(-1)
+        if mask.shape[0] != self.num_gpts:
+            raise ValueError(
+                f"positions_mask must have {self.num_gpts} elements, got {mask.shape[0]}"
+            )
+        self._positions_mask = mask
 
     @property
     def verbose(self) -> int:
@@ -570,6 +589,16 @@ class PtychographyDatasetBase(
     @property
     def num_gpts(self) -> int:
         return int(self.dset.shape[0])
+
+    @property
+    def num_positions(self) -> int:
+        """Number of active scan positions, i.e. ``positions_mask.sum()``.
+
+        Equals ``num_gpts`` until a sparser ``positions_mask`` is applied. This is the length
+        of ``targets``/``scan_positions_px``/``descan_shifts`` and the index range the
+        reconstruction loops (DataLoader, train/val split) operate over.
+        """
+        return int(self.positions_mask.sum())
 
     @property
     def detector_sampling(self) -> np.ndarray:
@@ -1095,6 +1124,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
         if obj_padding_px is None:
             obj_padding_px = np.array([0, 0])
 
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+
         nr, nc = self.gpts
         Sr, Sc = self._scan_sampling
         r = np.arange(nr) * Sr
@@ -1102,9 +1134,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
         r, c = np.meshgrid(r, c, indexing="ij")
 
-        if positions_mask is not None:
-            r = r[positions_mask]
-            c = c[positions_mask]
+        pos_mask_2d = self.positions_mask.reshape(nr, nc).cpu().numpy()
+        r = r[pos_mask_2d]
+        c = c[pos_mask_2d]
 
         positions = np.stack((r.ravel(), c.ravel()), axis=-1).astype(config.get("dtype_real"))
 
@@ -1128,7 +1160,6 @@ class PtychographyDatasetRaster(DatasetConstraints):
         # top-left padding
         positions[:, 0] += obj_padding_px[0]
         positions[:, 1] += obj_padding_px[1]
-
         self.scan_positions_px = positions
         self.initial_scan_positions_px = self.scan_positions_px.data.clone()
         return
@@ -1145,7 +1176,11 @@ class PtychographyDatasetRaster(DatasetConstraints):
         plot_com: str | bool = True,
         vectorized: bool = True,
         probe_energy: float | None = None,
+        positions_mask: np.ndarray | None = None,
     ):
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+
         # Store preprocessing parameters for serialization and reloading
         self._preprocessing_params = {
             "com_fit_function": com_fit_function,
@@ -1157,6 +1192,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             "plot_rotation": False,
             "plot_com": False,
             "vectorized": vectorized,
+            "positions_mask": self.positions_mask.cpu().numpy(),
         }
 
         if probe_energy is not None:
@@ -1264,8 +1300,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             com_measured_c = np.sum(intensities_mask * kcm[None, None], axis=(-2, -1))
 
             intensities_sum = np.sum(intensities_mask, axis=(-2, -1))
+            intensities_mask = intensities_sum == 0
+            intensities_sum[intensities_mask] = 1
             com_measured_r /= intensities_sum
             com_measured_c /= intensities_sum
+            com_measured_r[intensities_mask] = np.nan
+            com_measured_c[intensities_mask] = np.nan
 
         else:
             shape_r, shape_c = intensities.shape[:2]
@@ -1294,7 +1334,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             com_fit_r = com_fit_r * self.roi_shape[0] / 2
             com_fit_c = com_fit_c * self.roi_shape[1] / 2
         else:
-            finite_mask = np.isfinite(com_measured_r)
+            pos_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
+            finite_mask = np.isfinite(com_measured_r) & pos_mask_2d
             com_fit_r, com_fit_c, _com_res_r, _com_res_c = fit_origin(
                 data=(com_measured_r, com_measured_c),
                 fit_function=fit_function,
@@ -1350,7 +1391,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
             """Calculate curl of CoM gradient vector field"""
             grad_r_c = com_r[1:-1, 2:] - com_r[1:-1, :-2]  # dVh/dw
             grad_c_r = com_c[2:, 1:-1] - com_c[:-2, 1:-1]  # dVw/dh
-            return float(np.mean(np.abs(grad_c_r - grad_r_c)))
+            return float(np.nanmean(np.abs(grad_c_r - grad_r_c)))
 
         def calculate_curl_for_angles(
             angles_rad: np.ndarray,
@@ -1369,7 +1410,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
             grad_r_c = rot_r[:, 1:-1, 2:] - rot_r[:, 1:-1, :-2]
             grad_c_r = rot_c[:, 2:, 1:-1] - rot_c[:, :-2, 1:-1]
-            return np.mean(np.abs(grad_c_r - grad_r_c), axis=(-2, -1))
+            return np.nanmean(np.abs(grad_c_r - grad_r_c), axis=(-2, -1))
 
         def plot_curl_results(
             angles_deg: np.ndarray,
@@ -1434,6 +1475,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
         rotation_angles_deg = np.asarray(rotation_angles_deg)
         rotation_angles_rad = np.deg2rad(rotation_angles_deg)
 
+        pos_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
+        com_normalized_masked = self.com_normalized.copy()
+        com_normalized_masked[:, ~pos_mask_2d] = np.nan
+
         # Case 1: Known rotation
         if force_com_rotation is not None:
             _rotation_best_rad = np.deg2rad(force_com_rotation)
@@ -1448,12 +1493,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
             else:
                 # Calculate curl for both transpose options
                 rot_r, rot_c = rotate_com_vectors(
-                    self.com_normalized, _rotation_best_rad, transpose=False
+                    com_normalized_masked, _rotation_best_rad, transpose=False
                 )
                 rotation_curl = calculate_curl(rot_r, rot_c)
 
                 rot_r, rot_c = rotate_com_vectors(
-                    self.com_normalized, _rotation_best_rad, transpose=True
+                    com_normalized_masked, _rotation_best_rad, transpose=True
                 )
                 rotation_curl_transpose = calculate_curl(rot_r, rot_c)
 
@@ -1473,7 +1518,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 # Calculate curl for all angles with known transpose
                 curl_values = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=_rotation_best_transpose,
                 )
 
@@ -1497,13 +1542,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 # Calculate curl for both transpose options
                 rotation_curl = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=False,
                 )
 
                 rotation_curl_transpose = calculate_curl_for_angles(
                     rotation_angles_rad,
-                    self.com_normalized,
+                    com_normalized_masked,
                     transpose=True,
                 )
 
@@ -1572,6 +1617,9 @@ class PtychographyDatasetRaster(DatasetConstraints):
         dtype = config.get("dtype_real")
         diff_intensities = self.intensities_4d.copy().astype(dtype)
         com_fit = self.com_fit
+        if positions_mask is not None:
+            self.positions_mask = positions_mask
+        positions_mask_2d = self.positions_mask.reshape(self.gpts[0], self.gpts[1]).cpu().numpy()
 
         # Aggressive cropping for when off-centered high scattering angle data was recorded
         if crop_patterns:
@@ -1609,9 +1657,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             unit="probe position",
             disable=not self._verbose,
         ):
-            if positions_mask is not None:
-                if not positions_mask[Rr, Rc]:
-                    continue
+            if not positions_mask_2d[Rr, Rc]:
+                continue
 
             intensity = np.maximum(diff_intensities[Rr, Rc], 0)
             intensities[Rr, Rc] = intensity
@@ -1633,16 +1680,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
             centered_amplitudes[Rr, Rc] = shift_amplitude
             centered_intensities[Rr, Rc] = shift_amplitude**2
 
-        if positions_mask is not None:
-            amplitudes = amplitudes[positions_mask]
-            centered_amplitudes = centered_amplitudes[positions_mask]
-            intensities = intensities[positions_mask]
-            centered_intensities = centered_intensities[positions_mask]
-        else:
-            amplitudes = amplitudes.reshape((-1, *self.roi_shape))
-            centered_amplitudes = centered_amplitudes.reshape((-1, *self.roi_shape))
-            intensities = intensities.reshape((-1, *self.roi_shape))
-            centered_intensities = centered_intensities.reshape((-1, *self.roi_shape))
+        amplitudes = amplitudes[positions_mask_2d]
+        centered_amplitudes = centered_amplitudes[positions_mask_2d]
+        intensities = intensities[positions_mask_2d]
+        centered_intensities = centered_intensities[positions_mask_2d]
 
         if crop_patterns:
             amplitudes = amplitudes[:, pattern_crop_mask].reshape((-1, *pattern_crop_mask_shape))
@@ -1661,10 +1702,11 @@ class PtychographyDatasetRaster(DatasetConstraints):
         self.amplitudes = amplitudes
         self.centered_intensities = centered_intensities
         self.intensities = intensities
-        descan_shifts = -1 * np.stack((com_fit[0].flatten(), com_fit[1].flatten()))
         descan_shifts = -1 * com_fit.reshape((2, -1))  # (2, rr*rc)
         descan_shifts += self.roi_shape[:, None] / 2
-        self.descan_shifts = descan_shifts.T
+        descan_shifts = descan_shifts.T  # (rr*rc, 2)
+        descan_shifts = descan_shifts[positions_mask_2d.ravel()]
+        self.descan_shifts = descan_shifts
         self.initial_descan_shifts = self.descan_shifts.data.clone()
 
         self.mean_diffraction_intensity = mean_intensity

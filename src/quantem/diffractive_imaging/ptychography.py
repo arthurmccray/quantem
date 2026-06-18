@@ -380,11 +380,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
-        # Compute the global scan count once — needed to keep loss scale consistent across world
-        global_n = self.dset.num_gpts
+        # Compute the global scan count once — needed to keep loss scale consistent across world.
+        global_n = self.dset.num_positions
 
         train_indices, val_indices = compute_train_val_split(
-            self.dset.num_gpts,
+            self.dset.num_positions,
             self.val_ratio,
             self.val_mode,
             self.rng,

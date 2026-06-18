@@ -1111,7 +1111,7 @@ class ObjectDIP(ObjectConstraints):
             rng=rng,
             _token=cls._token,
         )
-        obj_model.model = model.to(device)
+        obj_model.model = model.to(obj_model.device)
         obj_model.model_input = model_input
         obj_model._set_pretrained_weights(model)
 

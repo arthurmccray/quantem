@@ -156,14 +156,13 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     ):
         if _token is not self._token:
             raise RuntimeError("Use a factory method to instantiate this class.")
-
         # Initialize nn.Module first
         nn.Module.__init__(self)
         RNGMixin.__init__(self, rng=rng, device=device)
         OptimizerMixin.__init__(self)
 
         self.num_probes = num_probes
-        self._device = device
+        self.device = device
         self._probe_params = self.DEFAULT_PROBE_PARAMS
         self._max_aberrations_order = max_aberrations_order
         self.probe_params = probe_params

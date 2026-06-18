@@ -387,7 +387,7 @@ class PtychographyVisualizations(PtychographyBase):
             return fig, axs, {"top": top_img, "bottom": bottom_img}
         return fig, axs
 
-    def show_fourier_probe(self, probe: np.ndarray | None = None):
+    def show_fourier_probe(self, probe: np.ndarray | None = None, **kwargs):
         """
         Show the Fourier transform of the probe.
         Parameters
@@ -421,7 +421,7 @@ class PtychographyVisualizations(PtychographyBase):
             ]
         else:
             titles = "Fourier Probe"
-        show_2d(probes, title=titles, scalebar=scalebar)
+        show_2d(probes, title=titles, scalebar=scalebar, **kwargs)
 
     def show_obj_and_probe(
         self,

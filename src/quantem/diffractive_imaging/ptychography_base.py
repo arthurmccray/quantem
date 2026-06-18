@@ -217,7 +217,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     def _get_probe_overlap(self, max_batch_size: int | None = None) -> np.ndarray:
         prb = self.probe_model.probe[0]
-        num_dps = int(np.prod(self.gpts))
+        num_dps = self.dset.num_positions
         shifted_probes = prb.expand(num_dps, *self.roi_shape)
 
         batch_size = num_dps if max_batch_size is None else int(max_batch_size)
@@ -1120,7 +1120,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             preds = pred_intensities
 
         mask = self.dset.detector_mask
-        n = global_n if global_n is not None else self.dset.num_gpts
+        n = global_n if global_n is not None else self.dset.num_positions
         error = criterion(preds * mask, targets * mask, n)
         loss = error / self.dset.mean_diffraction_intensity
         return loss, targets
