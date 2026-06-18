@@ -11,6 +11,7 @@ from quantem.ptycho_tomography.object_models import (
     ObjectKPlanesTomo,
     ObjectPtychoTomoBase,
     ObjectVoxelTomo,
+    PtychoTomoObjConstraintParams,
     VoxelGrid,
 )
 from quantem.ptycho_tomography.ptycho_tomography import PtychoTomography
@@ -21,6 +22,7 @@ __all__ = [
     "ObjectKPlanesTomo",
     "ObjectPtychoTomoBase",
     "ObjectVoxelTomo",
+    "PtychoTomoObjConstraintParams",
     "VoxelGrid",
     "PtychoTomoPatchData",
     "rot_beam_to_spec",

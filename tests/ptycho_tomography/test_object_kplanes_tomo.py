@@ -6,12 +6,13 @@ backend and tested through the same payload interface. A compact inverse-crime r
 smoke exercises the PPLR fan-out through the full PtychoTomography loop.
 """
 
+from typing import cast
+
 import numpy as np
 import pytest
 import torch
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml import OptimizerParams
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
@@ -293,9 +294,11 @@ class TestReconstructIntegration:
         pt.reconstruct(num_iters=2, optimizer_params={"object": dict(PPLR)}, batch_size=75)
         vol_before = pt.volume.copy()
         path = tmp_path / "kplanes_tomo.zip"
-        pt.save(path, mode="o")
-        loaded = autoserialize_load(path)
+        pt.save(path, mode="o")  # raw data excluded by default -> reattach via from_file(dset=)
+        wrapper2 = cast(PtychoTomoDatasetRaster, pt.dset)  # same wrapper, as the notebook flow
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
         np.testing.assert_allclose(loaded.volume, vol_before, rtol=1e-4, atol=1e-5)
+        assert loaded.dset.implicit_object is True  # re-synced by the from_file override
         loaded.reconstruct(num_iters=2, optimizer_params={"object": dict(PPLR)}, batch_size=75)
 
 

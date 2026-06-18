@@ -14,7 +14,6 @@ import torch
 
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
-from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.probe_models import ProbePixelated
@@ -259,7 +258,12 @@ class TestForwardConsistency:
 
 
 class TestSerialization:
-    def test_save_load_roundtrip(self, inverse_crime_setup, tmp_path):
+    def test_save_from_file_roundtrip_and_visualize(self, inverse_crime_setup, tmp_path):
+        """The notebook flow: save (no raw data) -> rebuild wrapper -> from_file(dset=...) ->
+        visualize. Catches the implicit_object resync and the loaded-object render path."""
+        import matplotlib
+
+        matplotlib.use("Agg")
         arrays, _ = inverse_crime_setup
         pt = _make_ptycho(_make_wrapper(arrays))
         pt.reconstruct(
@@ -269,14 +273,76 @@ class TestSerialization:
         )
         vol_before = pt.volume.copy()
         path = tmp_path / "ptycho_tomo.zip"
-        pt.save(path, mode="o")  # save_raw_data defaults True for the tilt series
-        loaded = autoserialize_load(path)
+        pt.save(path, mode="o")  # raw tilt data excluded by default
+        wrapper2 = _make_wrapper(arrays)  # rebuilt + preprocessed fresh, like the notebook
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
         assert isinstance(loaded, PtychoTomography)
-        assert loaded.dset.implicit_object is True
+        assert loaded.dset.implicit_object is True  # re-synced for the fresh wrapper
         assert loaded.dset.num_tilts == len(TILTS)
         np.testing.assert_allclose(loaded.volume, vol_before, rtol=1e-5, atol=1e-6)
+        # the loaded object must visualize (this exact path failed before the from_file fix)
+        fig, _axs = loaded.visualize(return_fig=True)
+        assert fig is not None
+        # timings survive the round trip
+        assert len(loaded.recon_timings) == 1
+        assert loaded.recon_timings[0]["iters"] == 3
+        assert loaded.recon_timings[0]["s_per_iter"] > 0
         # continued reconstruction runs after reload
         loaded.reconstruct(
+            num_iters=2,
+            optimizer_params={"object": {"name": "adam", "lr": 1e-2}},
+            batch_size=64,
+        )
+        assert len(loaded.recon_timings) == 2
+
+
+class TestSnapshotsAndPadding:
+    def test_snapshots_are_banded_and_cropped(self, inverse_crime_setup):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        pt.reconstruct(
+            num_iters=4,
+            optimizer_params={"object": {"name": "adam", "lr": 1e-2}},
+            batch_size=64,
+            store_snapshots_every=2,
+        )
+        assert len(pt.snapshots) >= 2
+        snp = pt.snapshots[-1]
+        crop = tuple(pt.obj_shape_crop)
+        assert snp["obj"].shape == (min(NUM_SLICES, crop[0]), crop[1], crop[2])
+
+    def test_z_padding_preprocess_and_crop(self, inverse_crime_setup):
+        arrays, _ = inverse_crime_setup
+        wrapper = _make_wrapper(arrays)
+        obj = ObjectVoxelTomo.from_uniform(
+            thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=None, rng=0
+        )
+        probe_model = ProbePixelated.from_array(
+            num_probes=1,
+            probe_params={
+                "energy": PROBE_ENERGY,
+                "C10": C10,
+                "semiangle_cutoff": _semiangle_mrad(),
+            },
+            probe_array=_probe_array(),
+        )
+        pt = PtychoTomography.from_models(
+            wrapper, obj, probe_model, DetectorPixelated(), rng=0, verbose=False
+        )
+        z_pad_px = 4
+        pt.preprocess(obj_padding_px=(PAD, PAD), z_padding_px=z_pad_px)
+        pad_A = z_pad_px * float(np.mean(pt.sampling))
+        assert obj.box_thickness_A == pytest.approx(THICKNESS_A + 2 * pad_A)
+        # cubic z count covers the padded box; the crop removes the padding again
+        assert obj.volume_shape[0] == round(obj.box_thickness_A / float(np.mean(pt.sampling)))
+        crop = pt.volume_cropped
+        assert crop.shape[0] == round(THICKNESS_A / obj.z_voxel_A)
+        assert crop.shape[0] < obj.volume_shape[0]
+        # propagator spacing follows the padded slab thickness
+        assert obj.slab_thickness_A == pytest.approx(obj.box_thickness_A / NUM_SLICES)
+        # reconstruction runs with padding active
+        pt.reconstruct(
             num_iters=2,
             optimizer_params={"object": {"name": "adam", "lr": 1e-2}},
             batch_size=64,

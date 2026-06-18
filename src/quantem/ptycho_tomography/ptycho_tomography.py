@@ -7,7 +7,7 @@ unchanged. The tilt series enters through the paired models — a
 index space, rotation-carrying object-query payload) and a rotation-aware
 :class:`~quantem.ptycho_tomography.object_models.ObjectPtychoTomoBase` object (one 3D specimen
 volume queried at rotated coordinates per tilt). This class only adapts construction/validation,
-preprocessing geometry, and visualization to the 3D object.
+preprocessing geometry, snapshots/timing, and visualization to the 3D object.
 
 Typical use::
 
@@ -15,30 +15,32 @@ Typical use::
     obj = ObjectVoxelTomo.from_uniform(thickness_A=56.0, num_slices=16)
     probe = ProbeParametric.from_params(probe_params={"energy": 300e3, ...})
     pt = PtychoTomography.from_models(dset, obj, probe, DetectorPixelated(), device="gpu")
-    pt.preprocess(obj_padding_px=(32, 32))
-    pt.reconstruct(num_iters=300, optimizer_params={"object": ..., "probe": ...})
-    vol = pt.volume_cropped  # (D, h, w) specimen-frame density, rad/Å
+    pt.preprocess(obj_padding_px=(32, 32), z_padding_px=48)
+    pt.reconstruct(num_iters=300, store_snapshots_every=25,
+                   optimizer_params={"object": ..., "probe": ...})
+    vol = pt.volume_cropped  # (D, h, w) specimen-frame density, rad/Å (padding cropped)
 """
 
+import time
 from pathlib import Path
-from typing import Literal, Self, Sequence, cast
+from typing import Any, Literal, Self, Sequence, cast
 
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 from quantem.core import config
-from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.probe_models import ProbeModelType
 from quantem.diffractive_imaging.ptychography import Ptychography
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
 from quantem.ptycho_tomography.object_models import ObjectPtychoTomoBase
+from quantem.ptycho_tomography.ptycho_tomography_visualizations import (
+    PtychoTomographyVisualizations,
+)
 
 
-class PtychoTomography(Ptychography):
+class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     """Joint multislice-ptychography + tomography reconstruction of one 3D object."""
 
     @classmethod
@@ -79,6 +81,37 @@ class PtychoTomography(Ptychography):
             _token=cls._token,
         )
 
+    @classmethod
+    def from_file(  # pyright: ignore[reportIncompatibleMethodOverride] -- narrowed dset type
+        cls,
+        path: "str | Path",
+        dset: PtychoTomoDatasetRaster | None = None,
+        device: str | int | None = None,
+        verbose: int | bool | None = None,
+        auto_reload_dataset: bool = True,
+    ) -> "PtychoTomography":
+        """Load a saved reconstruction, attaching a (rebuilt + preprocessed) tilt-series dataset.
+
+        Tilt-series saves exclude the raw data by default, so pass ``dset=`` (rebuild the wrapper
+        from the per-tilt files and preprocess it with the same parameters). The attached
+        wrapper's ``implicit_object`` flag is re-synced here — a freshly built wrapper defaults to
+        False and the base ``from_file`` does not re-run the object-model wiring.
+        """
+        pt = super().from_file(
+            path,
+            # the wrapper is a sibling of the single-scan raster class, not a subclass, so the
+            # static type can't narrow; runtime duck-typing through the base from_file is fine
+            dset=cast("Any", dset),
+            device=device,
+            verbose=verbose,
+            auto_reload_dataset=auto_reload_dataset,
+        )
+        if not isinstance(pt, PtychoTomography):
+            raise TypeError(f"loaded object is not a PtychoTomography, got {type(pt)}")
+        if dset is not None:
+            pt.dset.implicit_object = pt.obj_model.is_implicit
+        return pt
+
     # region --- preprocessing ---
     def preprocess(
         self,
@@ -97,6 +130,7 @@ class PtychoTomography(Ptychography):
         plot_com: str | bool = False,
         plot_probe_overlap: bool = False,
         *,
+        z_padding_px: int = 0,
         probe_energy: float | None = None,
         free_per_tilt_arrays: bool = True,
     ) -> Self:
@@ -107,8 +141,14 @@ class PtychoTomography(Ptychography):
         2D probe-overlap FOV mask is replaced by a trivial mask (it is meaningless for a rotated
         3D object — support/positivity constraints play its role), and the object model's volume
         grid is matched to the padded object via ``obj_padding_px``'s ``_initialize_obj`` call.
-        The plotting/batch_size/DP-padding arguments exist for base-signature parity:
-        plots and the probe-overlap mask are skipped, and DP padding is not supported.
+
+        ``z_padding_px`` adds vacuum headroom along the beam on EACH side of the specimen
+        (anisotropic padding: z is set separately from the lateral ``obj_padding_px``). At high
+        tilt, probes near the lateral edges rotate into ``|z| > thickness/2``; for planar
+        (non-vacuum-padded) samples real density lives there. Costs ~no compute (the slab count
+        is fixed), only volume memory. ``volume_cropped`` removes it again.
+        TODO(padding-units): pixel-denominated padding doesn't make sense for implicitly defined
+        objects — consider physical-unit (Å) padding throughout.
         """
         del batch_size, plot_rotation, plot_com, plot_probe_overlap  # unused (parity only)
         if padded_diffraction_intensities_shape is not None:
@@ -142,13 +182,18 @@ class PtychoTomography(Ptychography):
                 device=self._single_device,
             )
 
+        # z padding must be set BEFORE the geometry handshake (it changes the box/slab extent
+        # and hence the cubic z-voxel count and propagator spacings)
+        obj = cast(ObjectPtychoTomoBase, self.obj_model)
+        obj.set_z_padding_A(float(z_padding_px) * float(np.mean(self.sampling)))
+
         # geometry handshake: triggers obj_model._initialize_obj(obj_shape_full, sampling)
         # (volume grid allocation) and re-derives scan positions on the padded grid
         self.obj_padding_px = obj_padding_px
         self.compute_propagator_arrays()
 
         # trivial FOV mask (ndim-3 expanded by the setter); obj_model.mask stays empty so the
-        # INR-style constraints skip it
+        # sampled-coordinate constraints skip it
         full2d = self.dset._obj_shape_full_2d(self.obj_padding_px)
         self.obj_fov_mask = np.ones(tuple(int(s) for s in full2d), dtype=config.get("dtype_real"))
 
@@ -161,21 +206,22 @@ class PtychoTomography(Ptychography):
     def _check_slab_coverage(self) -> None:
         """Warn if the beam-frame multislice slab cannot cover the rotated object support.
 
-        The slab spans ``thickness_A`` along the beam; an isolated object whose support fits in a
-        ball of diameter <= thickness_A is covered at every tilt. We can't know the true support,
-        so warn only on the clear inconsistency ``slab extent < thickness_A`` (always wrong) and
-        leave wide/planar-sample coverage (lateral extent >> thickness) to the user.
+        The slab spans the padded box along the beam; an isolated object whose support fits in a
+        ball of diameter <= box_thickness_A is covered at every tilt. We can't know the true
+        support, so warn only on the clear inconsistency ``slab extent < box thickness`` (always
+        wrong) and leave wide/planar-sample coverage (lateral extent >> thickness) to the user.
         """
         obj = self.obj_model
         if not isinstance(obj, ObjectPtychoTomoBase):  # pragma: no cover - guarded by from_models
             return
         slab = obj.slab_thickness_A * obj.num_slices
-        if slab < obj.thickness_A * (1 - 1e-6):
+        if slab < obj.box_thickness_A * (1 - 1e-6):
             from warnings import warn
 
             warn(
                 f"multislice slab extent ({slab:.2f} Å) is smaller than the object box thickness "
-                f"({obj.thickness_A:.2f} Å); the rotated object will be cropped along the beam.",
+                f"({obj.box_thickness_A:.2f} Å); the rotated object will be cropped along the "
+                "beam.",
                 stacklevel=2,
             )
 
@@ -195,24 +241,66 @@ class PtychoTomography(Ptychography):
         total_loss = total_loss + self.dset.apply_soft_constraints(self.dset.descan_shifts)
         return total_loss
 
+    # region --- reconstruction (timing wrapper) ---
+    @property
+    def recon_timings(self) -> list[dict]:
+        """Per-``reconstruct()``-call wall-clock records: ``{iters, seconds, s_per_iter, when}``.
+
+        Serialized with the object, so loading a completed reconstruction shows how long it took.
+        """
+        if not hasattr(self, "_recon_timings"):
+            self._recon_timings: list[dict] = []
+        return self._recon_timings
+
+    def reconstruct(self, *args, **kwargs) -> Self:
+        timings = self.recon_timings  # ensures the attribute exists
+        iters_before = len(self._iter_losses)
+        t0 = time.time()
+        out = super().reconstruct(*args, **kwargs)
+        seconds = time.time() - t0
+        iters_run = len(self._iter_losses) - iters_before
+        if iters_run > 0:
+            timings.append(
+                {
+                    "iters": iters_run,
+                    "seconds": round(seconds, 2),
+                    "s_per_iter": round(seconds / iters_run, 3),
+                    "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        return out
+
+    def _store_current_iter_snapshot(self) -> None:
+        """
+        Full padded volumes are ~hundreds of MB each; also not sure how this should work with 
+        implicitly defined objects. Answer might be checkpointing the model? 
+        """
+        raise NotImplementedError("Not implemented yet for ptychotomo")
+
+    # endregion --- reconstruction (timing wrapper) ---
+
     # region --- properties ---
     @property
     def obj_shape_crop(self) -> np.ndarray:
-        """``(D, h, w)``: the specimen volume cropped laterally to the scan FOV (full z)."""
+        """``(D, h, w)``: the specimen volume cropped to the scan FOV laterally AND to the
+        un-padded specimen thickness along z (the z padding is vacuum headroom, not specimen)."""
         shp = np.floor(self.dset.fov / self.sampling)
         shp += shp % 2
         obj = self.obj_model
         assert isinstance(obj, ObjectPtychoTomoBase)
-        return np.concatenate([[obj.volume_shape[0]], shp]).astype("int")
+        d_specimen = max(1, round(obj.thickness_A / obj.z_voxel_A))
+        d_specimen = min(d_specimen, obj.volume_shape[0])
+        return np.concatenate([[d_specimen], shp]).astype("int")
 
     @property
     def volume(self) -> np.ndarray:
-        """Materialized specimen-frame volume ``(D, H, W)`` (density, rad/Å) on the padded grid."""
+        """Materialized specimen-frame volume ``(D, H, W)`` (density, rad/Å) on the padded grid
+        (includes z padding; use ``volume_cropped`` for the specimen)."""
         return self.obj
 
     @property
     def volume_cropped(self) -> np.ndarray:
-        """Specimen-frame volume cropped laterally to the scan FOV, ``(D, h, w)``."""
+        """Specimen-frame volume cropped to the scan FOV and specimen thickness, ``(D, h, w)``."""
         return self.obj_cropped
 
     @property
@@ -226,7 +314,7 @@ class PtychoTomography(Ptychography):
         """Specimen-frame z voxel size of the volume grid (Å)."""
         obj = self.obj_model
         assert isinstance(obj, ObjectPtychoTomoBase)
-        return obj.thickness_A / obj.volume_shape[0]
+        return obj.z_voxel_A
 
     # endregion --- properties ---
 
@@ -237,20 +325,11 @@ class PtychoTomography(Ptychography):
         store: Literal["auto", "zip", "dir"] = "auto",
         skip: "str | type | Sequence[str | type]" = (),
         compression_level: int | None = 4,
-        save_raw_data: bool = True,
+        save_raw_data: bool = False,
         verbose: int | bool = True,
     ):
-        """Save the reconstruction. ``save_raw_data`` defaults to True (unlike single-scan
-        ptychography): the concatenated tilt stack has no single source file path, so the
-        load-time dataset-rebuild path is not available yet."""
-        if not save_raw_data:
-            from warnings import warn
-
-            warn(
-                "save_raw_data=False: reloading will not be able to rebuild the tilt-series "
-                "dataset automatically (no single source file); pass dset= to from_file.",
-                stacklevel=2,
-            )
+        """Save the reconstruction (raw tilt data excluded by default — rebuild the wrapper and
+        attach it via ``from_file(path, dset=...)`` to visualize or continue training)."""
         return super().save(
             path,
             mode=mode,
@@ -260,89 +339,3 @@ class PtychoTomography(Ptychography):
             save_raw_data=save_raw_data,
             verbose=verbose,
         )
-
-    # region --- visualization ---
-    def _volume_sections(self, slab_frac: float = 0.1) -> list[np.ndarray]:
-        """Slab-averaged central cross-sections [(y,x), (z,x), (z,y)] of the cropped volume."""
-        vol = self.volume_cropped
-        secs = []
-        for ax in range(3):
-            n = vol.shape[ax]
-            half = max(1, int(round(n * slab_frac / 2)))
-            lo, hi = max(0, n // 2 - half), min(n, n // 2 + half)
-            secs.append(vol.take(range(lo, hi), axis=ax).mean(axis=ax))
-        return secs
-
-    def show_volume_sections(
-        self,
-        slab_frac: float = 0.1,
-        cmap: str = "magma",
-        axsize: tuple[float, float] = (4.0, 4.0),
-        returnfig: bool = False,
-    ):
-        """Central slab-averaged cross-sections of the reconstructed volume.
-
-        The (z, x) and (z, y) panels are drawn with the true physical aspect
-        (``z_sampling / lateral sampling``) so depth sections read to scale.
-        """
-        secs = self._volume_sections(slab_frac)
-        titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
-        fig, axs = plt.subplots(1, 3, figsize=(3 * axsize[0], axsize[1]))
-        z_aspect = self.z_sampling / float(np.mean(self.sampling))
-        for i, (ax, sec, title) in enumerate(zip(axs, secs, titles)):
-            im = ax.imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
-            ax.set_title(title)
-            plt.colorbar(im, ax=ax, fraction=0.046)
-        plt.tight_layout()
-        if returnfig:
-            return fig, axs
-        plt.show()
-
-    def visualize(self, cbar: bool = True, return_fig: bool = False, *, cmap: str = "magma"):
-        """Losses + learning rates, central volume cross-sections, and the centered complex probe.
-
-        Mirrors the ptychography ``visualize`` layout: the top panel reuses the inherited
-        ``plot_losses`` (loss + LR curves); the probe is shown centered (fftshift) as a complex
-        image, matching the ptychography probe display.
-        """
-        fig = plt.figure(figsize=(13, 7))
-        gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.35)
-        ax_top = fig.add_subplot(gs[0])
-        if len(self._iter_losses):
-            self.plot_losses(figax=(fig, ax_top))
-        else:
-            ax_top.text(0.5, 0.5, "no iterations yet", ha="center", va="center")
-            ax_top.set_axis_off()
-
-        gs_bot = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs[1])
-        axs = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(4)])
-        secs = self._volume_sections()
-        titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
-        z_aspect = self.z_sampling / float(np.mean(self.sampling))
-        for i, (sec, title) in enumerate(zip(secs, titles)):
-            im = axs[i].imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
-            axs[i].set_title(title)
-            axs[i].set_axis_off()
-            if cbar:
-                plt.colorbar(im, ax=axs[i], fraction=0.046)
-
-        probe = self.probe
-        probe0 = probe.sum(0) if probe.ndim == 3 else probe
-        show_2d(
-            np.fft.fftshift(probe0),  # centered, complex (amplitude+phase rendering)
-            figax=(fig, axs[3]),
-            title="Probe",
-            cbar=cbar,
-            scalebar={"sampling": float(self.sampling[0]), "units": "Å"},
-        )
-        if len(self._iter_losses):
-            plt.suptitle(
-                f"Final loss: {self._iter_losses[-1]:.3e} | Iters: {len(self._iter_losses)}",
-                fontsize=14,
-                y=0.97,
-            )
-        if return_fig:
-            return fig, (ax_top, axs)
-        plt.show()
-
-    # endregion --- visualization ---

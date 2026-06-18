@@ -282,29 +282,10 @@ class TestObjectVoxelTomoStateAndConstraints:
         loss = obj.apply_soft_constraints()
         assert loss.item() == 0.0
 
-    def test_pretrain_fits_target(self):
-        target = torch.zeros(5, 9, 9)
-        target[2, 3:6, 3:6] = 1.0
+    def test_voxel_has_no_pretrain(self):
+        # warm starts go through set_volume; pretraining is the K-Planes backend's concern
         obj = make_initialized_voxel_obj(volume_shape=(5, 9, 9))
-        obj.pretrain(
-            pretrain_target=target,
-            num_iters=150,
-            optimizer_params={"name": "adam", "lr": 5e-2},
-            show=False,
-        )
-        assert torch.allclose(obj.volume, target, atol=1e-2)
-        # pretrained weights become the reset state
-        model = obj._model
-        assert isinstance(model, VoxelGrid)
-        with torch.no_grad():
-            model.volume.zero_()
-        obj.reset()
-        assert torch.allclose(obj.volume, target, atol=1e-2)
-
-    def test_pretrain_shape_mismatch_raises(self):
-        obj = make_initialized_voxel_obj(volume_shape=(5, 9, 9))
-        with pytest.raises(ValueError, match="volume_shape"):
-            obj.pretrain(pretrain_target=torch.zeros(4, 9, 9), num_iters=1, show=False)
+        assert not hasattr(obj, "pretrain")
 
     def test_box_half_extents(self):
         obj = make_initialized_voxel_obj(
@@ -321,21 +302,56 @@ class TestObjectVoxelTomoStateAndConstraints:
             _ = obj._box_half_extents
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestZPadding:
+    def test_box_extends_and_crop_target_unchanged(self):
+        obj = ObjectVoxelTomo.from_uniform(thickness_A=8.0, num_slices=4)
+        obj.set_z_padding_A(2.0)
+        assert obj.box_thickness_A == pytest.approx(12.0)
+        assert obj.thickness_A == pytest.approx(8.0)  # specimen thickness unchanged
+        assert obj.slab_thickness_A == pytest.approx(3.0)  # slabs span the padded box
+        assert obj.slice_thicknesses is not None
+        assert torch.allclose(obj.slice_thicknesses, torch.full((3,), 3.0))
+        obj._initialize_obj((4, 17, 17), sampling=(0.5, 0.5))
+        h_z, _hy, _hx = obj._box_half_extents
+        assert h_z == pytest.approx(6.0)
+        # cubic default z count follows the padded box
+        assert obj.volume_shape[0] == round(12.0 / 0.5)
+
+    def test_padded_box_covers_rotated_lateral_probes(self):
+        """At high tilt, points near the lateral edge rotate to |z| > thickness/2; with z padding
+        they stay inside the box (density there is representable, not force-masked to vacuum)."""
+        thickness, lat_half = 8.0, 8.0  # h_y = 8 at 70 deg -> |z_spec| up to ~8.4 > 4
+        obj_pad = ObjectVoxelTomo.from_uniform(thickness_A=thickness, num_slices=4)
+        obj_pad.set_z_padding_A(6.0)  # box half-z = 10 > 8.4
+        obj_pad._initialize_obj((4, 33, 33), sampling=(2 * lat_half / 32, 2 * lat_half / 32))
+        # uniform density: with full coverage every slab phase = density * slab_thickness even
+        # for edge patches at 70 deg... only true where the rotated point stays in the box;
+        # instead check the masked fraction shrinks vs the unpadded object
+        obj_nopad = ObjectVoxelTomo.from_uniform(thickness_A=thickness, num_slices=4)
+        obj_nopad._initialize_obj((4, 33, 33), sampling=(2 * lat_half / 32, 2 * lat_half / 32))
+
+        def covered_fraction(obj, density=0.05):  # small density: slab phase stays << pi
+            with torch.no_grad():
+                obj.set_volume(torch.full(obj.volume_shape, density), set_as_initial=False)
+                out = obj.forward(full_fov_payload(33, tilt_deg=70.0))
+                phase = torch.angle(out)
+                expected = density * obj.slab_thickness_A  # full coverage value
+                return (phase > 0.95 * expected).float().mean().item()
+
+        assert covered_fraction(obj_pad) > covered_fraction(obj_nopad)
 
 
 class TestHardPositivity:
     def test_project_parameters_clamps_potential(self):
         vol = torch.rand(5, 7, 7) - 0.5
         obj = make_initialized_voxel_obj(volume=vol, volume_shape=(5, 7, 7))
-        obj.project_parameters()
+        obj.project_parameters()  # constraints.positivity defaults True
         assert (obj.volume >= 0).all()
 
     def test_opt_out_and_pure_phase_untouched(self):
         vol = torch.rand(5, 7, 7) - 0.5
         obj = make_initialized_voxel_obj(volume=vol, volume_shape=(5, 7, 7))
-        obj.hard_positivity = False
+        obj.constraints = {"positivity": False}  # hard positivity now lives in the constraints
         obj.project_parameters()
         assert (obj.volume < 0).any()
         obj2 = make_initialized_voxel_obj(
@@ -349,9 +365,18 @@ class TestHardPositivity:
         vol += 0.05  # uniform haze
         vol[2, 4:6, 4:6] = 1.0  # feature on plane 2
         obj = make_initialized_voxel_obj(volume=vol, volume_shape=(6, 10, 10))
-        obj.shrink_quantile = 0.3
+        obj.constraints = {"shrink_quantile": 0.3}
         obj.project_parameters()
         out = obj.volume
         # haze-only planes pinned to 0; the feature survives (shifted by the plane floor)
         assert out[0].abs().max() < 1e-6
         assert out[2].max() > 0.9
+
+    def test_constraint_keys_validated(self):
+        obj = make_initialized_voxel_obj()
+        with pytest.raises(KeyError, match="Invalid constraint key"):
+            obj.constraints = {"identical_slices": True}  # a Raster key, not a Volume key
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
