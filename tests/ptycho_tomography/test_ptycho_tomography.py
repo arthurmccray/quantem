@@ -184,6 +184,16 @@ class TestWiring:
         assert crop.shape == tuple(pt.obj_shape_crop)
         assert crop.shape[0] == NUM_Z_VOX
 
+    def test_volume_cropped_cubic_is_centered_cube(self, inverse_crime_setup):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        vc = pt.volume_cropped
+        cube = pt.volume_cropped_cubic
+        n = min(vc.shape)
+        assert cube.shape == (n, n, n)  # consistent cubic framing (WS4: z vacuum vs scan FOV)
+        sl = tuple(slice((s - n) // 2, (s - n) // 2 + n) for s in vc.shape)
+        np.testing.assert_array_equal(cube, vc[sl])
+
     def test_from_models_type_validation(self, inverse_crime_setup):
         arrays, _ = inverse_crime_setup
         wrapper = _make_wrapper(arrays)

@@ -318,8 +318,28 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
     @property
     def volume_cropped(self) -> np.ndarray:
-        """Specimen-frame volume cropped to the scan FOV and specimen thickness, ``(D, h, w)``."""
+        """Specimen-frame volume cropped to the scan FOV and specimen thickness, ``(D, h, w)``.
+
+        Intentionally **non-cubic**: z spans the full specimen thickness (``thickness_A``) while
+        the lateral dims span the scan FOV. For a compact object smaller than the box this shows
+        vacuum headroom along z that the (often narrower) scan FOV crops away laterally — so depth
+        sections can look vacuum-padded top/bottom relative to the projection. Use
+        ``volume_cropped_cubic`` for a consistent cubic view.
+        """
         return self.obj_cropped
+
+    @property
+    def volume_cropped_cubic(self) -> np.ndarray:
+        """``volume_cropped`` center-cropped to a cube (side = the smallest of its three extents).
+
+        Convenience view for consistent display when ``volume_cropped`` is non-cubic (z = full
+        specimen thickness vs lateral = scan FOV). Does not change the reconstruction or the
+        default ``volume``/``volume_cropped`` returned for scoring.
+        """
+        vol = self.volume_cropped
+        n = int(min(vol.shape))
+        sl = tuple(slice((s - n) // 2, (s - n) // 2 + n) for s in vol.shape)
+        return vol[sl]
 
     @property
     def thickness_A(self) -> float:

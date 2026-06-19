@@ -16,9 +16,13 @@ from quantem.core.visualization import show_2d
 class PtychoTomographyVisualizations:
     """Volume-aware visualization methods (mixin; expects the PtychoTomography interface)."""
 
-    def _volume_sections(self, slab_frac: float = 0.1) -> list[np.ndarray]:
-        """Slab-averaged central cross-sections [(y,x), (z,x), (z,y)] of the cropped volume."""
-        vol = self.volume_cropped  # type: ignore[attr-defined]
+    def _volume_sections(self, slab_frac: float = 0.1, cubic: bool = False) -> list[np.ndarray]:
+        """Slab-averaged central cross-sections [(y,x), (z,x), (z,y)] of the cropped volume.
+
+        ``cubic=True`` uses ``volume_cropped_cubic`` (center-cropped to a cube) so depth sections
+        are framed consistently with the projection instead of showing z vacuum headroom.
+        """
+        vol = self.volume_cropped_cubic if cubic else self.volume_cropped  # type: ignore[attr-defined]
         secs = []
         for ax in range(3):
             n = vol.shape[ax]
@@ -33,13 +37,15 @@ class PtychoTomographyVisualizations:
         cmap: str = "magma",
         axsize: tuple[float, float] = (4.0, 4.0),
         returnfig: bool = False,
+        cubic: bool = False,
     ):
         """Central slab-averaged cross-sections of the reconstructed volume.
 
         The (z, x) and (z, y) panels are drawn with the true physical aspect
-        (``z_voxel / lateral sampling``) so depth sections read to scale.
+        (``z_voxel / lateral sampling``) so depth sections read to scale. ``cubic=True``
+        center-crops to a cube first (consistent framing; no z vacuum headroom).
         """
-        secs = self._volume_sections(slab_frac)
+        secs = self._volume_sections(slab_frac, cubic=cubic)
         titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
         fig, axs = plt.subplots(1, 3, figsize=(3 * axsize[0], axsize[1]))
         z_aspect = self.z_sampling / float(np.mean(self.sampling))  # type: ignore[attr-defined]
@@ -52,12 +58,20 @@ class PtychoTomographyVisualizations:
             return fig, axs
         plt.show()
 
-    def visualize(self, cbar: bool = True, return_fig: bool = False, *, cmap: str = "magma"):
+    def visualize(
+        self,
+        cbar: bool = True,
+        return_fig: bool = False,
+        *,
+        cmap: str = "magma",
+        cubic: bool = False,
+    ):
         """Losses + learning rates, central volume cross-sections, and the centered complex probe.
 
         Mirrors the ptychography ``visualize`` layout: the top panel reuses the inherited
         ``plot_losses`` (loss + LR curves); the probe is shown centered (fftshift) as a complex
-        image, matching the ptychography probe display.
+        image, matching the ptychography probe display. ``cubic=True`` center-crops the volume
+        to a cube for the cross-sections (consistent framing; no z vacuum headroom).
         """
         fig = plt.figure(figsize=(13, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.35)
@@ -71,7 +85,7 @@ class PtychoTomographyVisualizations:
 
         gs_bot = gridspec.GridSpecFromSubplotSpec(1, 4, subplot_spec=gs[1])
         axs = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(4)])
-        secs = self._volume_sections()
+        secs = self._volume_sections(cubic=cubic)
         titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
         z_aspect = self.z_sampling / float(np.mean(self.sampling))  # type: ignore[attr-defined]
         for i, (sec, title) in enumerate(zip(secs, titles)):
