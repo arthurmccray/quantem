@@ -270,7 +270,9 @@ class TestSerialization:
             num_iters=3,
             optimizer_params={"object": {"name": "adam", "lr": 1e-2}},
             batch_size=64,
+            store_snapshots_every=2,  # present at save -> exercises the snapshot-skip path
         )
+        assert len(pt.snapshots) >= 1
         vol_before = pt.volume.copy()
         path = tmp_path / "ptycho_tomo.zip"
         pt.save(path, mode="o")  # raw tilt data excluded by default
@@ -280,25 +282,26 @@ class TestSerialization:
         assert isinstance(loaded, PtychoTomography)
         assert loaded.dset.implicit_object is True  # re-synced for the fresh wrapper
         assert loaded.dset.num_tilts == len(TILTS)
+        # snapshots (object state_dicts) survive the round trip and re-materialize after load
+        assert len(loaded.snapshots) == len(pt.snapshots)
+        assert "state_dict" in loaded.snapshots[-1]
+        snp = loaded.get_snapshot_by_iter(loaded.snapshots[-1]["iteration"], cropped=True)
+        assert snp["obj"].shape == tuple(loaded.obj_shape_crop)
         np.testing.assert_allclose(loaded.volume, vol_before, rtol=1e-5, atol=1e-6)
         # the loaded object must visualize (this exact path failed before the from_file fix)
         fig, _axs = loaded.visualize(return_fig=True)
         assert fig is not None
-        # timings survive the round trip
-        assert len(loaded.recon_timings) == 1
-        assert loaded.recon_timings[0]["iters"] == 3
-        assert loaded.recon_timings[0]["s_per_iter"] > 0
         # continued reconstruction runs after reload
         loaded.reconstruct(
             num_iters=2,
             optimizer_params={"object": {"name": "adam", "lr": 1e-2}},
             batch_size=64,
         )
-        assert len(loaded.recon_timings) == 2
+        assert loaded.num_iters == 5
 
 
 class TestSnapshotsAndPadding:
-    def test_snapshots_are_banded_and_cropped(self, inverse_crime_setup):
+    def test_snapshots_checkpoint_and_materialize(self, inverse_crime_setup):
         arrays, _ = inverse_crime_setup
         pt = _make_ptycho(_make_wrapper(arrays))
         pt.reconstruct(
@@ -308,9 +311,17 @@ class TestSnapshotsAndPadding:
             store_snapshots_every=2,
         )
         assert len(pt.snapshots) >= 2
-        snp = pt.snapshots[-1]
-        crop = tuple(pt.obj_shape_crop)
-        assert snp["obj"].shape == (min(NUM_SLICES, crop[0]), crop[1], crop[2])
+        # snapshots hold a lightweight object state_dict, not a materialized volume
+        assert "state_dict" in pt.snapshots[-1]
+        # materializing a snapshot returns the cropped specimen volume and restores live state
+        vol_now = pt.volume.copy()
+        last_iter = pt.snapshots[-1]["iteration"]
+        snp = pt.get_snapshot_by_iter(last_iter, cropped=True)
+        assert snp["obj"].shape == tuple(pt.obj_shape_crop)
+        np.testing.assert_allclose(pt.volume, vol_now)
+        # closest=True resolves to a stored iteration
+        snp_closest = pt.get_snapshot_by_iter(last_iter - 1, closest=True)
+        assert snp_closest["iteration"] in [s["iteration"] for s in pt.snapshots]
 
     def test_z_padding_preprocess_and_crop(self, inverse_crime_setup):
         arrays, _ = inverse_crime_setup

@@ -57,8 +57,7 @@ class PtychoTomographyVisualizations:
 
         Mirrors the ptychography ``visualize`` layout: the top panel reuses the inherited
         ``plot_losses`` (loss + LR curves); the probe is shown centered (fftshift) as a complex
-        image, matching the ptychography probe display. Reconstruction timing (s/iter) is shown
-        in the title when available.
+        image, matching the ptychography probe display.
         """
         fig = plt.figure(figsize=(13, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.35)
@@ -92,9 +91,6 @@ class PtychoTomographyVisualizations:
         )
         if len(iter_losses):
             title = f"Final loss: {iter_losses[-1]:.3e} | Iters: {len(iter_losses)}"
-            timings = getattr(self, "_recon_timings", [])
-            if timings:
-                title += f" | {timings[-1]['s_per_iter']:.1f} s/iter"
             plt.suptitle(title, fontsize=14, y=0.97)
         if return_fig:
             return fig, (ax_top, axs)

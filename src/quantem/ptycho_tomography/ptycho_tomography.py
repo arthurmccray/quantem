@@ -7,7 +7,7 @@ unchanged. The tilt series enters through the paired models — a
 index space, rotation-carrying object-query payload) and a rotation-aware
 :class:`~quantem.ptycho_tomography.object_models.ObjectPtychoTomoBase` object (one 3D specimen
 volume queried at rotated coordinates per tilt). This class only adapts construction/validation,
-preprocessing geometry, snapshots/timing, and visualization to the 3D object.
+preprocessing geometry, snapshots, and visualization to the 3D object.
 
 Typical use::
 
@@ -21,7 +21,7 @@ Typical use::
     vol = pt.volume_cropped  # (D, h, w) specimen-frame density, rad/Å (padding cropped)
 """
 
-import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal, Self, Sequence, cast
 
@@ -241,43 +241,61 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         total_loss = total_loss + self.dset.apply_soft_constraints(self.dset.descan_shifts)
         return total_loss
 
-    # region --- reconstruction (timing wrapper) ---
-    @property
-    def recon_timings(self) -> list[dict]:
-        """Per-``reconstruct()``-call wall-clock records: ``{iters, seconds, s_per_iter, when}``.
-
-        Serialized with the object, so loading a completed reconstruction shows how long it took.
-        """
-        if not hasattr(self, "_recon_timings"):
-            self._recon_timings: list[dict] = []
-        return self._recon_timings
-
-    def reconstruct(self, *args, **kwargs) -> Self:
-        timings = self.recon_timings  # ensures the attribute exists
-        iters_before = len(self._iter_losses)
-        t0 = time.time()
-        out = super().reconstruct(*args, **kwargs)
-        seconds = time.time() - t0
-        iters_run = len(self._iter_losses) - iters_before
-        if iters_run > 0:
-            timings.append(
-                {
-                    "iters": iters_run,
-                    "seconds": round(seconds, 2),
-                    "s_per_iter": round(seconds / iters_run, 3),
-                    "when": time.strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
-        return out
-
+    # region --- snapshots ---
     def _store_current_iter_snapshot(self) -> None:
-        """
-        Full padded volumes are ~hundreds of MB each; also not sure how this should work with 
-        implicitly defined objects. Answer might be checkpointing the model? 
-        """
-        raise NotImplementedError("Not implemented yet for ptychotomo")
+        """Checkpoint the object backend at the current iteration (object-only, lightweight).
 
-    # endregion --- reconstruction (timing wrapper) ---
+        Stores a CPU copy of the backend ``state_dict`` rather than a materialized volume: tiny
+        for the K-Planes backend (feature grids + decoder) and at most the volume size for the
+        dense voxel grid, but never forced onto the GPU. ``get_snapshot_by_iter`` re-materializes
+        the volume on demand. The probe is shared across tilts and is not snapshotted.
+        """
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        state = {k: v.detach().cpu().clone() for k, v in obj_model.model.state_dict().items()}
+        # snapshots carry an object state_dict rather than the base (obj, probe) arrays
+        self._snapshots.append({"iteration": self.num_iters, "state_dict": state})  # type: ignore[typeddict-item]
+
+    def get_snapshot_by_iter(  # pyright: ignore[reportIncompatibleMethodOverride] -- volume snapshot
+        self, iteration: int, closest: bool = False, cropped: bool = True
+    ) -> dict:
+        """Materialize the object volume checkpointed at a stored iteration.
+
+        Snapshots hold only the backend ``state_dict``; this temporarily loads it into the live
+        backend, reads the volume (cropped to the specimen by default), then restores the current
+        state. Returns ``{"iteration", "obj"}`` where ``obj`` is the specimen-frame volume
+        ``(D, h, w)`` (``cropped=True``) or the padded ``(D, H, W)`` volume.
+        """
+        if len(self._snapshots) == 0:
+            raise ValueError(
+                "No snapshots available. Pass store_snapshots_every=... to reconstruct()."
+            )
+        iteration = int(iteration)
+        if iteration < 0:
+            iteration = self.num_iters + iteration
+        iters = [s["iteration"] for s in self._snapshots]
+        if closest:
+            snp = min(self._snapshots, key=lambda s: abs(s["iteration"] - iteration))
+        elif iteration in iters:
+            snp = self._snapshots[iters.index(iteration)]
+        else:
+            raise ValueError(
+                f"No snapshot at iteration {iteration}; set closest=True for the nearest stored."
+            )
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        model = obj_model.model
+        saved = deepcopy(model.state_dict())
+        try:
+            model.load_state_dict(
+                {k: v.to(obj_model.device) for k, v in snp["state_dict"].items()}  # type: ignore[typeddict-item]
+            )
+            obj_model._invalidate_obj_cache()
+            vol = self.volume_cropped if cropped else self.volume
+        finally:
+            model.load_state_dict(saved)
+            obj_model._invalidate_obj_cache()
+        return {"iteration": snp["iteration"], "obj": vol}
+
+    # endregion --- snapshots ---
 
     # region --- properties ---
     @property
@@ -329,7 +347,11 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         verbose: int | bool = True,
     ):
         """Save the reconstruction (raw tilt data excluded by default — rebuild the wrapper and
-        attach it via ``from_file(path, dset=...)`` to visualize or continue training)."""
+        attach it via ``from_file(path, dset=...)`` to visualize or continue training).
+
+        Iteration snapshots (lightweight object state_dicts) round-trip like the base class's;
+        pass ``skip=("_snapshots",)`` to drop them for a leaner save.
+        """
         return super().save(
             path,
             mode=mode,
