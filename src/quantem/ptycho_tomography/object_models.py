@@ -178,6 +178,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
     # Compute scales linearly with this; set to 1 for fast midpoint-rule prototyping.
     samples_per_slab: int | None = None
 
+    # Soft cap on rotated-coordinate points materialized per ``forward`` chunk. The S*K
+    # slab-quadrature sample sets are processed in chunks of ``budget // (B*Hroi*Wroi)`` sample-sets
+    # (then trimmed to the in-box subset before the backend query). Sized for a few million points
+    # per chunk -- the same budget used by ``_query_volume_grid`` -- so peak activation memory and
+    # the per-chunk dense coordinate tensors stay bounded regardless of batch size.
+    _forward_point_budget: int = 4_000_000
+
     def __init__(
         self,
         model: nn.Module,
@@ -484,21 +491,47 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         lat_y = ryy * y_b + ryx * x_b
         lat_x = rxy * y_b + rxx * x_b
 
-        phases = []
-        for s in range(self.num_slices):
-            acc = None
-            for z_off in z_offsets:  # K is small; loop keeps per-call memory at (B, H, W)
-                z_k = z_centers[s] + z_off
-                n_z = (rzz * z_k + lat_z) / h_z
-                n_y = (ryz * z_k + lat_y) / h_y
-                n_x = (rxz * z_k + lat_x) / h_x
-                inside = (n_z.abs() <= 1.0) & (n_y.abs() <= 1.0) & (n_x.abs() <= 1.0)
-                pts = torch.stack([n_z, n_y, n_x], dim=-1).reshape(-1, 3)
-                vals = self._model(pts).reshape(coords.shape[:3]) * inside.to(coords.dtype)
-                acc = vals if acc is None else acc + vals
-            assert acc is not None
-            phases.append(acc * (t_slab / len(z_offsets)))
-        phase = torch.stack(phases, dim=0)  # (S, B, Hroi, Wroi)
+        # Batch the (slice, z_off) backend queries and query only the in-box samples. The S*K
+        # slab-quadrature sample sets are flattened into one (S*K,) z-axis and processed in chunks
+        # of ``group`` sample-sets (sized for a fixed points-per-call budget). Within each chunk we
+        # compute the rotated coordinates, drop the out-of-box points (they contribute exactly zero
+        # density -- the ``inside`` mask), query the backend on ONLY the kept points, and scatter
+        # the result back into the per-slice accumulator. This keeps the slab-binning math
+        # identical -- per slab the phase is still ``t_slab * mean_k(masked val_k)`` -- while
+        # shrinking the dominant ``grid_sampler_2d_backward`` work to the in-box fraction (and
+        # collapsing S*K small backend calls into a few large ones). The backward over the backend
+        # query dominates wall time, so trimming its point count is the lever that pays off.
+        s_idx = torch.arange(self.num_slices, device=coords.device)
+        z_grid = z_centers.view(-1, 1) + z_offsets.view(1, -1)  # (S, K) physical z per sample
+        z_flat = z_grid.reshape(-1)  # (S*K,)
+        slice_of = s_idx.view(-1, 1).expand(self.num_slices, z_offsets.shape[0]).reshape(-1)
+        n_samples = z_flat.shape[0]
+
+        b, h, w = coords.shape[:3]
+        bhw = b * h * w
+        group = max(1, min(n_samples, self._forward_point_budget // max(bhw, 1)))
+
+        acc = torch.zeros((self.num_slices * bhw,), dtype=coords.dtype, device=coords.device)
+        # flat per-(slice, sample, b, h, w) position in ``acc`` for scatter; slice offset added below
+        base = torch.arange(bhw, device=coords.device)
+        for start in range(0, n_samples, group):
+            g = min(group, n_samples - start)
+            zk = z_flat[start : start + g].view(-1, 1, 1, 1)  # (g, 1, 1, 1)
+            n_z = (rzz * zk + lat_z) / h_z  # (g, B, H, W)
+            n_y = (ryz * zk + lat_y) / h_y
+            n_x = (rxz * zk + lat_x) / h_x
+            inside = (n_z.abs() <= 1.0) & (n_y.abs() <= 1.0) & (n_x.abs() <= 1.0)
+            sel = inside.reshape(-1)  # (g*B*H*W,)
+            pts = torch.stack([n_z, n_y, n_x], dim=-1).reshape(-1, 3)[sel]  # only in-box points
+            if pts.shape[0] == 0:
+                continue
+            vals = self._model(pts).reshape(-1)  # (n_inside,)
+            # destination index in ``acc``: slice_of[sample] * bhw + (b,h,w position)
+            dest = (slice_of[start : start + g].view(-1, 1) * bhw + base.view(1, -1)).reshape(-1)[
+                sel
+            ]
+            acc = acc.index_add(0, dest, vals)
+        phase = acc.view(self.num_slices, b, h, w) * (t_slab / z_offsets.shape[0])
         return torch.exp(1.0j * phase)
 
     # endregion --- forward ---
