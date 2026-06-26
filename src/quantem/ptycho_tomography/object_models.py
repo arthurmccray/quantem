@@ -74,11 +74,12 @@ class PtychoTomoObjConstraintParams:
 
         Attributes
         ----------
-        tv_weight_z : float, default ``0.0``
-            Soft. Specimen-z total variation at sampled coordinates (independent of the
-            multislice slab count).
-        tv_weight_xy : float, default ``0.0``
-            Soft. Lateral total variation at sampled coordinates.
+        tv_weight : float, default ``0.0``
+            Soft. **Isotropic L2** 3D total variation at sampled coordinates: the same weight is
+            applied to all three axes (specimen-z and the two lateral axes), matching the
+            tomography module's ``tv_vol``. Each axis penalizes the **squared** adjacent-voxel
+            difference (L2, as in tomography; the diffractive_imaging ptychography TV uses L1). The
+            per-axis sample step is one cubic voxel, so the scaling is identical across z and xy.
         positivity_weight : float, default ``0.0``
             Soft. ``weight * mean(relu(-value))`` at sampled coordinates (``potential`` only).
             The main positivity handle for the K-Planes backend.
@@ -107,8 +108,7 @@ class PtychoTomoObjConstraintParams:
             Scales the subtracted baseline offset.
         """
 
-        tv_weight_z: float = 0.0
-        tv_weight_xy: float = 0.0
+        tv_weight: float = 0.0
         positivity_weight: float = 0.0
         sparsity_weight: float = 0.0
         positivity: bool = True
@@ -118,8 +118,7 @@ class PtychoTomoObjConstraintParams:
         _name: str = "volume"
 
         soft_constraint_keys = [
-            "tv_weight_z",
-            "tv_weight_xy",
+            "tv_weight",
             "positivity_weight",
             "sparsity_weight",
         ]
@@ -606,18 +605,17 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
     def apply_soft_constraints(
         self, obj: torch.Tensor | None = None, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        """Coordinate-sampled 3D TV + positivity penalties over the specimen volume.
+        """Coordinate-sampled **isotropic** 3D TV + positivity penalties over the specimen volume.
 
-        ``tv_weight_z`` penalizes the specimen z axis (independent of the multislice slab count),
-        ``tv_weight_xy`` the lateral axes. Evaluated at randomly sampled coordinates so the
-        penalty is differentiable without materializing the volume.
+        ``tv_weight`` applies an isotropic total variation — the same weight on the specimen-z and
+        the lateral axes, matching the tomography module's ``tv_vol``. Evaluated at randomly
+        sampled coordinates so the penalty is differentiable without materializing the volume.
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
-        w_z = self.constraints.tv_weight_z
-        w_xy = self.constraints.tv_weight_xy
-        if w_z > 0 or w_xy > 0:
-            tv_loss = self._sampled_tv3d_loss(w_z, w_xy)
+        w_tv = self.constraints.tv_weight
+        if w_tv > 0:
+            tv_loss = self._sampled_tv3d_loss(w_tv)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
         w_pos = self.constraints.positivity_weight
@@ -654,22 +652,27 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         value = self._model(coords).squeeze(-1)
         return weight * value.abs().mean()
 
-    def _sampled_tv3d_loss(self, w_z: float, w_xy: float, num_samples: int = 4096) -> torch.Tensor:
-        """Finite-difference TV over the specimen volume at randomly sampled coordinates."""
+    def _sampled_tv3d_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+        """Isotropic **L2 (squared-difference)** TV at sampled coordinates (same weight on z, xy).
+
+        Matches the tomography ``tv_vol`` (mean squared adjacent-voxel difference, equal weight on
+        all three axes). NOTE: this L2 form intentionally DIFFERS from the diffractive_imaging
+        ptychography TV (``ObjectBase._calc_tv_loss``), which uses L1 (mean ``|Δvalue|``) — chosen
+        here to be consistent with the tomography module. An L1-vs-L2 comparison is left for later.
+        The per-axis step ``h = 2 / volume_shape[axis]`` is one cubic voxel, so a unit step is the
+        same physical distance on every axis and the scaling is isotropic.
+        """
         real_dtype = getattr(torch, config.get("dtype_real"))
         coords = self._sample_volume_coords(num_samples)
         value = self._model(coords).squeeze(-1)
         loss = self._get_zero_loss_tensor()
-        weights = (w_z, w_xy, w_xy)
         for axis in range(3):
-            w = weights[axis]
-            if w <= 0:
-                continue
-            h = 2.0 / max(int(self.volume_shape[axis]), 2)  # ~one voxel step
+            h = 2.0 / max(int(self.volume_shape[axis]), 2)  # one cubic-voxel step
             offset = torch.zeros(3, device=self.device, dtype=real_dtype)
             offset[axis] = h
             shifted = self._model(coords + offset).squeeze(-1)
-            loss = loss + w * torch.mean(torch.abs(shifted - value))
+            # L2 (squared) difference to match tomography; ptychography uses L1 (abs).
+            loss = loss + weight * torch.mean((shifted - value) ** 2)
         return loss
 
     # endregion --- constraints ---

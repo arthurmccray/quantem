@@ -156,7 +156,7 @@ class TestPretrainAndState:
             final = obj.model.sigma_net
             final = final[-1] if isinstance(final, torch.nn.Sequential) else final
             final.weight.normal_(0, 0.1)
-        obj.constraints = {"tv_weight_z": 0.1, "tv_weight_xy": 0.1, "positivity_weight": 0.5}
+        obj.constraints = {"tv_weight": 0.1, "positivity_weight": 0.5}
         loss = obj.apply_soft_constraints()
         assert torch.isfinite(loss)
         loss.backward()

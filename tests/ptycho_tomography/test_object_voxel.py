@@ -269,7 +269,7 @@ class TestObjectVoxelTomoStateAndConstraints:
     def test_soft_constraints_finite_and_differentiable(self):
         vol = torch.rand(6, 8, 8) - 0.2  # some negative values for positivity
         obj = make_initialized_voxel_obj(volume=vol, volume_shape=(6, 8, 8))
-        obj.constraints = {"tv_weight_z": 0.1, "tv_weight_xy": 0.1, "positivity_weight": 0.5}
+        obj.constraints = {"tv_weight": 0.1, "positivity_weight": 0.5}
         loss = obj.apply_soft_constraints()
         assert torch.isfinite(loss) and loss > 0
         loss.backward()

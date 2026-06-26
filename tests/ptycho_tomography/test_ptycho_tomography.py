@@ -247,8 +247,7 @@ class TestForwardConsistency:
             constraints={
                 "object": {
                     "positivity_weight": 0.3,
-                    "tv_weight_z": 3e-3,
-                    "tv_weight_xy": 1e-3,
+                    "tv_weight": 3e-3,
                 }
             },
             batch_size=pt.dset.num_gpts,
