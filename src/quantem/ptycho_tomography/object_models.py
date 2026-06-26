@@ -82,6 +82,12 @@ class PtychoTomoObjConstraintParams:
         positivity_weight : float, default ``0.0``
             Soft. ``weight * mean(relu(-value))`` at sampled coordinates (``potential`` only).
             The main positivity handle for the K-Planes backend.
+        sparsity_weight : float, default ``0.0``
+            Soft L1 sparsity: ``weight * mean(|value|)`` at sampled coordinates. An L1 prior on
+            the density that drives the under-determined vacuum regions (including the interior
+            voids) toward zero (cf. the tomography ``sparsity`` term). An alternative to
+            ``fix_potential_baseline`` for cleaning the nonzero vacuum baseline of the implicit
+            backends, and unlike that display gauge it shapes the reconstruction itself.
         positivity : bool, default ``True``
             Hard (voxel backend only). Clamp the density >= 0 after every optimizer step
             (``potential`` only) — suppresses the phase-winding instability; mirrors the
@@ -94,7 +100,9 @@ class PtychoTomoObjConstraintParams:
             samples; quantile below the vacuum area fraction). ~0.2 works well.
         fix_potential_baseline : bool, default ``False``
             Display gauge on the materialized volume (``potential`` only): subtract a
-            background offset and clamp >= 0. Does not affect the reconstruction.
+            background offset (mask-background mean, else a robust low quantile of the volume)
+            and clamp >= 0. Drives a nonzero vacuum baseline to ~0 without touching the
+            reconstruction (a constant offset is a diffraction-invariant global phase).
         fix_potential_baseline_factor : float, default ``1.0``
             Scales the subtracted baseline offset.
         """
@@ -102,13 +110,19 @@ class PtychoTomoObjConstraintParams:
         tv_weight_z: float = 0.0
         tv_weight_xy: float = 0.0
         positivity_weight: float = 0.0
+        sparsity_weight: float = 0.0
         positivity: bool = True
         shrink_quantile: float | None = None
         fix_potential_baseline: bool = False
         fix_potential_baseline_factor: float = 1.0
         _name: str = "volume"
 
-        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy", "positivity_weight"]
+        soft_constraint_keys = [
+            "tv_weight_z",
+            "tv_weight_xy",
+            "positivity_weight",
+            "sparsity_weight",
+        ]
         hard_constraint_keys = [
             "positivity",
             "shrink_quantile",
@@ -565,10 +579,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         """Project the materialized volume (display only).
 
         For ``pure_phase`` the density is recentered to zero mean (a global-phase gauge). For
-        ``potential``, if ``fix_potential_baseline`` is set, subtract a background offset (mask
-        background mean, else the global min) scaled by ``fix_potential_baseline_factor`` and
-        clamp ``>= 0``. A constant offset is a global phase (diffraction-invariant), so this does
-        not affect the reconstruction.
+        ``potential``, if ``fix_potential_baseline`` is set, subtract a background offset and clamp
+        ``>= 0``. The offset is the mean over the background ``mask`` if one is provided, else a
+        robust low quantile of the volume (the vacuum-dominated background level) scaled by
+        ``fix_potential_baseline_factor``. A constant offset is a global phase
+        (diffraction-invariant), so this does not affect the reconstruction. The global *minimum*
+        is deliberately not used: a single noisy negative excursion (common in the implicit
+        backends) would make the gauge add a baseline instead of removing it.
         """
         with torch.no_grad():
             if self.obj_type == "pure_phase":
@@ -577,7 +594,11 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
                 if mask is not None and mask.numel() and (mask < 0.5 * mask.max()).any():
                     offset = raw[mask < 0.5 * mask.max()].mean()
                 else:
-                    offset = raw.amin()
+                    flat = raw.reshape(-1).float()
+                    if flat.numel() > 2_000_000:  # torch.quantile caps the input size
+                        idx = torch.randperm(flat.numel(), device=flat.device)[:2_000_000]
+                        flat = flat[idx]
+                    offset = torch.quantile(flat, 0.25).to(raw.dtype)
                 offset = offset * self.constraints.fix_potential_baseline_factor
                 return torch.clamp(raw - offset, min=0.0)
             return raw
@@ -604,6 +625,11 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             pos_loss = self._sampled_positivity_loss(w_pos)
             loss = loss + pos_loss
             self.add_soft_constraint_loss("positivity_loss", pos_loss)
+        w_l1 = self.constraints.sparsity_weight
+        if w_l1 > 0:
+            l1_loss = self._sampled_l1_loss(w_l1)
+            loss = loss + l1_loss
+            self.add_soft_constraint_loss("sparsity_loss", l1_loss)
         self.accumulate_constraint_losses()
         return loss
 
@@ -621,6 +647,12 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         coords = self._sample_volume_coords(num_samples)
         value = self._model(coords).squeeze(-1)
         return weight * torch.relu(-value).mean()
+
+    def _sampled_l1_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+        """Soft L1 sparsity: ``weight * mean(|density|)`` at randomly sampled coordinates."""
+        coords = self._sample_volume_coords(num_samples)
+        value = self._model(coords).squeeze(-1)
+        return weight * value.abs().mean()
 
     def _sampled_tv3d_loss(self, w_z: float, w_xy: float, num_samples: int = 4096) -> torch.Tensor:
         """Finite-difference TV over the specimen volume at randomly sampled coordinates."""
