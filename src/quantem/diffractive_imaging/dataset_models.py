@@ -644,10 +644,12 @@ class PtychographyDatasetBase(
 
     @property
     def _obj_shape_crop_2d(self) -> np.ndarray:
-        """All object shapes are 2D"""
+        """Allocated/expected object crop shape, in the object array's own axis order."""
         shp = np.floor(self.fov / self.obj_sampling)
         shp += shp % 2
         shp = shp.astype("int")
+        if self.com_transpose: # match the axis-flipped scan positions
+            shp = shp[::-1]
         return shp
 
     @property
@@ -1095,7 +1097,10 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
     @property
     def upsample_factor(self) -> float:
-        return (self._obj_shape_crop_2d / self.gpts).mean()
+        # pair each crop axis with its own scan-grid axis so the factor stays
+        # transpose-invariant (_obj_shape_crop_2d is transposed when com_transpose)
+        gpts = self.gpts[::-1] if self.com_transpose else self.gpts
+        return (self._obj_shape_crop_2d / gpts).mean()
 
     # endregion --- properties ---
 
@@ -1149,8 +1154,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
             positions = np.flip(positions, axis=1)
             sampling = sampling[::-1]
 
-        # ensure positive
-        m: np.ndarray = np.min(positions, axis=0).clip(-np.inf, 0)
+        # anchor the used positions to the object origin
+        m: np.ndarray = np.min(positions, axis=0)
         positions -= m
 
         # finally, switch to pixels

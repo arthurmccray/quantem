@@ -392,6 +392,86 @@ class TestTargetResidency:
         assert reloaded.target_residency == "cpu"
 
 
+def _build_aspect_ratio_ptycho(complex_obj, probe_array, gpts, com_rotation, transpose):
+    """Build a Ptychography on a (possibly non-square) scan grid with a forced rotation
+    and transpose. Reconstruction quality is irrelevant here — the fixture only exercises
+    scan-position placement and object sizing."""
+    scan_x, scan_y = gpts
+    x = np.arange(0.0, scan_x * SCAN_STEP_SIZE, SCAN_STEP_SIZE)
+    y = np.arange(0.0, scan_y * SCAN_STEP_SIZE, SCAN_STEP_SIZE)
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    positions = np.stack((xx.ravel(), yy.ravel()), axis=-1)
+    reciprocal_sampling = 2 * Q_MAX / N
+
+    sim_row, sim_col = return_patch_indices(positions, (N, N), (N, N))
+    _, _, _, intensities = simulate_intensities(complex_obj, probe_array, sim_row, sim_col)
+
+    dset = Dataset4dstem.from_array(
+        array=np.fft.fftshift(intensities * 100, axes=(-2, -1)).reshape((scan_x, scan_y, N, N)),
+        sampling=(SCAN_STEP_SIZE, SCAN_STEP_SIZE, reciprocal_sampling, reciprocal_sampling),
+        units=("A", "A", "A^-1", "A^-1"),
+    )
+    pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
+    pdset.preprocess(
+        com_fit_function="constant",
+        plot_rotation=False,
+        plot_com=False,
+        probe_energy=PROBE_ENERGY,
+        force_com_rotation=com_rotation,
+        force_com_transpose=transpose,
+    )
+
+    probe_params = {
+        "energy": PROBE_ENERGY,
+        "C10": C10,
+        "semiangle_cutoff": electron_wavelength_angstrom(PROBE_ENERGY) * 1e3,
+    }
+    ptycho = Ptychography.from_models(
+        dset=pdset,
+        obj_model=ObjectPixelated.from_uniform(
+            num_slices=1, obj_type="complex", slice_thicknesses=1
+        ),
+        probe_model=ProbePixelated.from_array(
+            num_probes=1, probe_params=probe_params, probe_array=probe_array
+        ),
+        detector_model=DetectorPixelated(),
+        rng=42,
+    )
+    ptycho.preprocess(obj_padding_px=(0, 0))
+    return ptycho
+
+
+class TestAspectRatioRotatedFOV:
+    """Regression for the non-square / rotated / transposed FOV bug.
+
+    A high aspect-ratio scan grid combined with a large com_rotation (and/or transpose)
+    used to (a) place scan positions outside the object array — wrapping the object and
+    pinning positions to the FOV edge — and (b) crash ``obj_cropped`` inside
+    ``_crop_rotate_obj_fov`` because the un-rotated FOV could not fit the object frame.
+    """
+
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_positions_inside_object(self, complex_obj, probe_array, transpose):
+        ptycho = _build_aspect_ratio_ptycho(
+            complex_obj, probe_array, gpts=(32, 64), com_rotation=89, transpose=transpose
+        )
+        obj_full = ptycho.dset._obj_shape_full_2d(ptycho.obj_padding_px)
+        pos = ptycho.dset.initial_scan_positions_px.cpu().detach().numpy()
+        # positions must sit strictly inside the object (no wrap / no edge pile-up)
+        assert pos[:, 0].min() >= 0 and pos[:, 1].min() >= 0
+        assert pos[:, 0].max() < obj_full[-2]
+        assert pos[:, 1].max() < obj_full[-1]
+
+    @pytest.mark.parametrize("transpose", [False, True])
+    def test_obj_cropped_shape(self, complex_obj, probe_array, transpose):
+        ptycho = _build_aspect_ratio_ptycho(
+            complex_obj, probe_array, gpts=(32, 64), com_rotation=89, transpose=transpose
+        )
+        # obj_cropped must not raise and returns the non-transposed display FOV shape
+        cropped = ptycho.obj_cropped
+        assert tuple(cropped.shape) == tuple(ptycho.obj_shape_crop)
+
+
 @pytest.mark.slow
 class TestPtychographySaveLoadRoundtrip:
     """Reconstruct → save → load → continue training preserves training state.

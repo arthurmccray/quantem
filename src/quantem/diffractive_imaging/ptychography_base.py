@@ -34,7 +34,6 @@ from quantem.diffractive_imaging.object_models import ObjectBase, ObjectModelTyp
 from quantem.diffractive_imaging.probe_models import ProbeBase, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_losses import DataCriterion, get_data_criterion
 from quantem.diffractive_imaging.ptycho_utils import (
-    AffineTransform,
     center_crop_arr,
     fourier_translation_operator,
     sum_patches,
@@ -857,45 +856,20 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         transpose: bool | None = None,
         padding: np.ndarray | tuple[int, int] | None = None,
     ) -> np.ndarray:
-        """
-        Crops and rotated object to FOV bounded by current pixel positions.
-        """
+        """Un-rotates and un-transposes the object and crops it to the reconstruction FOV."""
         array = self._to_numpy(array).copy()
         com_rotation_rad = (
             self.dset.com_rotation_rad if com_rotation_rad is None else com_rotation_rad
         )
         transpose = self.dset.com_transpose if transpose is None else transpose
-        padding = np.array(padding) if padding is not None else self.obj_padding_px
 
         angle = com_rotation_rad if transpose else -1 * com_rotation_rad
 
-        if positions_px is None:
-            positions = self.dset.initial_scan_positions_px.cpu().detach().numpy()
-            # if using learned positions potentially need to pad the object in center_crop_arr
-            # positions = self.dset.scan_positions_px.cpu().detach().numpy()
-        else:
-            positions = positions_px
-
-        tf = AffineTransform(angle=angle)
-        rotated_points = tf(positions, origin=positions.mean(0))
-        rotated_points += 1e-9  # avoid pixel perfect errors
-
-        min_r, min_c = np.floor(np.min(rotated_points, axis=0)).astype("int")
-        min_r = max(min_r, 0)
-        min_c = max(min_c, 0)
-        max_r, max_c = np.ceil(np.max(rotated_points, axis=0)).astype("int")
-        max_r = min(max_r, array.shape[-2])
-        max_c = min(max_c, array.shape[-1])
-        # print(f"{min_r = }, {min_c = }, {max_r = }, {max_c = }")
-
-        rotated_array = ndi.rotate(
-            array, np.rad2deg(-angle), order=1, reshape=False, axes=(-2, -1)
-        )[..., min_r:max_r, min_c:max_c]
+        rotated_array = ndi.rotate(array, np.rad2deg(-angle), order=1, reshape=True, axes=(-2, -1))
 
         if transpose:
             rotated_array = rotated_array.swapaxes(-2, -1)
 
-        # fixing that is sometimes 1 pixel off
         cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
 
         return cropped
