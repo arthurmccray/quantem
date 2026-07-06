@@ -259,6 +259,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
 
+        ``batch_size`` is GLOBAL: the number of samples contributing to one optimizer step,
+        regardless of GPU count. Under multi-GPU each rank draws ``batch_size // world_size``
+        per step (a warning is emitted when not evenly divisible), so the same ``batch_size``
+        reproduces the same optimization trajectory — and loss curve — on 1 or N GPUs.
+
         ``loss_type`` selects the data-fidelity criterion: a registered name
         (``"l2_amplitude"`` [default], ``"l1_amplitude"``, ``"l2_intensity"``, ``"l1_intensity"``,
         ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
