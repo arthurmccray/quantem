@@ -30,6 +30,20 @@ from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
 
 
+def _cap_worker_cpu_threads(world_size: int) -> None:
+    """Split the visible CPU cores evenly across spawned workers."""
+    if os.environ.get("OMP_NUM_THREADS"):
+        return
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # platforms without sched_getaffinity (e.g. macOS)
+        cpus = os.cpu_count() or 1
+    threads = max(1, cpus // max(world_size, 1))
+    # Env var so BLAS/OpenMP pools initialized later in this process follow suit.
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+
+
 def _ddp_ptycho_worker(
     rank: int,
     world_size: int,
@@ -44,6 +58,7 @@ def _ddp_ptycho_worker(
     large tensors cross the process boundary via pickle (which triggers PyTorch's
     shared-memory tensor mechanism and fails in some Linux environments).
     """
+    _cap_worker_cpu_threads(world_size)
     device_id = devices[rank]
     # Bind the CUDA device BEFORE init_process_group so NCCL allocates its
     # communicator buffers on the correct GPU. Without this, NCCL grabs cuda:0

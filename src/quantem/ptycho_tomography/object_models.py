@@ -35,6 +35,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -196,7 +197,20 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
     # (then trimmed to the in-box subset before the backend query). Sized for a few million points
     # per chunk -- the same budget used by ``_query_volume_grid`` -- so peak activation memory and
     # the per-chunk dense coordinate tensors stay bounded regardless of batch size.
+    # Subclasses override per backend: VoxelGrid gains ~20-25% end-to-end from 64M (fewer, larger
+    # grid_sample calls; backward -45%/call) while K-Planes backends should stay at 4M (16M gave
+    # ~1% speed for 3.5x memory under checkpointing).
     _forward_point_budget: int = 4_000_000
+
+    # Opt-in gradient checkpointing of the per-chunk gather compute in ``forward``. When True,
+    # each chunk's (rotated coords -> in-box mask -> backend query) runs under
+    # ``torch.utils.checkpoint.checkpoint(use_reentrant=False)``: only the chunk *outputs*
+    # (in-box densities + scatter indices) are retained for backward and the activations are
+    # recomputed. Cuts gather-loop retained memory from O(all chunk activations) to O(in-box
+    # outputs) -- e.g. K-Planes sps=7/num_slices=16 batch 128 drops from OOM (>40 GB) to
+    # ~6.8 GiB -- at ~10-20% extra time per iteration. Required for K-Planes backends at
+    # production sampling on 40 GB GPUs; unnecessary for configs that already fit.
+    forward_checkpoint: bool = False
 
     def __init__(
         self,
@@ -527,23 +541,54 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         acc = torch.zeros((self.num_slices * bhw,), dtype=coords.dtype, device=coords.device)
         # flat per-(slice, sample, b, h, w) position in ``acc`` for scatter; slice offset added below
         base = torch.arange(bhw, device=coords.device)
-        for start in range(0, n_samples, group):
-            g = min(group, n_samples - start)
-            zk = z_flat[start : start + g].view(-1, 1, 1, 1)  # (g, 1, 1, 1)
+
+        def _chunk(zk, sl, rzz, ryz, rxz, lat_z, lat_y, lat_x, base):
+            """(g,) z-samples -> (in-box densities, flat scatter indices). Pure given inputs;
+            closes over self._model / h_z / h_y / h_x / bhw. All differentiable tensor inputs
+            are explicit args so checkpointing keeps grads flowing upstream (probe positions,
+            alignment shifts, tilt rotations)."""
+            zk = zk.view(-1, 1, 1, 1)  # (g, 1, 1, 1)
             n_z = (rzz * zk + lat_z) / h_z  # (g, B, H, W)
             n_y = (ryz * zk + lat_y) / h_y
             n_x = (rxz * zk + lat_x) / h_x
             inside = (n_z.abs() <= 1.0) & (n_y.abs() <= 1.0) & (n_x.abs() <= 1.0)
             sel = inside.reshape(-1)  # (g*B*H*W,)
             pts = torch.stack([n_z, n_y, n_x], dim=-1).reshape(-1, 3)[sel]  # only in-box points
-            if pts.shape[0] == 0:
-                continue
-            vals = self._model(pts).reshape(-1)  # (n_inside,)
             # destination index in ``acc``: slice_of[sample] * bhw + (b,h,w position)
-            dest = (slice_of[start : start + g].view(-1, 1) * bhw + base.view(1, -1)).reshape(-1)[
-                sel
-            ]
-            acc = acc.index_add(0, dest, vals)
+            dest = (sl.view(-1, 1) * bhw + base.view(1, -1)).reshape(-1)[sel]
+            if pts.shape[0] == 0:
+                return pts.new_zeros((0,)), dest
+            return self._model(pts).reshape(-1), dest  # (n_inside,)
+
+        for start in range(0, n_samples, group):
+            # tensor slicing self-clamps at the end of the range, so no explicit ``g`` needed
+            args = (
+                z_flat[start : start + group],
+                slice_of[start : start + group],
+                rzz,
+                ryz,
+                rxz,
+                lat_z,
+                lat_y,
+                lat_x,
+                base,
+            )
+            if self.forward_checkpoint and torch.is_grad_enabled():
+                # Recompute-in-backward. use_reentrant=False is required (data-dependent
+                # ``sel`` output shapes; grads to closure-captured module params);
+                # preserve_rng_state=False is safe (no RNG ops in the chunk) and avoids a
+                # per-chunk CUDA RNG sync. Scatter stays OUTSIDE so retained per-chunk state
+                # is O(n_inside), not O(num_slices * B*H*W).
+                vals, dest = cast(
+                    tuple[torch.Tensor, torch.Tensor],
+                    checkpoint(_chunk, *args, use_reentrant=False, preserve_rng_state=False),
+                )
+            else:
+                vals, dest = _chunk(*args)
+            # in-place: ``acc`` starts as fresh zeros and no graph node reads its pre-update
+            # value, so autograd version counting is satisfied; out-of-place index_add would
+            # reallocate the (num_slices*B*H*W) accumulator every chunk.
+            acc.index_add_(0, dest, vals)
         phase = acc.view(self.num_slices, b, h, w) * (t_slab / z_offsets.shape[0])
         return torch.exp(1.0j * phase)
 
@@ -691,6 +736,11 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
     in place after every optimizer step via ``project_parameters`` — see
     :class:`PtychoTomoObjConstraintParams.Volume`.
     """
+
+    # VoxelGrid's backend query is a single fused grid_sample, so large chunks are cheap:
+    # 64M drops the gather backward ~45%/call for ~20-25% end-to-end (peak ~7.5 GiB at batch
+    # 128, ~18.5 GiB at batch 512 on A100-40G). K-Planes backends keep the 4M base default.
+    _forward_point_budget: int = 64_000_000
 
     @property
     def name(self) -> str:
