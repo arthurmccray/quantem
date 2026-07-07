@@ -219,7 +219,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         num_dps = self.dset.num_positions
         shifted_probes = prb.expand(num_dps, *self.roi_shape)
 
-        batch_size = num_dps if max_batch_size is None else int(max_batch_size)
+        batch_size = min(num_dps, 4096) if max_batch_size is None else int(max_batch_size)
         probe_overlap = torch.zeros(
             tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self._single_device
         )
@@ -995,12 +995,26 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         ``__getitem__`` returns ``{"index": idx, ...}`` for the original dataset index, and
         ``Subset[i]`` calls ``dataset[indices[i]]``, so ``batch["index"]`` is the original
         dataset index under either branch.
+
+        ``self.batch_size`` is the GLOBAL batch: the number of samples contributing to one
+        optimizer step across all ranks. Each rank's DataLoader draws ``batch_size //
+        world_size``, so the same ``batch_size`` gives the same optimization trajectory (and
+        loss curve) on any GPU count.
         """
         pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
             "cuda"
         )
+        per_rank_batch = self.batch_size
+        if world_size > 1:
+            per_rank_batch = max(1, self.batch_size // world_size)
+            if self.batch_size % world_size != 0:
+                warn(
+                    f"batch_size={self.batch_size} is not divisible by world_size={world_size}; "
+                    f"each rank uses {per_rank_batch}, so the effective global batch is "
+                    f"{per_rank_batch * world_size}."
+                )
         loader_kwargs: dict[str, Any] = {
-            "batch_size": self.batch_size,
+            "batch_size": per_rank_batch,
             "num_workers": num_workers,
             "pin_memory": pin_memory,
             "drop_last": False,

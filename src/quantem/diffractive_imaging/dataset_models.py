@@ -1620,7 +1620,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         bilinear: bool = False,
     ):
         dtype = config.get("dtype_real")
-        diff_intensities = self.intensities_4d.copy().astype(dtype)
+        diff_intensities = self.intensities_4d.astype(dtype)
         com_fit = self.com_fit
         if positions_mask is not None:
             self.positions_mask = positions_mask
@@ -1651,10 +1651,7 @@ class PtychographyDatasetRaster(DatasetConstraints):
         mean_amplitude = 0
         centered_amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
         amplitudes = np.zeros(diff_intensities.shape, dtype=dtype)
-        centered_intensities = np.zeros(diff_intensities.shape, dtype=dtype)
         intensities = np.zeros(diff_intensities.shape, dtype=dtype)
-        ## there is some additional memory overhead in this loop due to numpy array assignment
-        ## but I don't think it's easy to avoid -- ARCM 251212
         for Rr, Rc in tqdmnd(
             range(diff_intensities.shape[0]),
             range(diff_intensities.shape[1]),
@@ -1683,12 +1680,13 @@ class PtychographyDatasetRaster(DatasetConstraints):
             shift_amplitude = np.fft.fftshift(shift_amplitude)
 
             centered_amplitudes[Rr, Rc] = shift_amplitude
-            centered_intensities[Rr, Rc] = shift_amplitude**2
+
+        # The source 4D copy is no longer needed; free it before the masking copies below 
+        del diff_intensities
 
         amplitudes = amplitudes[positions_mask_2d]
         centered_amplitudes = centered_amplitudes[positions_mask_2d]
         intensities = intensities[positions_mask_2d]
-        centered_intensities = centered_intensities[positions_mask_2d]
 
         if crop_patterns:
             amplitudes = amplitudes[:, pattern_crop_mask].reshape((-1, *pattern_crop_mask_shape))
@@ -1696,9 +1694,8 @@ class PtychographyDatasetRaster(DatasetConstraints):
                 (-1, *pattern_crop_mask_shape)
             )
             intensities = intensities[:, pattern_crop_mask].reshape((-1, *pattern_crop_mask_shape))
-            centered_intensities = centered_intensities[:, pattern_crop_mask].reshape(
-                (-1, *pattern_crop_mask_shape)
-            )
+
+        centered_intensities = centered_amplitudes**2
 
         mean_intensity /= amplitudes.shape[0]
         mean_amplitude /= amplitudes.shape[0]

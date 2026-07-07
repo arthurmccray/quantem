@@ -14,8 +14,10 @@ from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.dist_utils import (
+    find_free_port,
     init_process_group,
     is_distributed_launch,
+    maybe_configure_fabric_env,
     spawn_distributed_workers,
 )
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
@@ -30,6 +32,20 @@ from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
 
 
+def _cap_worker_cpu_threads(world_size: int) -> None:
+    """Split the visible CPU cores evenly across spawned workers."""
+    if os.environ.get("OMP_NUM_THREADS"):
+        return
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # platforms without sched_getaffinity (e.g. macOS)
+        cpus = os.cpu_count() or 1
+    threads = max(1, cpus // max(world_size, 1))
+    # Env var so BLAS/OpenMP pools initialized later in this process follow suit.
+    os.environ["OMP_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+
+
 def _ddp_ptycho_worker(
     rank: int,
     world_size: int,
@@ -37,13 +53,18 @@ def _ddp_ptycho_worker(
     devices: list[int],
     recon_kwargs: dict[str, Any],
     result_path: str,
+    master_port: str,
 ) -> None:
     """Module-level worker for mp.start_processes — must live at module scope to be picklable.
 
     Receives a file path rather than the Ptychography object directly so that no
     large tensors cross the process boundary via pickle (which triggers PyTorch's
     shared-memory tensor mechanism and fails in some Linux environments).
+
+    ``master_port`` is chosen (free) by the parent so all ranks rendezvous on the same
+    port and repeated ``reconstruct`` calls never collide on a stale ``29500``.
     """
+    _cap_worker_cpu_threads(world_size)
     device_id = devices[rank]
     # Bind the CUDA device BEFORE init_process_group so NCCL allocates its
     # communicator buffers on the correct GPU. Without this, NCCL grabs cuda:0
@@ -53,52 +74,68 @@ def _ddp_ptycho_worker(
         rank,
         world_size,
         backend="nccl" if torch.cuda.is_available() else "gloo",
+        master_port=master_port,
         local_device=device_id if torch.cuda.is_available() else None,
     )
 
-    # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
-    # CPU-resident) state instead of each duplicating it.
-    ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False, mmap=True)
-    ptycho.to(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+    try:
+        # mmap=True so all workers share one memory-mapped RAM copy of the (potentially large,
+        # CPU-resident) state instead of each duplicating it.
+        ptycho = torch.load(ptycho_path, map_location="cpu", weights_only=False, mmap=True)
+        ptycho.to(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
 
-    if dist.is_available() and dist.is_initialized():
-        ptycho._broadcast_parameters(src=0)
+        if dist.is_available() and dist.is_initialized():
+            ptycho._broadcast_parameters(src=0)
 
-    ptycho._reconstruct_inner(**recon_kwargs, _dist_rank=rank, _dist_world_size=world_size)
+        ptycho._reconstruct_inner(**recon_kwargs, _dist_rank=rank, _dist_world_size=world_size)
 
-    if rank == 0:
-        obj_opt = ptycho.optimizers.get("object")
-        probe_opt = ptycho.optimizers.get("probe")
-        dset_opt = ptycho.optimizers.get("dataset")
-        torch.save(
-            {
-                "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
-                "probe_state": {k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()},
-                # Dataset learnable params (scan positions / descan) are optimized and all-reduced
-                # in the workers; ship them back so the main process keeps the refinement.
-                "dset_scan_positions_px": ptycho.dset._scan_positions_px.detach().cpu(),
-                "dset_descan_shifts": ptycho.dset._descan_shifts.detach().cpu(),
-                "obj_optimizer_params": ptycho.obj_model._optimizer_params,
-                "probe_optimizer_params": ptycho.probe_model._optimizer_params,
-                "dset_optimizer_params": ptycho.dset._optimizer_params,
-                "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
-                "probe_optimizer_state": probe_opt.state_dict() if probe_opt is not None else None,
-                "dset_optimizer_state": dset_opt.state_dict() if dset_opt is not None else None,
-                "iter_losses": ptycho._iter_losses,
-                "iter_val_losses": ptycho._iter_val_losses,
-                "iter_lrs": ptycho._iter_lrs,
-                "iter_recon_types": ptycho._iter_recon_types,
-            },
-            result_path,
-        )
+        if rank == 0:
+            obj_opt = ptycho.optimizers.get("object")
+            probe_opt = ptycho.optimizers.get("probe")
+            dset_opt = ptycho.optimizers.get("dataset")
+            torch.save(
+                {
+                    "obj_state": {k: v.cpu() for k, v in ptycho.obj_model.state_dict().items()},
+                    "probe_state": {
+                        k: v.cpu() for k, v in ptycho.probe_model.state_dict().items()
+                    },
+                    # Dataset learnable params (scan positions / descan) are optimized and
+                    # all-reduced in the workers; ship them back so the main process keeps
+                    # the refinement.
+                    "dset_scan_positions_px": ptycho.dset._scan_positions_px.detach().cpu(),
+                    "dset_descan_shifts": ptycho.dset._descan_shifts.detach().cpu(),
+                    "obj_optimizer_params": ptycho.obj_model._optimizer_params,
+                    "probe_optimizer_params": ptycho.probe_model._optimizer_params,
+                    "dset_optimizer_params": ptycho.dset._optimizer_params,
+                    "obj_optimizer_state": obj_opt.state_dict() if obj_opt is not None else None,
+                    "probe_optimizer_state": (
+                        probe_opt.state_dict() if probe_opt is not None else None
+                    ),
+                    "dset_optimizer_state": dset_opt.state_dict()
+                    if dset_opt is not None
+                    else None,
+                    # Snapshots recorded during the run (rank 0 only) so the notebook multi-GPU
+                    # path returns them just like single-GPU reconstruct does.
+                    "snapshots": ptycho._snapshots,
+                    "iter_losses": ptycho._iter_losses,
+                    "iter_val_losses": ptycho._iter_val_losses,
+                    "iter_lrs": ptycho._iter_lrs,
+                    "iter_recon_types": ptycho._iter_recon_types,
+                },
+                result_path,
+            )
 
-    # Synchronize before teardown so every rank finishes
-    if dist.is_available() and dist.is_initialized():
-        if torch.cuda.is_available():
-            dist.barrier(device_ids=[device_id])
-        else:
-            dist.barrier()
-    dist.destroy_process_group()
+        # Synchronize before teardown so every rank finishes
+        if dist.is_available() and dist.is_initialized():
+            if torch.cuda.is_available():
+                dist.barrier(device_ids=[device_id])
+            else:
+                dist.barrier()
+    finally:
+        # Always tear down the process group — even if the run raised — so the rendezvous
+        # port is released and the next reconstruct() call starts clean.
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase):  # pyright: ignore[reportUnsafeMultipleInheritance]
@@ -259,6 +296,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         from a notebook, or uses the existing distributed process group when launched with
         ``torchrun``. Only autograd mode is supported for multi-GPU in this release.
 
+        ``batch_size`` is GLOBAL: the number of samples contributing to one optimizer step,
+        regardless of GPU count. Under multi-GPU each rank draws ``batch_size // world_size``
+        per step (a warning is emitted when not evenly divisible), so the same ``batch_size``
+        reproduces the same optimization trajectory — and loss curve — on 1 or N GPUs.
+
         ``loss_type`` selects the data-fidelity criterion: a registered name
         (``"l2_amplitude"`` [default], ``"l1_amplitude"``, ``"l2_intensity"``, ``"l1_intensity"``,
         ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
@@ -303,6 +345,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             if not torch.distributed.is_initialized():
                 # Bind the device BEFORE init_process_group so NCCL allocates
                 # its communicator buffers on the correct GPU.
+                maybe_configure_fabric_env()
                 if torch.cuda.is_available():
                     torch.cuda.set_device(local_rank)
                 torch.distributed.init_process_group(
@@ -556,6 +599,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
             torch.save(self, ptycho_path, pickle_protocol=4)
 
+            # Pick a free rendezvous port on the parent so every rank agrees on it and
+            # repeated reconstruct() calls in one kernel never collide on a stale 29500.
+            master_port = find_free_port()
+
             # forkserver: workers fork from a clean pre-started server (no inherited
             # CUDA, no Jupyter FDs).  Only plain Python scalars/strings cross the
             # process boundary, so tensor pickling is never triggered.
@@ -566,6 +613,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 devices,
                 recon_kwargs,
                 result_path,
+                master_port,
             )
             result = torch.load(result_path, map_location="cpu", weights_only=False)
 
@@ -638,6 +686,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     self._iter_lrs[k] = []
                 self._iter_lrs[k].extend(list(v)[n_before:])
             self._iter_recon_types.extend(result.get("iter_recon_types", [])[n_before:])
+
+        # --- snapshots (recorded on rank 0 in the worker) ---
+        # reset=True gave the worker a fresh _snapshots list; reset=False inherited the old
+        # ones and appended, so the returned list is already the full history either way.
+        returned_snapshots = result.get("snapshots")
+        if returned_snapshots is not None:
+            self._snapshots = returned_snapshots
 
         self._multi_gpu_devices = devices
         return self
