@@ -219,7 +219,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         num_dps = self.dset.num_positions
         shifted_probes = prb.expand(num_dps, *self.roi_shape)
 
-        batch_size = num_dps if max_batch_size is None else int(max_batch_size)
+        batch_size = min(num_dps, 4096) if max_batch_size is None else int(max_batch_size)
         probe_overlap = torch.zeros(
             tuple(self.obj_shape_full[-2:]), dtype=self._dtype_real, device=self._single_device
         )

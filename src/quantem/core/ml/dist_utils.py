@@ -8,6 +8,7 @@ can be used by diffractive_imaging without circular imports.
 from __future__ import annotations
 
 import os
+import socket
 from typing import Any
 
 import torch
@@ -17,6 +18,40 @@ import torch.distributed as dist
 def is_distributed_launch() -> bool:
     """True when launched via torchrun / torch.distributed.launch (RANK env var is set)."""
     return "RANK" in os.environ
+
+
+def find_free_port() -> str:
+    """Return a currently-free TCP port (as a string) on the loopback interface.
+
+    Used to pick the rendezvous port for the notebook ``mp.spawn`` path instead of a
+    hardcoded ``29500``. A hardcoded port collides across repeated ``reconstruct`` cell
+    re-runs (a run that errors before ``destroy_process_group`` leaves the TCPStore server
+    socket bound), producing "client socket ... failed to connect" / "address already in
+    use" on the next call. Binding to port 0 lets the OS hand back an unused port each time.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return str(s.getsockname()[1])
+
+
+def maybe_configure_fabric_env() -> None:
+    """Set the NCCL/libfabric env for the HPE Slingshot (``hsn``) fabric, if present.
+
+    Perlmutter (and other Slingshot-11 systems) need ``NCCL_SOCKET_IFNAME=hsn`` plus
+    ``FI_CXI_ATS=0`` / ``NCCL_CROSS_NIC=1`` for NCCL to bring up its communicators cleanly;
+    without them multi-GPU init can hang or emit fatal socket errors. Gated on the presence
+    of an ``hsn0`` interface and on each var being unset, so this is a no-op on non-Slingshot
+    systems (e.g. a local GPU workstation) and never overrides an explicit user setting.
+    """
+    if not os.path.isdir("/sys/class/net/hsn0"):
+        return
+    defaults = {
+        "NCCL_SOCKET_IFNAME": "hsn",
+        "FI_CXI_ATS": "0",
+        "NCCL_CROSS_NIC": "1",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
 
 
 def init_process_group(
@@ -40,6 +75,7 @@ def init_process_group(
     """
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = master_port
+    maybe_configure_fabric_env()
     if backend == "nccl":
         device_index = local_device if local_device is not None else rank
         torch.cuda.set_device(device_index)

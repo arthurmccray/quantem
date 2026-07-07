@@ -90,6 +90,16 @@ class PtychoTomoObjConstraintParams:
             voids) toward zero (cf. the tomography ``sparsity`` term). An alternative to
             ``fix_potential_baseline`` for cleaning the nonzero vacuum baseline of the implicit
             backends, and unlike that display gauge it shapes the reconstruction itself.
+        tv_plane_weight : float, default ``0.0``
+            Soft (**K-Planes backend only**; the voxel backend has no factor planes and ignores
+            it). Total variation applied **directly on the K-Planes feature planes** rather than
+            on the sampled output density: squared adjacent-element differences along both plane
+            axes of every feature plane, averaged over channels and summed across multiscale
+            levels. Mirrors the tomography module's ``tv_plane``. Because it acts on the O(0.1-1)
+            factor planes at *every* element (not a sparse coordinate sample of the sub-1e-3
+            density), a given weight bites far harder than ``tv_weight`` and is cheap (no model
+            forward). Smooths the tensor-decomposition representation itself — the natural place
+            to suppress rotation-induced high-frequency aliasing in the tilted K-Planes object.
         positivity : bool, default ``True``
             Hard (voxel backend only). Clamp the density >= 0 after every optimizer step
             (``potential`` only) — suppresses the phase-winding instability; mirrors the
@@ -112,6 +122,7 @@ class PtychoTomoObjConstraintParams:
         tv_weight: float = 0.0
         positivity_weight: float = 0.0
         sparsity_weight: float = 0.0
+        tv_plane_weight: float = 0.0
         positivity: bool = True
         shrink_quantile: float | None = None
         fix_potential_baseline: bool = False
@@ -122,6 +133,7 @@ class PtychoTomoObjConstraintParams:
             "tv_weight",
             "positivity_weight",
             "sparsity_weight",
+            "tv_plane_weight",
         ]
         hard_constraint_keys = [
             "positivity",
@@ -655,6 +667,8 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         ``tv_weight`` applies an isotropic total variation — the same weight on the specimen-z and
         the lateral axes, matching the tomography module's ``tv_vol``. Evaluated at randomly
         sampled coordinates so the penalty is differentiable without materializing the volume.
+        ``tv_plane_weight`` additionally applies TV directly on the K-Planes feature planes (a
+        no-op on the voxel backend); see :meth:`_plane_tv_loss`.
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
@@ -663,6 +677,11 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             tv_loss = self._sampled_tv3d_loss(w_tv)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
+        w_plane = self.constraints.tv_plane_weight
+        if w_plane > 0:
+            plane_loss = self._plane_tv_loss(w_plane)
+            loss = loss + plane_loss
+            self.add_soft_constraint_loss("tv_plane_loss", plane_loss)
         w_pos = self.constraints.positivity_weight
         if w_pos > 0 and self.obj_type == "potential":
             pos_loss = self._sampled_positivity_loss(w_pos)
@@ -719,6 +738,14 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             # L2 (squared) difference to match tomography; ptychography uses L1 (abs).
             loss = loss + weight * torch.mean((shifted - value) ** 2)
         return loss
+
+    def _plane_tv_loss(self, weight: float) -> torch.Tensor:
+        """Plane-TV hook. Only the K-Planes backend implements it (voxel returns zero).
+
+        The dense voxel grid has no factor planes, so plane-TV is meaningless there and this base
+        returns zero; :class:`ObjectKPlanesTomo` overrides it with the real penalty on the grids.
+        """
+        return self._get_zero_loss_tensor()
 
     # endregion --- constraints ---
 
@@ -897,6 +924,39 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
     @property
     def model(self) -> KPlanesType:
         return cast(KPlanesType, self._model)
+
+    def _plane_tv_loss(self, weight: float) -> torch.Tensor:
+        """Total variation on the K-Planes **feature planes** themselves (dense, cheap).
+
+        For every multiscale grid, penalize the squared adjacent-element difference along both
+        plane axes (H and W), averaged over feature channels; sum the per-level penalties. For the
+        tilted backend (:class:`KPlanesTILTED`) the ``3`` planes of each of the ``T`` learned
+        rotations are summed and then averaged over rotations, matching the tomography module's
+        ``_get_plane_tv_loss``. ``CPTilted`` line factors ``(3*T, C, L)`` are handled by
+        differencing the single spatial axis. Backprops straight into the ``grids`` parameters, so
+        it is a much stronger and cheaper smoothness prior than the coordinate-sampled 3D TV on the
+        sub-1e-3 output density.
+        """
+        model = self.model
+        grids = getattr(model, "grids", None)
+        if grids is None or len(grids) == 0:
+            return self._get_zero_loss_tensor()
+        is_tilted = bool(getattr(model, "tilted", False))
+        per_level = []
+        for p in grids:
+            if p.ndim == 4:  # (3*T, C, H, W) feature planes
+                dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
+                dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
+                per_plane = dh + dw  # (3*T,)
+            else:  # (3*T, C, L) CP line factors
+                per_plane = (p[..., 1:] - p[..., :-1]).pow(2).mean(dim=tuple(range(1, p.ndim)))
+            if is_tilted:
+                # sum the 3 planes of each rotation, then average across the T rotations
+                level_tv = per_plane.view(cast(int, model.T), 3).sum(dim=1).mean()
+            else:
+                level_tv = per_plane.sum()
+            per_level.append(level_tv)
+        return weight * torch.stack(per_level).sum()
 
     @classmethod
     def from_model(
