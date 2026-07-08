@@ -1001,8 +1001,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         world_size``, so the same ``batch_size`` gives the same optimization trajectory (and
         loss curve) on any GPU count.
         """
-        pin_memory = self.dset.target_residency == "cpu" and str(self._single_device).startswith(
-            "cuda"
+        pin_memory = (
+            self.dset.target_residency == "cpu"
+            and str(self._single_device).startswith("cuda")
+            and num_workers > 0
         )
         per_rank_batch = self.batch_size
         if world_size > 1:

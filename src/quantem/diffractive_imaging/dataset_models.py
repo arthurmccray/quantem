@@ -166,7 +166,8 @@ class PtychographyDatasetBase(
         self._initial_descan_shifts = torch.zeros_like(self._descan_shifts)
 
         # _targets is a plain attribute (NOT a registered buffer) so that its device can be
-        # managed explicitly per target_residency; AutoSerialize does not serialize it either way.
+        # managed explicitly per target_residency. It is rebuilt by _set_targets at the
+        # start of every reconstruct() regardless.
         self._targets = torch.zeros(self.num_gpts, *self.roi_shape)
         self.register_buffer(
             "_patch_indices", torch.zeros(self.num_gpts, *self.roi_shape, dtype=torch.int32)
@@ -377,6 +378,9 @@ class PtychographyDatasetBase(
             raise ValueError(
                 f"target_space must be 'amplitude' or 'intensity', got {target_space!r}"
             )
+        # Release the stale stack before building the new one: holding both means a transient
+        # 2x targets allocation on the compute device at every reconstruct() start.
+        self._targets = torch.empty(0)
         self._targets = source.clone().to(target_device)
 
     @property
