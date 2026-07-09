@@ -27,7 +27,7 @@ padded box.
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Sequence, cast
+from typing import Any, Callable, Sequence, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -223,6 +223,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
     # ~6.8 GiB -- at ~10-20% extra time per iteration. Required for K-Planes backends at
     # production sampling on 40 GB GPUs; unnecessary for configs that already fit.
     forward_checkpoint: bool = False
+
+    # With ``forward_checkpoint=True``, chunks with index % N == 0 skip recompute-in-backward
+    # (their activations stay resident). Trades ~(chunk fwd cost)/N recompute time for
+    # ~(no-checkpoint residency)/N extra memory -- a dial between full checkpointing and none.
+    # N=4 at batch 128 measured -4% time for ~29 GiB peak on A100-40. 0 (default) = checkpoint
+    # every chunk (unchanged behavior).
+    forward_ckpt_resident_every: int = 0
 
     def __init__(
         self,
@@ -554,7 +561,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         # flat per-(slice, sample, b, h, w) position in ``acc`` for scatter; slice offset added below
         base = torch.arange(bhw, device=coords.device)
 
-        def _chunk(zk, sl, rzz, ryz, rxz, lat_z, lat_y, lat_x, base):
+        # Hoist the learned tilt rotations out of the chunk loop: ``so3.as_matrix()`` runs a
+        # host-syncing cuSOLVER SVD, and without this it re-executes on every chunk AND every
+        # checkpoint recompute. Passing R as an explicit checkpoint arg keeps so3 grads flowing.
+        so3 = getattr(self._model, "so3", None)
+        model_R = so3.as_matrix() if so3 is not None else None
+
+        def _chunk(zk, sl, rzz, ryz, rxz, lat_z, lat_y, lat_x, base, model_R):
             """(g,) z-samples -> (in-box densities, flat scatter indices). Pure given inputs;
             closes over self._model / h_z / h_y / h_x / bhw. All differentiable tensor inputs
             are explicit args so checkpointing keeps grads flowing upstream (probe positions,
@@ -570,9 +583,10 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             dest = (sl.view(-1, 1) * bhw + base.view(1, -1)).reshape(-1)[sel]
             if pts.shape[0] == 0:
                 return pts.new_zeros((0,)), dest
-            return self._model(pts).reshape(-1), dest  # (n_inside,)
+            return self._query_model(pts, model_R).reshape(-1), dest  # (n_inside,)
 
-        for start in range(0, n_samples, group):
+        resident_every = int(getattr(self, "forward_ckpt_resident_every", 0) or 0)
+        for ci, start in enumerate(range(0, n_samples, group)):
             # tensor slicing self-clamps at the end of the range, so no explicit ``g`` needed
             args = (
                 z_flat[start : start + group],
@@ -584,8 +598,14 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
                 lat_y,
                 lat_x,
                 base,
+                model_R,
             )
-            if self.forward_checkpoint and torch.is_grad_enabled():
+            do_ckpt = self.forward_checkpoint and torch.is_grad_enabled()
+            if do_ckpt and resident_every >= 1 and ci % resident_every == 0:
+                do_ckpt = (
+                    False  # keep this chunk's activations resident (spend idle VRAM on speed)
+                )
+            if do_ckpt:
                 # Recompute-in-backward. use_reentrant=False is required (data-dependent
                 # ``sel`` output shapes; grads to closure-captured module params);
                 # preserve_rng_state=False is safe (no RNG ops in the chunk) and avoids a
@@ -672,9 +692,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
+        # One SVD for all constraint terms: the sampled penalties below make up to 6 backend
+        # queries per batch, and tilted backends would re-run the host-syncing so3 SVD in each.
+        so3 = getattr(self._model, "so3", None)
+        model_R = so3.as_matrix() if so3 is not None else None
         w_tv = self.constraints.tv_weight
         if w_tv > 0:
-            tv_loss = self._sampled_tv3d_loss(w_tv)
+            tv_loss = self._sampled_tv3d_loss(w_tv, model_R=model_R)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
         w_plane = self.constraints.tv_plane_weight
@@ -684,12 +708,12 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             self.add_soft_constraint_loss("tv_plane_loss", plane_loss)
         w_pos = self.constraints.positivity_weight
         if w_pos > 0 and self.obj_type == "potential":
-            pos_loss = self._sampled_positivity_loss(w_pos)
+            pos_loss = self._sampled_positivity_loss(w_pos, model_R=model_R)
             loss = loss + pos_loss
             self.add_soft_constraint_loss("positivity_loss", pos_loss)
         w_l1 = self.constraints.sparsity_weight
         if w_l1 > 0:
-            l1_loss = self._sampled_l1_loss(w_l1)
+            l1_loss = self._sampled_l1_loss(w_l1, model_R=model_R)
             loss = loss + l1_loss
             self.add_soft_constraint_loss("sparsity_loss", l1_loss)
         self.accumulate_constraint_losses()
@@ -705,18 +729,31 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             - 1.0
         )
 
-    def _sampled_positivity_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+    def _query_model(self, coords: torch.Tensor, model_R: torch.Tensor | None) -> torch.Tensor:
+        """Backend query that reuses precomputed tilt rotations when the backend has them."""
+        if model_R is not None:
+            # only so3-bearing (tilted K-Planes family) backends produce a non-None model_R
+            return cast(Any, self._model).get_densities(coords, rotation_matrices=model_R)
+        return self._model(coords)
+
+    def _sampled_positivity_loss(
+        self, weight: float, num_samples: int = 4096, model_R: torch.Tensor | None = None
+    ) -> torch.Tensor:
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._query_model(coords, model_R).squeeze(-1)
         return weight * torch.relu(-value).mean()
 
-    def _sampled_l1_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+    def _sampled_l1_loss(
+        self, weight: float, num_samples: int = 4096, model_R: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Soft L1 sparsity: ``weight * mean(|density|)`` at randomly sampled coordinates."""
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._query_model(coords, model_R).squeeze(-1)
         return weight * value.abs().mean()
 
-    def _sampled_tv3d_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
+    def _sampled_tv3d_loss(
+        self, weight: float, num_samples: int = 4096, model_R: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Isotropic **L2 (squared-difference)** TV at sampled coordinates (same weight on z, xy).
 
         Matches the tomography ``tv_vol`` (mean squared adjacent-voxel difference, equal weight on
@@ -728,13 +765,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         """
         real_dtype = getattr(torch, config.get("dtype_real"))
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._query_model(coords, model_R).squeeze(-1)
         loss = self._get_zero_loss_tensor()
         for axis in range(3):
             h = 2.0 / max(int(self.volume_shape[axis]), 2)  # one cubic-voxel step
             offset = torch.zeros(3, device=self.device, dtype=real_dtype)
             offset[axis] = h
-            shifted = self._model(coords + offset).squeeze(-1)
+            shifted = self._query_model(coords + offset, model_R).squeeze(-1)
             # L2 (squared) difference to match tomography; ptychography uses L1 (abs).
             loss = loss + weight * torch.mean((shifted - value) ** 2)
         return loss
@@ -783,7 +820,21 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
         with torch.no_grad():
             if c.shrink_quantile is not None and 0.0 < c.shrink_quantile < 1.0:
                 planes = model.volume.view(model.volume.shape[0], -1)
-                floor = torch.quantile(planes, c.shrink_quantile, dim=1, keepdim=True)
+                # Estimate the per-plane quantile on a random column subsample: this projection
+                # runs after EVERY optimizer step, and the full-plane sort is its entire cost
+                # (26% of a small-scale batch). ~5-6k of 90k elements estimates a 0.2 quantile
+                # to well under the per-step drift it corrects; small planes (<= 4096) keep the
+                # exact quantile. Shared columns across planes keep it one fused gather.
+                n = planes.shape[1]
+                k = max(4096, n // 16)
+                if k < n:
+                    cols = torch.randint(
+                        0, n, (k,), device=planes.device, generator=self._rng_torch
+                    )
+                    sample = planes[:, cols]
+                else:
+                    sample = planes
+                floor = torch.quantile(sample, c.shrink_quantile, dim=1, keepdim=True)
                 planes.sub_(torch.clamp(floor, min=0.0))
             model.volume.clamp_(min=0.0)
         self._invalidate_obj_cache()

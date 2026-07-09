@@ -494,9 +494,16 @@ class KPlanesTILTED(KPlanes):
     # Core forward
     # ------------------------------------------------------------------
 
-    def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
+    def get_densities(
+        self, coords: torch.Tensor, rotation_matrices: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``rotation_matrices`` lets a caller that queries the model many times per step
+        (e.g. the ptycho-tomo gather loop: every chunk, checkpoint recompute, and constraint
+        tap) compute ``so3.as_matrix()`` once and reuse it — the SVD inside is a host-syncing
+        cuSOLVER call. Gradients still flow to ``so3`` through the passed tensor. ``None``
+        (default) computes it here, preserving the original behavior."""
         pts = coords.reshape(-1, 3)
-        R = self.so3.as_matrix()  # (T, 3, 3)
+        R = self.so3.as_matrix() if rotation_matrices is None else rotation_matrices  # (T, 3, 3)
         features = interpolate_ms_features_tilted(
             pts=pts,
             ms_grids=self.grids,
@@ -705,9 +712,12 @@ class CPTilted(PPLR, TensorDecompositionModel):
         else:
             raise ValueError(f"Unknown SO3 param type: {so3_param_type}")
 
-    def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
+    def get_densities(
+        self, coords: torch.Tensor, rotation_matrices: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """See :meth:`KPlanesTILTED.get_densities` for the ``rotation_matrices`` reuse contract."""
         pts = coords.reshape(-1, 3)
-        R = self.so3.as_matrix()
+        R = self.so3.as_matrix() if rotation_matrices is None else rotation_matrices
         features = interpolate_ms_features_cp_tilted(pts, self.grids, R)
         return self.density_activation(self.sigma_net(features))
 

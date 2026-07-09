@@ -451,6 +451,9 @@ class AutoSerialize:
             serialized = dill.dumps(value)
             compressed = gzip.compress(serialized)
             self._write_bytes(group, name, compressed, compressors)
+            # Tag the payload so loaders can decode it without guessing (the stored array is
+            # otherwise indistinguishable from a genuine 1-D uint8 array).
+            group.attrs[f"{name}._dill"] = True
 
     def _recursive_save(
         self,
@@ -522,6 +525,7 @@ class AutoSerialize:
                 name == "_autoserialize"
                 or name.endswith(".torch_save")
                 or name.endswith(".is_path")
+                or name.endswith("._dill")
             ):
                 continue  # Skip metadata/flags
             if name in skip_names:
@@ -836,6 +840,20 @@ class AutoSerialize:
         # Helper to handle optional torch tensor restoration
         def maybe_tensor(group, key):
             arr = AutoSerialize._read_array_np(group, key)
+            # Dill-fallback payloads (see ``_serialize_value``) are stored as 1-D uint8 arrays.
+            # The attribute-level loader decodes them, but this container path historically
+            # returned the raw bytes (e.g. a loaded ``_optimizer_params`` dict held uint8
+            # arrays and crashed ``reset_optimizer``). Prefer the explicit save-time tag;
+            # fall back to a decode attempt for files saved before the tag existed (a genuine
+            # uint8 array fails the gzip magic-header check and passes through unchanged).
+            if arr.dtype == np.uint8 and arr.ndim == 1:
+                try:
+                    payload = dill.loads(gzip.decompress(arr.tobytes()))
+                except Exception:
+                    if group.attrs.get(f"{key}._dill"):
+                        raise
+                else:
+                    return payload
             return torch.from_numpy(arr) if group.attrs.get(f"{key}.torch_save") else arr
 
         if ctype in ("list", "tuple"):
@@ -1073,6 +1091,7 @@ class AutoSerialize:
                     key == "_container_type"
                     or key.endswith(".torch_save")
                     or key.endswith(".is_path")
+                    or key.endswith("._dill")
                 ):
                     continue
                 val = group.attrs[key]
