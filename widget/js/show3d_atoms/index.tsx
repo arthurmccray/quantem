@@ -6,6 +6,11 @@
  * color range, and the traced sites overlaid: marker size scales with intensity,
  * marker opacity fades with distance from the slice.
  *
+ * The full volume stays in the kernel: Python streams only the *current* 2D slice
+ * (`slice_bytes`) plus a precomputed global color range (`data_lo`/`data_hi`) and
+ * histogram (`hist_bins`). Every message stays tiny, so this works at full
+ * resolution on a remote server for volumes of any size.
+ *
  * Interaction: left-drag = box zoom, middle-drag = pan, double-click = reset view
  * and all settings.  All site coordinates are in voxel/array-index space.
  */
@@ -22,7 +27,7 @@ import Switch from "@mui/material/Switch";
 import { useTheme } from "../theme";
 import { extractFloat32 } from "../format";
 import { COLORMAPS, COLORMAP_NAMES, applyColormap } from "../colormaps";
-import { findDataRange, sliderRange, percentileClip } from "../stats";
+import { sliderRange } from "../stats";
 
 const sliderStyles = {
   py: 0,
@@ -54,47 +59,21 @@ function planeInfo(plane: string, n0: number, n1: number, n2: number): PlaneInfo
   };
 }
 
-function extractSlice(vol: Float32Array, n1: number, n2: number, info: PlaneInfo, k: number): Float32Array {
-  const { rows, cols, normalAxis } = info;
-  const out = new Float32Array(rows * cols);
-  const stride0 = n1 * n2;
-  if (normalAxis === 2) {
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r * cols + c] = vol[r * stride0 + c * n2 + k];
-  } else if (normalAxis === 1) {
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r * cols + c] = vol[r * stride0 + k * n2 + c];
-  } else {
-    const base = k * stride0;
-    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r * cols + c] = vol[base + r * n2 + c];
-  }
-  return out;
-}
-
-/** Histogram binned over a fixed [lo, hi] range, clipping outliers into the end bins. */
-function histogramInRange(data: Float32Array, lo: number, hi: number, nbins = 96): number[] {
-  const bins = new Array(nbins).fill(0);
-  const range = hi > lo ? hi - lo : 1;
-  const scale = nbins / range;
-  for (let i = 0; i < data.length; i++) {
-    const v = data[i];
-    if (!isFinite(v)) continue;
-    let b = Math.floor((v - lo) * scale);
-    if (b < 0) b = 0; else if (b >= nbins) b = nbins - 1;
-    bins[b]++;
-  }
-  const mx = Math.max(...bins, 1e-9);
-  for (let i = 0; i < nbins; i++) bins[i] /= mx;
-  return bins;
-}
-
 function Show3DAtoms() {
   const { colors: tc } = useTheme();
 
-  const [volumeBytes] = useModelState<DataView>("volume_bytes");
+  // Current slice is streamed pre-extracted from Python (row-major, rows*cols).
+  const [sliceBytes] = useModelState<DataView>("slice_bytes");
+  const [sliceRows] = useModelState<number>("slice_rows");
+  const [sliceCols] = useModelState<number>("slice_cols");
   const [sitesBytes] = useModelState<DataView>("sites_bytes");
   const [n0] = useModelState<number>("n0");
   const [n1] = useModelState<number>("n1");
   const [n2] = useModelState<number>("n2");
   const [numSites] = useModelState<number>("num_sites");
+  const [dataLo] = useModelState<number>("data_lo");
+  const [dataHi] = useModelState<number>("data_hi");
+  const [histBinsModel] = useModelState<number[]>("hist_bins");
   const [title] = useModelState<string>("title");
   const [cmap, setCmap] = useModelState<string>("cmap");
   const [plane, setPlane] = useModelState<string>("plane");
@@ -110,22 +89,23 @@ function Show3DAtoms() {
   const [showSlice, setShowSlice] = useModelState<boolean>("show_slice");
   const [canvasSize] = useModelState<number>("canvas_size");
 
-  const volume = React.useMemo(() => extractFloat32(volumeBytes), [volumeBytes]);
+  const slice = React.useMemo(() => extractFloat32(sliceBytes), [sliceBytes]);
   const sites = React.useMemo(() => extractFloat32(sitesBytes), [sitesBytes]);
   const info = React.useMemo(() => planeInfo(plane, n0, n1, n2), [plane, n0, n1, n2]);
   const k = Math.max(0, Math.min(info.depth - 1, sliceIndex));
 
-  // Robust intensity range (percentile-clipped) for histogram + color mapping.
+  // The streamed slice matches the current plane once synced; while a plane/index
+  // change is in flight, the slice's own (rows, cols) may lag the plane's info.
+  const sliceReady = !!slice && slice.length === sliceRows * sliceCols
+    && sliceRows === info.rows && sliceCols === info.cols;
+
+  // Robust intensity range + histogram are precomputed in the kernel.
   const baseRange = React.useMemo(() => {
-    if (!volume) return { lo: 0, hi: 1 };
-    const { vmin, vmax, min, max } = percentileClip(volume, 0.5, 99.5);
-    return vmax > vmin ? { lo: vmin, hi: vmax } : findDataRange(volume).max > findDataRange(volume).min
-      ? { lo: min, hi: max } : { lo: min, hi: min + 1 };
-  }, [volume]);
-  const histBins = React.useMemo(
-    () => (volume ? histogramInRange(volume, baseRange.lo, baseRange.hi) : null),
-    [volume, baseRange],
-  );
+    const lo = dataLo ?? 0;
+    const hi = (dataHi ?? 1) > lo ? (dataHi as number) : lo + 1;
+    return { lo, hi };
+  }, [dataLo, dataHi]);
+  const histBins = histBinsModel && histBinsModel.length ? histBinsModel : null;
   const maxIntensity = React.useMemo(() => {
     if (!sites || numSites === 0) return 1;
     let m = 0;
@@ -154,20 +134,19 @@ function Show3DAtoms() {
     }
   }, [plane, info.depth, sliceIndex, setSliceIndex]);
 
-  // ---- Effect A: colormap the full slice into an offscreen canvas (heavy) ----
+  // ---- Effect A: colormap the streamed slice into an offscreen canvas (heavy) ----
   const offRef = React.useRef<HTMLCanvasElement | null>(null);
   const [sliceVersion, setSliceVersion] = React.useState(0);
   React.useEffect(() => {
-    if (!volume) return;
+    if (!sliceReady) return;   // wait for the matching slice during a plane switch
     let off = offRef.current;
     if (!off) { off = document.createElement("canvas"); offRef.current = off; }
     off.width = info.cols; off.height = info.rows;
     const octx = off.getContext("2d")!;
     if (showSlice) {
-      const sliceData = extractSlice(volume, n1, n2, info, k);
       const { vmin, vmax } = sliderRange(baseRange.lo, baseRange.hi, vminPct, vmaxPct);
       const rgba = new Uint8ClampedArray(info.rows * info.cols * 4);
-      applyColormap(sliceData, rgba, COLORMAPS[cmap] || COLORMAPS.gray, vmin, vmax);
+      applyColormap(slice!, rgba, COLORMAPS[cmap] || COLORMAPS.gray, vmin, vmax);
       const img = octx.createImageData(info.cols, info.rows);
       img.data.set(rgba);
       octx.putImageData(img, 0, 0);
@@ -176,7 +155,7 @@ function Show3DAtoms() {
       octx.fillRect(0, 0, info.cols, info.rows);
     }
     setSliceVersion((v) => v + 1);
-  }, [volume, n1, n2, info, k, cmap, baseRange, vminPct, vmaxPct, showSlice]);
+  }, [slice, sliceReady, info, cmap, baseRange, vminPct, vmaxPct, showSlice]);
 
   // ---- Effect B: draw offscreen (viewport crop) + atom overlay + rubber band (light) ----
   const canvasRef = React.useRef<HTMLCanvasElement>(null);
