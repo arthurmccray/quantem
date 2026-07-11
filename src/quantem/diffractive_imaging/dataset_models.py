@@ -521,11 +521,13 @@ class PtychographyDatasetBase(
     @property
     def com_transpose(self) -> bool:
         "whether or not the dset has been transposed"
-        return self._transpose
+        # reads/writes _com_transpose (the attribute __init__ initializes) — the getter used to
+        # read a never-initialized `_transpose`, breaking any access before preprocess()
+        return self._com_transpose
 
     @com_transpose.setter
     def com_transpose(self, t: bool) -> None:
-        self._transpose = bool(t)
+        self._com_transpose = bool(t)
 
     @property
     def com_rotation_rad(self) -> float:

@@ -47,8 +47,12 @@ def initialized(obj: ObjectKPlanesTomo, lateral: int = 17, sampling: float = 0.5
     return obj
 
 
-def payload(lateral: int, tilt: float, batch: int = 2) -> PtychoTomoPatchData:
-    ax = torch.linspace(-1, 1, lateral)
+def payload(
+    lateral: int, tilt: float, batch: int = 2, sampling: float = 0.5
+) -> PtychoTomoPatchData:
+    # coords_yx_A carries physical Å since the refactor: scale the normalized [-1, 1] grid by
+    # the lateral half-extent h = (lateral - 1) / 2 * sampling (matching ``initialized``)
+    ax = torch.linspace(-1, 1, lateral) * ((lateral - 1) / 2.0 * sampling)
     gy, gx = torch.meshgrid(ax, ax, indexing="ij")
     coords = torch.stack([gy, gx], dim=-1)[None].expand(batch, -1, -1, -1)
     rots = rot_beam_to_spec(0.0, torch.full((batch,), tilt), 0.0)
@@ -197,6 +201,7 @@ def _make_ptycho(arrays, obj):
         for a in arrays
     ]
     wrapper = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
+    obj.set_geometry(lateral_box_A=(1.0, 1.0), sampling=(1.0, 1.0))
     probe = ProbePixelated.from_array(
         num_probes=1,
         probe_params={

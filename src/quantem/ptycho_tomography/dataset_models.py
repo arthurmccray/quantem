@@ -122,6 +122,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_shifts = nn.Parameter(
             torch.zeros(num_tilts, 2, dtype=real_dtype), requires_grad=False
         )
+        # Beam-frame coordinate origin in scan-grid pixels (set at preprocess): the center of
+        # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
+        # relative to this point (see PtychoTomoPatchData).
+        self.register_buffer("_scan_center_px", torch.full((2,), torch.nan, dtype=real_dtype))
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -305,6 +309,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self.com_transpose = bool(force_com_transpose)
 
         self._set_initial_scan_positions_px(obj_padding_px)
+        self._set_scan_center(obj_padding_px)
         self._set_targets("amplitude")
         if free_per_tilt_arrays:
             self._free_per_tilt_arrays()
@@ -324,6 +329,20 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         )
         self.scan_positions_px = positions
         self.initial_scan_positions_px = self.scan_positions_px.data.clone()
+
+    def _set_scan_center(self, obj_padding_px: "np.ndarray | tuple[int, int]") -> None:
+        """Set the beam-frame coordinate origin: the center of the scan grid at this padding.
+
+        Positions carry the same padding offset, so the origin is padding-invariant in Å. Must
+        be re-called if positions are re-derived at a different padding (the base
+        ``obj_padding_px`` setter path does this via ``PtychoTomography.preprocess``).
+        """
+        full2d = self._obj_shape_full_2d(obj_padding_px)
+        self._scan_center_px = torch.tensor(
+            [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0],
+            dtype=self._scan_center_px.dtype,
+            device=self._scan_center_px.device,
+        )
 
     def _set_patch_indices(self, obj_padding_px: np.ndarray | tuple) -> None:
         """No-op: only implicit (coordinate-queried) object models are supported."""
@@ -364,11 +383,37 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self.apply_hard_constraints(obj_padding_px)
         bidx = torch.as_tensor(batch_indices).to(self._tilt_offsets.device)
         positions_px = self.scan_positions_px[bidx]
-        coords = self._scan_coords(bidx, obj_padding_px)
+        coords_A = self._scan_coords_A(bidx)
         tilt_idx = self.tilt_index_of(bidx)
         rotations = self.rotations()[tilt_idx]
-        payload = PtychoTomoPatchData(coords_yx=coords, rotations=rotations, tilt_indices=tilt_idx)
+        payload = PtychoTomoPatchData(
+            coords_yx_A=coords_A, rotations=rotations, tilt_indices=tilt_idx
+        )
         return payload, positions_px, torch.zeros_like(positions_px), None
+
+    def _scan_coords_A(self, batch_indices: torch.Tensor) -> torch.Tensor:
+        """Physical beam-frame ``(row, col)`` patch coordinates in Å, ``(B, Hroi, Wroi, 2)``.
+
+        Same construction as the base ``_scan_coords`` (un-rounded positions + fftfreq ROI
+        offsets, no wrap) but emitted in Å relative to ``_scan_center_px`` (the scan-grid
+        center == specimen-box center) instead of normalized over a padded pixel grid — the
+        object model owns the Å -> [-1, 1] support normalization.
+        """
+        center = self._scan_center_px
+        if bool(torch.isnan(center).any()):
+            raise RuntimeError("scan center not set; run preprocess() first")
+        positions = self.scan_positions_px[batch_indices]  # (batch, 2), un-rounded px
+        hroi, wroi = int(self.roi_shape[0]), int(self.roi_shape[1])
+        r_ind = torch.fft.fftfreq(hroi, d=1 / hroi).to(self.device)
+        c_ind = torch.fft.fftfreq(wroi, d=1 / wroi).to(self.device)
+        rows = positions[:, 0][:, None, None] + r_ind[None, :, None]  # (batch, Hroi, 1)
+        cols = positions[:, 1][:, None, None] + c_ind[None, None, :]  # (batch, 1, Wroi)
+        rows = rows.expand(-1, -1, wroi)
+        cols = cols.expand(-1, hroi, -1)
+        samp = self.obj_sampling
+        rows_A = (rows - center[0]) * float(samp[0])
+        cols_A = (cols - center[1]) * float(samp[1])
+        return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
     def reset(self) -> None:
         super().reset()

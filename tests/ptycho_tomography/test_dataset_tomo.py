@@ -149,7 +149,7 @@ class TestForward:
         n = int(np.prod(GPTS))
         batch = torch.tensor([0, n - 1, n + 2, 2 * n + 3])  # spans all three tilts
         payload, pos, frac, descan = w.forward(batch, (8, 8))
-        assert payload.coords_yx.shape == (4, ROI, ROI, 2)
+        assert payload.coords_yx_A.shape == (4, ROI, ROI, 2)
         assert payload.rotations.shape == (4, 3, 3)
         assert torch.equal(payload.tilt_indices, torch.tensor([0, 0, 1, 2]))
         assert pos.shape == (4, 2)
@@ -179,7 +179,41 @@ class TestForward:
         local = torch.tensor([0, 3, 7])
         coords_single = single._scan_coords(local, (8, 8))
         payload, *_ = w.forward(local, (8, 8))  # tilt-0 block: flat == local indices
-        assert torch.allclose(payload.coords_yx, coords_single, atol=1e-6)
+        # the wrapper now emits physical Å (origin at the padded-grid center) while the base
+        # _scan_coords stays normalized over the padded grid; they relate by
+        # coords_A = coords_norm * h with h = (full2d - 1) / 2 * sampling per axis
+        full2d = single._obj_shape_full_2d((8, 8))
+        samp = single.obj_sampling
+        h = torch.tensor(
+            [
+                (int(full2d[0]) - 1) / 2.0 * float(samp[0]),
+                (int(full2d[1]) - 1) / 2.0 * float(samp[1]),
+            ]
+        )
+        assert torch.allclose(payload.coords_yx_A, coords_single * h, atol=1e-5)
+
+    def test_payload_coords_are_A_centered_on_scan_grid(self):
+        """Payload coords are physical Å with the origin at the scan-grid center.
+
+        For the tilt-0 block of a dataset preprocessed at padding (8, 8): the batch-mean of the
+        per-position coordinate (ROI offset 0 == the scan position itself) sits near 0 (the scan
+        grid is anchored at the coordinate origin, up to the pixel rounding of the grid
+        placement), and each patch spans exactly one ROI extent in Å.
+        """
+        w = _build_wrapper()
+        w.implicit_object = True
+        samp = w.obj_sampling
+        n = int(np.prod(GPTS))
+        payload, *_ = w.forward(torch.arange(n), (8, 8))  # all tilt-0 scan positions
+        coords = payload.coords_yx_A
+        # ROI offset 0 is the (fractional) scan position itself -> grid centered near 0 Å
+        centers = coords[:, 0, 0, :]
+        assert centers.mean(0).abs().max().item() < STEP  # within one scan step of the origin
+        # per-patch spread along each axis = (ROI - 1) * sampling in Å (fftfreq offsets)
+        row_span = (coords[0, ..., 0].max() - coords[0, ..., 0].min()).item()
+        col_span = (coords[0, ..., 1].max() - coords[0, ..., 1].min()).item()
+        assert row_span == pytest.approx((ROI - 1) * float(samp[0]), rel=1e-6)
+        assert col_span == pytest.approx((ROI - 1) * float(samp[1]), rel=1e-6)
 
 
 class TestStateAndSerialization:

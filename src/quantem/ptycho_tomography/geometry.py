@@ -103,24 +103,31 @@ class PtychoTomoPatchData:
     Carries everything the rotated-coordinate object query needs for one batch. Defined at module
     level (not nested) so it pickles across the multi-GPU forkserver spawn.
 
+    Coordinate convention (2026-07-10, physical-units refactor): all coordinates are **physical
+    Å in the beam frame**, with the **origin at the specimen-box center** — which is anchored to
+    the scan-footprint center by the dataset model — and the tilt/rotation axis passing through
+    it. The object model owns the mapping from specimen-frame Å to its normalized ``[-1, 1]``
+    support box; the dataset no longer needs to know anything about padding or box extents.
+
     Attributes
     ----------
-    coords_yx:
-        ``(B, Hroi, Wroi, 2)`` normalized beam-frame ``(row, col)`` patch coordinates in
-        ``[-1, 1]`` over the padded 2D object extent (same construction as the implicit-object
-        ``_scan_coords``); fractional scan positions are baked in.
+    coords_yx_A:
+        ``(B, Hroi, Wroi, 2)`` beam-frame ``(row, col)`` patch coordinates in **Å**, origin at
+        the scan-footprint center (== specimen-box center); fractional scan positions are baked
+        in. (Renamed from the pre-refactor ``coords_yx``, which was normalized over the padded
+        pixel grid — the rename makes stale unit assumptions fail loudly.)
     rotations:
         ``(B, 3, 3)`` beam→specimen rotation matrices (``rot_beam_to_spec``), components
         ``(z, y, x)``.
     tilt_indices:
         ``(B,)`` long tensor mapping each batch element to its tilt (diagnostics / per-tilt
         extensions).
-    shifts_px:
-        Optional ``(B, 2)`` beam-frame alignment shifts in pixels, subtracted before rotation
+    shifts_A:
+        Optional ``(B, 2)`` beam-frame alignment shifts in Å, subtracted before rotation
         (per-tilt pose refinement; unused/None in v1).
     """
 
-    coords_yx: torch.Tensor
+    coords_yx_A: torch.Tensor
     rotations: torch.Tensor
     tilt_indices: torch.Tensor
-    shifts_px: torch.Tensor | None = None
+    shifts_A: torch.Tensor | None = None

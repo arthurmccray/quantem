@@ -15,7 +15,7 @@ Typical use::
     obj = ObjectVoxelTomo.from_uniform(thickness_A=56.0, num_slices=16)
     probe = ProbeParametric.from_params(probe_params={"energy": 300e3, ...})
     pt = PtychoTomography.from_models(dset, obj, probe, DetectorPixelated(), device="gpu")
-    pt.preprocess(obj_padding_px=(32, 32), z_padding_px=48)
+    pt.preprocess(specimen_box_A=(84.0, 84.0, 84.0))  # physical box (Å); see preprocess()
     pt.reconstruct(num_iters=300, store_snapshots_every=25,
                    optimizer_params={"object": ..., "probe": ...})
     vol = pt.volume_cropped  # (D, h, w) specimen-frame density, rad/Å (padding cropped)
@@ -113,9 +113,10 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         return pt
 
     # region --- preprocessing ---
-    def preprocess(
+    def preprocess(  # pyright: ignore[reportIncompatibleMethodOverride] -- physical-units geometry
         self,
-        obj_padding_px: tuple[int, int] = (0, 0),
+        specimen_box_A: "tuple[float, float] | tuple[float, float, float] | None" = None,
+        box_margin_A: tuple[float, float, float] = (0.0, 0.0, 0.0),
         val_ratio: float = 0.0,
         val_mode: Literal["grid", "random"] = "grid",
         vectorized: bool = True,
@@ -130,25 +131,29 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         plot_com: str | bool = False,
         plot_probe_overlap: bool = False,
         *,
-        z_padding_px: int = 0,
         probe_energy: float | None = None,
         free_per_tilt_arrays: bool = True,
+        obj_padding_px: tuple[int, int] | None = None,  # DEPRECATED
+        z_padding_px: int | None = None,  # DEPRECATED
     ) -> Self:
-        """Preprocess the tilt series and run the 3D object-geometry handshake.
+        """Preprocess the tilt series and run the physical-units geometry handshake.
 
-        Mirrors ``PtychographyBase.preprocess`` with tilt-series specifics: per-tilt CoM rotation
-        is forced (default 0; per-tilt solved rotations would scramble the shared geometry), the
-        2D probe-overlap FOV mask is replaced by a trivial mask (it is meaningless for a rotated
-        3D object — support/positivity constraints play its role), and the object model's volume
-        grid is matched to the padded object via ``obj_padding_px``'s ``_initialize_obj`` call.
+        Geometry (2026-07-10 refactor — all in Å, shared by every backend):
 
-        ``z_padding_px`` adds vacuum headroom along the beam on EACH side of the specimen
-        (anisotropic padding: z is set separately from the lateral ``obj_padding_px``). At high
-        tilt, probes near the lateral edges rotate into ``|z| > thickness/2``; for planar
-        (non-vacuum-padded) samples real density lives there. Costs ~no compute (the slab count
-        is fixed), only volume memory. ``volume_cropped`` removes it again.
-        TODO(padding-units): pixel-denominated padding doesn't make sense for implicitly defined
-        objects — consider physical-unit (Å) padding throughout.
+        - ``specimen_box_A``: the physical object box (crop target), ``(by, bx)`` lateral or
+          ``(bz, by, bx)`` (``bz`` must equal the object's ``thickness_A``). Axis-aligned with
+          the object grid in the specimen frame; its center is the coordinate origin and the
+          tilt axis passes through it (the scan-footprint center is anchored there). Default:
+          scan-grid extent plus one probe-ROI extent laterally (covers probe tails) —
+          the right semantic for plan-view samples too. For simulated data pass the true box
+          (e.g. the AuNP's cubic 84 Å box → cubic ``volume_cropped``, square projections).
+        - ``box_margin_A``: ``(mz, my, mx)`` extra support margin OUTSIDE the box per side,
+          default zeros. Only useful when true material extends beyond the box (plan-view /
+          real data); under tilt the beam samples up to ``±(bz/2)·sin(θ_max)`` laterally beyond
+          the 0° footprint. ``volume_cropped`` removes margins on ALL three axes.
+
+        Tilt-series specifics as before: a common (usually zero) CoM rotation is forced across
+        tilts, and the 2D probe-overlap FOV mask is replaced by a trivial mask.
         """
         del batch_size, plot_rotation, plot_com, plot_probe_overlap  # unused (parity only)
         if padded_diffraction_intensities_shape is not None:
@@ -161,16 +166,37 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
                 "(per-tilt solved rotations would break the shared geometry); use 0.0 / False "
                 "for simulated data."
             )
+
+        # ---- deprecated pixel-padding arguments (legacy mapping keeps old runs reproducible)
+        legacy = obj_padding_px is not None or z_padding_px is not None
+        if legacy:
+            from warnings import warn
+
+            warn(
+                "obj_padding_px / z_padding_px are deprecated - use specimen_box_A (Å) and "
+                "box_margin_A (Å); the pixel arguments will be removed",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            print(
+                "[DEPRECATED] preprocess(obj_padding_px/z_padding_px) -> "
+                "preprocess(specimen_box_A=..., box_margin_A=...); will be removed"
+            )
+            if specimen_box_A is not None:
+                raise ValueError("pass either specimen_box_A or the deprecated pixel paddings")
+        _pad = obj_padding_px if obj_padding_px is not None else (0, 0)
+        pad_yx: tuple[int, int] = (int(_pad[0]), int(_pad[1]))
+
+        # cast: dset is validated as a PtychoTomoDatasetRaster in from_models (it is a
+        # sibling of the single-scan raster class, so isinstance narrowing can't apply)
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)
         if not self.dset.preprocessed:
             self.vprint("Dataset was not preprocessed, proceeding with defaults.")
-            # cast: dset is validated as a PtychoTomoDatasetRaster in from_models (it is a
-            # sibling of the single-scan raster class, so isinstance narrowing can't apply)
-            dset = cast(PtychoTomoDatasetRaster, self.dset)
-            dset.preprocess(
+            dset_t.preprocess(
                 com_fit_function=com_fit_function,
                 force_com_rotation=force_com_rotation,
                 force_com_transpose=force_com_transpose,
-                obj_padding_px=obj_padding_px,
+                obj_padding_px=pad_yx,
                 probe_energy=probe_energy,
                 free_per_tilt_arrays=free_per_tilt_arrays,
                 vectorized=vectorized,
@@ -182,20 +208,68 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
                 device=self._single_device,
             )
 
-        # z padding must be set BEFORE the geometry handshake (it changes the box/slab extent
-        # and hence the cubic z-voxel count and propagator spacings)
         obj = cast(ObjectPtychoTomoBase, self.obj_model)
-        obj.set_z_padding_A(float(z_padding_px) * float(np.mean(self.sampling)))
+        samp = np.asarray(self.dset.obj_sampling, dtype=float)  # (y, x), Å/px
+        s = float(np.mean(samp))
 
-        # geometry handshake: triggers obj_model._initialize_obj(obj_shape_full, sampling)
-        # (volume grid allocation) and re-derives scan positions on the padded grid
-        self.obj_padding_px = obj_padding_px
+        # base machinery attrs first: the setter may power-2-adjust the padding and re-derives
+        # scan positions, so the coordinate origin is set from the FINAL padding afterwards.
+        # Suppress the setter's legacy pixel handshake — set_geometry below is authoritative
+        # (documented seam in ObjectPtychoTomoBase._initialize_obj).
+        obj._geometry_set = True
+        self.obj_padding_px = pad_yx
+        dset_t._set_scan_center(self.obj_padding_px)
+
+        # ---- resolve the physical geometry
+        margins: tuple[float, float, float] = (
+            float(box_margin_A[0]),
+            float(box_margin_A[1]),
+            float(box_margin_A[2]),
+        )
+        if legacy:
+            # compat mapping: reproduces the old padded-grid extents exactly —
+            # lateral box = un-padded grid point-extent, margins = padding in Å
+            full2d_nopad = self.dset._obj_shape_full_2d((0, 0))
+            lateral_box = (
+                (int(full2d_nopad[0]) - 1) * float(samp[0]),
+                (int(full2d_nopad[1]) - 1) * float(samp[1]),
+            )
+            p_final = tuple(int(p) for p in np.asarray(self.obj_padding_px).ravel())
+            margins = (
+                float(z_padding_px or 0) * s,
+                p_final[0] * float(samp[0]),
+                p_final[1] * float(samp[1]),
+            )
+        elif specimen_box_A is not None:
+            box = tuple(float(v) for v in np.asarray(specimen_box_A, dtype=float).ravel())
+            if len(box) == 3:
+                if not np.isclose(box[0], obj.thickness_A, rtol=1e-6):
+                    raise ValueError(
+                        f"specimen_box_A z extent ({box[0]} Å) must equal the object's "
+                        f"thickness_A ({obj.thickness_A} Å) — set thickness_A at construction"
+                    )
+                lateral_box = (box[1], box[2])
+            elif len(box) == 2:
+                lateral_box = (box[0], box[1])
+            else:
+                raise ValueError(f"specimen_box_A must have 2 or 3 components, got {box}")
+        else:
+            # default: scan-grid extent + one probe-ROI extent (probe-tail coverage);
+            # plan-view-appropriate (there is no "true" box for extended samples)
+            full2d_nopad = self.dset._obj_shape_full_2d((0, 0))
+            roi = np.asarray(self.roi_shape, dtype=float)
+            lateral_box = (
+                (int(full2d_nopad[0]) - 1) * float(samp[0]) + float(roi[0]) * float(samp[0]),
+                (int(full2d_nopad[1]) - 1) * float(samp[1]) + float(roi[1]) * float(samp[1]),
+            )
+
+        obj.set_geometry(lateral_box_A=lateral_box, sampling=samp, box_margin_A=margins)
         self.compute_propagator_arrays()
 
         # trivial FOV mask (ndim-3 expanded by the setter); obj_model.mask stays empty so the
         # sampled-coordinate constraints skip it
         full2d = self.dset._obj_shape_full_2d(self.obj_padding_px)
-        self.obj_fov_mask = np.ones(tuple(int(s) for s in full2d), dtype=config.get("dtype_real"))
+        self.obj_fov_mask = np.ones(tuple(int(v) for v in full2d), dtype=config.get("dtype_real"))
 
         self._check_slab_coverage()
         self._preprocessed = True
@@ -299,16 +373,53 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
     # region --- properties ---
     @property
-    def obj_shape_crop(self) -> np.ndarray:
-        """``(D, h, w)``: the specimen volume cropped to the scan FOV laterally AND to the
-        un-padded specimen thickness along z (the z padding is vacuum headroom, not specimen)."""
-        shp = np.floor(self.dset.fov / self.sampling)
-        shp += shp % 2
+    def sampling(self) -> np.ndarray:  # pyright: ignore[reportIncompatibleMethodOverride] -- 3D
+        """``(z, y, x)`` voxel size of the reconstruction volume, Å. Cubic by construction:
+        y == x exactly (enforced), z equal to <0.1% (grid rounding over the box thickness)."""
         obj = self.obj_model
         assert isinstance(obj, ObjectPtychoTomoBase)
+        lat = np.asarray(self.dset.obj_sampling, dtype=float)
+        try:
+            zv = obj.z_voxel_A
+        except ValueError:  # volume grid not allocated yet (mid-construction, pre-preprocess)
+            zv = float(lat[0])  # z voxel == lateral pixel by design once geometry is set
+        return np.array([zv, lat[0], lat[1]], dtype=float)
+
+    @property
+    def obj_shape_crop(self) -> np.ndarray:
+        """``(D, h, w)`` of the specimen box (all support margins removed on all three axes)."""
+        obj = self.obj_model
+        assert isinstance(obj, ObjectPtychoTomoBase)
+        if obj.lateral_box_A is not None:
+            sl = obj.crop_slices
+            d, h, w = obj.volume_shape
+            return np.array(
+                [
+                    len(range(*sl[0].indices(d))),
+                    len(range(*sl[1].indices(h))),
+                    len(range(*sl[2].indices(w))),
+                ]
+            )
+        # legacy fallback (pre-set_geometry objects): scan-FOV lateral crop, thickness z crop
+        shp = np.floor(self.dset.fov / np.asarray(self.dset.obj_sampling, dtype=float))
+        shp += shp % 2
         d_specimen = max(1, round(obj.thickness_A / obj.z_voxel_A))
         d_specimen = min(d_specimen, obj.volume_shape[0])
         return np.concatenate([[d_specimen], shp]).astype("int")
+
+    @property
+    def obj_cropped(self) -> np.ndarray:  # pyright: ignore[reportIncompatibleMethodOverride]
+        """Specimen-box volume: the support volume with ALL margins cropped (z, y and x).
+
+        For a cubic specimen box (e.g. the AuNP's 84 Å cube) this is a cubic array — square
+        projections along every axis. Falls back to the legacy FOV crop for objects loaded
+        without the physical-box geometry.
+        """
+        obj = self.obj_model
+        assert isinstance(obj, ObjectPtychoTomoBase)
+        if obj.lateral_box_A is not None:
+            return self._to_numpy(self.obj_model.obj[obj.crop_slices])
+        return super().obj_cropped
 
     @property
     def volume(self) -> np.ndarray:

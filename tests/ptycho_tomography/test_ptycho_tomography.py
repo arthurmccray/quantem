@@ -69,19 +69,23 @@ def _make_wrapper(arrays_per_tilt: list[np.ndarray]) -> PtychoTomoDatasetRaster:
     return PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
 
 
-def _make_ptycho(wrapper: PtychoTomoDatasetRaster) -> PtychoTomography:
-    obj = ObjectVoxelTomo.from_uniform(
-        thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
-    )
-    probe_model = ProbePixelated.from_array(
+
+def _make_probe() -> ProbePixelated:
+    return ProbePixelated.from_array(
         num_probes=1,
         probe_params={"energy": PROBE_ENERGY, "C10": C10, "semiangle_cutoff": _semiangle_mrad()},
         probe_array=_probe_array(),
     )
+
+
+def _make_ptycho(wrapper: PtychoTomoDatasetRaster) -> PtychoTomography:
+    obj = ObjectVoxelTomo.from_uniform(
+        thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
+    )
     pt = PtychoTomography.from_models(
         dset=wrapper,
         obj_model=obj,
-        probe_model=probe_model,
+        probe_model=_make_probe(),
         detector_model=DetectorPixelated(),
         rng=0,
         verbose=False,
@@ -172,7 +176,8 @@ class TestWiring:
         assert np.allclose(pt.obj_fov_mask, 1.0)
         h_z, h_y, h_x = obj._box_half_extents
         assert h_z == pytest.approx(THICKNESS_A / 2)
-        assert h_y == pytest.approx((full2d[0] - 1) / 2 * pt.sampling[0])
+        # pt.sampling is now a (z, y, x) 3-vector; index 1 is the lateral (row) sampling
+        assert h_y == pytest.approx((full2d[0] - 1) / 2 * pt.sampling[1])
 
     def test_volume_and_crop_shapes(self, inverse_crime_setup):
         arrays, _ = inverse_crime_setup
@@ -193,6 +198,65 @@ class TestWiring:
         assert cube.shape == (n, n, n)  # consistent cubic framing (WS4: z vacuum vs scan FOV)
         sl = tuple(slice((s - n) // 2, (s - n) // 2 + n) for s in vc.shape)
         np.testing.assert_array_equal(cube, vc[sl])
+
+    def test_cubic_specimen_box_volume_cropped(self, inverse_crime_setup):
+        """specimen_box_A=(T, L, L) with L == thickness crops to the specimen box with three
+        ~equal (cubic) voxel sizes.
+
+        Point-grid convention on all three axes (``round(L / s) + 1`` points spanning the
+        box), so the cubic specimen box crops to a cubic (13, 13, 13) array.
+        """
+        arrays, _ = inverse_crime_setup
+        wrapper = _make_wrapper(arrays)
+        obj = ObjectVoxelTomo.from_uniform(
+            thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=None, rng=0
+        )
+        pt = PtychoTomography.from_models(
+            wrapper, obj, _make_probe(), DetectorPixelated(), rng=0, verbose=False
+        )
+        L = THICKNESS_A  # cubic specimen box: bz must equal the object's thickness_A
+        pt.preprocess(specimen_box_A=(THICKNESS_A, L, L))
+        samp = pt.sampling
+        assert samp.shape == (3,)  # (z, y, x) voxel sizes, cubic by construction
+        assert np.allclose(samp, samp[0], rtol=1e-3)
+        crop = pt.obj_cropped
+        n_box = round(L / float(samp[1]))
+        assert crop.shape == (n_box + 1, n_box + 1, n_box + 1)  # cubic box -> cubic crop
+        assert crop.shape[1] == crop.shape[2]
+        assert pt.volume_cropped.shape == crop.shape
+
+    def test_deprecated_padding_matches_explicit_set_geometry(self, inverse_crime_setup):
+        """Old/new geometry equivalence: the deprecated preprocess(obj_padding_px=(PAD, PAD))
+        maps to set_geometry with lateral_box_A = un-padded grid point-extent and
+        box_margin_A = the (power-of-2-adjusted) padding in Å — identical box half-extents
+        and a numerically identical object forward on the same payload."""
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))  # deprecated obj_padding_px=(PAD, PAD) inside
+        obj_legacy = pt.obj_model
+        assert isinstance(obj_legacy, ObjectVoxelTomo)
+        s = float(pt.sampling[1])
+        n_fov = pt.dset._obj_shape_full_2d((0, 0))  # un-padded grid points per axis
+        pad_final = np.asarray(pt.obj_padding_px)  # PAD after the power-of-2 adjustment
+        obj_new = ObjectVoxelTomo.from_uniform(
+            thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
+        )
+        obj_new.set_geometry(
+            lateral_box_A=((int(n_fov[0]) - 1) * s, (int(n_fov[1]) - 1) * s),
+            sampling=(s, s),
+            box_margin_A=(0.0, float(pad_final[0]) * s, float(pad_final[1]) * s),
+        )
+        assert obj_new._box_half_extents == obj_legacy._box_half_extents
+        assert obj_new.volume_shape == obj_legacy.volume_shape
+        # same payload + same volume -> identical transmission patches
+        torch.manual_seed(0)
+        vol = 0.01 * torch.rand(obj_legacy.volume_shape)
+        obj_legacy.set_volume(vol, set_as_initial=False)
+        obj_new.set_volume(vol, set_as_initial=False)
+        patch_data, *_ = pt.dset.forward(torch.arange(8), pt.obj_padding_px)
+        with torch.no_grad():
+            out_legacy = obj_legacy.forward(patch_data)
+            out_new = obj_new.forward(patch_data)
+        assert torch.allclose(out_legacy, out_new, atol=1e-6)
 
     def test_from_models_type_validation(self, inverse_crime_setup):
         arrays, _ = inverse_crime_setup
@@ -338,26 +402,19 @@ class TestSnapshotsAndPadding:
         obj = ObjectVoxelTomo.from_uniform(
             thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=None, rng=0
         )
-        probe_model = ProbePixelated.from_array(
-            num_probes=1,
-            probe_params={
-                "energy": PROBE_ENERGY,
-                "C10": C10,
-                "semiangle_cutoff": _semiangle_mrad(),
-            },
-            probe_array=_probe_array(),
-        )
         pt = PtychoTomography.from_models(
-            wrapper, obj, probe_model, DetectorPixelated(), rng=0, verbose=False
+            wrapper, obj, _make_probe(), DetectorPixelated(), rng=0, verbose=False
         )
         z_pad_px = 4
         pt.preprocess(obj_padding_px=(PAD, PAD), z_padding_px=z_pad_px)
-        pad_A = z_pad_px * float(np.mean(pt.sampling))
+        # pt.sampling is (z, y, x); the deprecated z_padding_px maps to Å via the lateral pixel
+        s_lat = float(np.mean(pt.sampling[1:]))
+        pad_A = z_pad_px * s_lat
         assert obj.box_thickness_A == pytest.approx(THICKNESS_A + 2 * pad_A)
-        # cubic z count covers the padded box; the crop removes the padding again
-        assert obj.volume_shape[0] == round(obj.box_thickness_A / float(np.mean(pt.sampling)))
+        # cubic z point count covers the padded box; the crop removes the padding again
+        assert obj.volume_shape[0] == round(obj.box_thickness_A / s_lat) + 1
         crop = pt.volume_cropped
-        assert crop.shape[0] == round(THICKNESS_A / obj.z_voxel_A)
+        assert crop.shape[0] == round(THICKNESS_A / obj.z_voxel_A) + 1  # point convention
         assert crop.shape[0] < obj.volume_shape[0]
         # propagator spacing follows the padded slab thickness
         assert obj.slab_thickness_A == pytest.approx(obj.box_thickness_A / NUM_SLICES)

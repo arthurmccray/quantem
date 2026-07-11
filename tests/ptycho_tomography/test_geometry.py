@@ -135,13 +135,15 @@ def test_slab_z_centers():
 
 
 def test_patch_data_fields():
+    # physical-units refactor: coords_yx_A / shifts_A carry Å (renamed from the normalized
+    # coords_yx / pixel shifts_px so stale unit assumptions fail loudly)
     pd = PtychoTomoPatchData(
-        coords_yx=torch.zeros(2, 4, 4, 2),
+        coords_yx_A=torch.zeros(2, 4, 4, 2),
         rotations=torch.eye(3).expand(2, 3, 3),
         tilt_indices=torch.zeros(2, dtype=torch.long),
     )
-    assert pd.shifts_px is None
-    assert pd.coords_yx.shape == (2, 4, 4, 2)
+    assert pd.shifts_A is None
+    assert pd.coords_yx_A.shape == (2, 4, 4, 2)
 
 
 if __name__ == "__main__":

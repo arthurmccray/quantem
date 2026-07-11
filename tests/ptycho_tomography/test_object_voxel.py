@@ -39,15 +39,20 @@ def make_initialized_voxel_obj(
 
 
 def full_fov_payload(
-    lateral_full: int, tilt_deg: float = 0.0, batch: int = 1
+    lateral_full: int, tilt_deg: float = 0.0, batch: int = 1, sampling: float = 0.5
 ) -> PtychoTomoPatchData:
-    """One patch spanning the full padded lateral grid (rows/cols at exact grid coords)."""
-    ax = _axis(lateral_full)
+    """One patch spanning the full padded lateral grid (rows/cols at exact grid coords, Å).
+
+    Physical-units refactor: ``coords_yx_A`` carries beam-frame Å (origin at the box center),
+    so the normalized [-1, 1] grid is scaled by the lateral half-extent
+    ``h = (lateral_full - 1) / 2 * sampling`` (== the object's ``_box_half_extents`` laterals).
+    """
+    ax = _axis(lateral_full) * ((lateral_full - 1) / 2.0 * sampling)
     gy, gx = torch.meshgrid(ax, ax, indexing="ij")
     coords = torch.stack([gy, gx], dim=-1)[None].expand(batch, -1, -1, -1)
     rots = rot_beam_to_spec(0.0, torch.full((batch,), float(tilt_deg)), 0.0)
     return PtychoTomoPatchData(
-        coords_yx=coords, rotations=rots, tilt_indices=torch.zeros(batch, dtype=torch.long)
+        coords_yx_A=coords, rotations=rots, tilt_indices=torch.zeros(batch, dtype=torch.long)
     )
 
 
@@ -159,7 +164,7 @@ class TestObjectVoxelTomoForward:
             lateral_full=n,
             sampling=sampling,
         )
-        out = obj.forward(full_fov_payload(n, tilt_deg=0.0))
+        out = obj.forward(full_fov_payload(n, tilt_deg=0.0, sampling=sampling))
         proj = torch.angle(out).sum(0)[0]  # (H, W)
         # Riemann sum of trilinear-interpolated volume at slab centers vs direct voxel sum:
         # compare against the same interpolation evaluated densely -> use voxel sum with tolerance
@@ -201,7 +206,7 @@ class TestObjectVoxelTomoForward:
         lat = torch.stack(torch.meshgrid(ax, ax, indexing="ij"), dim=-1)  # (n, n, 2) physical
         zc = obj._slab_z_centers_t  # (n,)
         for tilt in [0.0, 30.0, -30.0, 90.0, 70.0]:
-            out = obj.forward(full_fov_payload(n, tilt_deg=tilt))
+            out = obj.forward(full_fov_payload(n, tilt_deg=tilt, sampling=sampling))
             proj = torch.angle(out).sum(0)[0]
 
             # analytic reference: evaluate the phantom at the SAME rotated beam-frame points
@@ -233,7 +238,7 @@ class TestObjectVoxelTomoForward:
         obj = make_initialized_voxel_obj(
             volume=vol, thickness_A=thickness, num_slices=n, lateral_full=n, sampling=sampling
         )
-        out = obj.forward(full_fov_payload(n, tilt_deg=90.0))
+        out = obj.forward(full_fov_payload(n, tilt_deg=90.0, sampling=sampling))
         proj = torch.angle(out).sum(0)[0]
         ref = vol.sum(1) * obj.slab_thickness_A  # rows = specimen z, cols = x
         corr = torch.corrcoef(torch.stack([proj.flatten(), ref.flatten()]))[0, 1]
@@ -301,6 +306,25 @@ class TestObjectVoxelTomoStateAndConstraints:
         with pytest.raises(ValueError, match="preprocess"):
             _ = obj._box_half_extents
 
+    def test_set_geometry_rejects_anisotropic_sampling(self):
+        """set_geometry requires equal y/x sampling (cubic voxels)."""
+        obj = ObjectVoxelTomo.from_uniform(thickness_A=8.0, num_slices=4)
+        with pytest.raises(ValueError, match="equal y/x sampling"):
+            obj.set_geometry(lateral_box_A=(8.0, 8.0), sampling=(0.5, 0.6))
+
+    def test_set_geometry_matches_legacy_initialize(self):
+        """set_geometry and the legacy pixel handshake produce identical box half-extents."""
+        obj_legacy = ObjectVoxelTomo.from_uniform(thickness_A=8.0, num_slices=4)
+        obj_legacy._initialize_obj((4, 17, 17), sampling=(0.5, 0.5))
+        obj_new = ObjectVoxelTomo.from_uniform(thickness_A=8.0, num_slices=4)
+        # 17 grid points at 0.5 Å/px span (17 - 1) * 0.5 = 8 Å (point-grid convention)
+        obj_new.set_geometry(lateral_box_A=(8.0, 8.0), sampling=(0.5, 0.5))
+        assert obj_new._box_half_extents == obj_legacy._box_half_extents
+        # lateral grids identical; z uses the point convention (round(box/s) + 1 points) while
+        # the legacy pixel handshake used the voxel convention (round(box/s)) — one more point
+        assert obj_new.volume_shape[1:] == obj_legacy.volume_shape[1:]
+        assert obj_new.volume_shape[0] == obj_legacy.volume_shape[0] + 1
+
 
 class TestZPadding:
     def test_box_extends_and_crop_target_unchanged(self):
@@ -333,7 +357,7 @@ class TestZPadding:
         def covered_fraction(obj, density=0.05):  # small density: slab phase stays << pi
             with torch.no_grad():
                 obj.set_volume(torch.full(obj.volume_shape, density), set_as_initial=False)
-                out = obj.forward(full_fov_payload(33, tilt_deg=70.0))
+                out = obj.forward(full_fov_payload(33, tilt_deg=70.0, sampling=2 * lat_half / 32))
                 phase = torch.angle(out)
                 expected = density * obj.slab_thickness_A  # full coverage value
                 return (phase > 0.95 * expected).float().mean().item()

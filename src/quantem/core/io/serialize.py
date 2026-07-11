@@ -836,7 +836,11 @@ class AutoSerialize:
         # Helper to handle optional torch tensor restoration
         def maybe_tensor(group, key):
             arr = AutoSerialize._read_array_np(group, key)
-            if arr.dtype == np.uint8 and arr.ndim == 1 and not group.attrs.get(f"{key}.torch_save"):
+            if (
+                arr.dtype == np.uint8
+                and arr.ndim == 1
+                and not group.attrs.get(f"{key}.torch_save")
+            ):
                 try:
                     return dill.loads(gzip.decompress(arr.tobytes()))
                 except Exception:

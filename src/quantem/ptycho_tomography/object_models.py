@@ -250,7 +250,15 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         self._num_slices = int(num_slices)
         self._model = model.to(self._device)
         self._thickness_A = thickness_A
-        self._z_padding_A: float = 0.0
+        # Physical-box geometry (2026-07-10 refactor): the specimen box (crop target) is
+        # (thickness_A, *lateral_box_A); box_margin_A adds representation-support margin OUTSIDE
+        # the box on each side per axis (z, y, x). Margins default to zero — with implicit
+        # (coordinate-queried) backends there is no wrap-around edge, and margin only matters
+        # when true material extends beyond the box (plan-view / real data; under tilt the beam
+        # samples up to ±(box_z/2)·sin(θ_max) laterally beyond the 0° footprint).
+        self._lateral_box_A: tuple[float, float] | None = None
+        self._box_margin_A: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._geometry_set: bool = False
         self.slice_thicknesses = self.box_thickness_A / num_slices if num_slices > 1 else None
         self._set_pretrained_weights(self._model)
         self._num_z_voxels = int(num_z_voxels) if num_z_voxels is not None else None
@@ -310,29 +318,129 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
 
     @property
     def z_padding_A(self) -> float:
-        """Vacuum padding added on EACH side of the specimen along z (Å)."""
-        return self._z_padding_A
+        """DEPRECATED alias of ``box_margin_A[0]`` (z support margin per side, Å)."""
+        return self._box_margin_A[0]
 
     @property
     def box_thickness_A(self) -> float:
-        """Total object-box / multislice-slab z extent: ``thickness_A + 2 * z_padding_A``."""
-        return self._thickness_A + 2.0 * self._z_padding_A
+        """Total support-box / multislice-slab z extent: ``thickness_A + 2 * box_margin_A[0]``."""
+        return self._thickness_A + 2.0 * self._box_margin_A[0]
+
+    @property
+    def box_margin_A(self) -> tuple[float, float, float]:
+        """Support margin OUTSIDE the specimen box, per side, ``(mz, my, mx)`` in Å.
+
+        Zero by default: implicit backends have no wrap-around edge, so margin is only useful
+        when true material extends beyond the specimen box (plan-view / real data — it pushes
+        the box-edge vacuum clip away from the measured region, at the cost of diluting feature
+        resolution over a larger box). ``obj_cropped`` removes it on all three axes.
+        """
+        return self._box_margin_A
+
+    @property
+    def lateral_box_A(self) -> tuple[float, float] | None:
+        """Specimen-box lateral extents ``(by, bx)`` in Å (crop target; snapped to the point
+        grid ``n * sampling``). None until :meth:`set_geometry` (or the legacy pixel handshake,
+        which leaves it None and derives crops at the ptychography level)."""
+        return self._lateral_box_A
+
+    @property
+    def specimen_box_A(self) -> tuple[float, float, float]:
+        """The crop-target specimen box ``(bz, by, bx)`` in Å: ``(thickness_A, *lateral_box_A)``.
+
+        Axis-aligned with the object grid in the specimen frame; its center is the coordinate
+        origin (the tilt axis passes through it). With a rotated scan (common CoM rotation) the
+        rotated footprint sits inside this axis-aligned box — corner regions weakly constrained
+        at 0° are still constrained by tilted views and are NOT cropped away.
+        """
+        if self._lateral_box_A is None:
+            raise ValueError("lateral_box_A not set; call set_geometry() (new preprocess path).")
+        return (self._thickness_A, self._lateral_box_A[0], self._lateral_box_A[1])
+
+    def set_geometry(
+        self,
+        *,
+        lateral_box_A: "tuple[float, float] | np.ndarray",
+        sampling: "tuple[float, float] | np.ndarray",
+        box_margin_A: "tuple[float, float, float] | np.ndarray" = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Physical-units geometry handshake (replaces the pixel-padding ``_initialize_obj``).
+
+        Snaps the lateral specimen box and lateral margins to whole voxels (point-grid
+        convention: an extent ``n * s`` spans ``n + 1`` grid points), allocates the volume grid
+        over box + 2*margin per axis, and updates the slab geometry. Sampling must be equal in
+        y and x (raises otherwise); the z voxel is ``box_thickness_A / D`` with
+        ``D = round(box_thickness_A / s)`` — equal to the lateral pixel to <0.1% (exact when the
+        box thickness is a whole number of pixels).
+        """
+        samp = np.asarray(sampling, dtype=float).ravel()
+        if samp.size == 3:  # tolerate a (z, y, x) triple; lateral components are authoritative
+            samp = samp[1:]
+        if samp.size != 2:
+            raise ValueError(f"sampling must have 2 (y, x) components, got {sampling}")
+        if not np.isclose(samp[0], samp[1], rtol=1e-6, atol=0.0):
+            raise ValueError(
+                f"ptycho-tomography requires equal y/x sampling (cubic voxels), got "
+                f"({samp[0]:.8g}, {samp[1]:.8g}) Å"
+            )
+        s = float(samp[0])
+        mz, my, mx = (float(m) for m in np.asarray(box_margin_A, dtype=float).ravel())
+        if min(mz, my, mx) < 0:
+            raise ValueError(f"box_margin_A components must be >= 0, got {box_margin_A}")
+        by, bx = (float(v) for v in np.asarray(lateral_box_A, dtype=float).ravel())
+        if min(by, bx) <= 0:
+            raise ValueError(f"lateral_box_A extents must be > 0, got {lateral_box_A}")
+        n_by, n_bx = max(1, round(by / s)), max(1, round(bx / s))
+        n_my, n_mx = round(my / s), round(mx / s)
+        self._lateral_box_A = (n_by * s, n_bx * s)
+        self._box_margin_A = (mz, n_my * s, n_mx * s)
+        self.sampling = (s, s)
+        if self.num_slices > 1:
+            self.slice_thicknesses = self.box_thickness_A / self.num_slices
+        h_pts, w_pts = n_by + 2 * n_my + 1, n_bx + 2 * n_mx + 1
+        self._obj_shape = (self.num_slices, h_pts, w_pts)
+        if self._volume_shape_explicit:
+            if self._volume_shape is not None and self._volume_shape[1:] != (h_pts, w_pts):
+                warn(
+                    f"explicit volume_shape lateral dims {self._volume_shape[1:]} differ from "
+                    f"the support grid {(h_pts, w_pts)}; cropping will be misaligned.",
+                    stacklevel=2,
+                )
+        else:
+            # point convention on z too: round(box/s) + 1 points span the box thickness, so a
+            # cubic specimen box crops to a cubic array (z spacing == lateral pixel to <0.1%)
+            d = self._num_z_voxels or (max(1, round(self.box_thickness_A / s)) + 1)
+            new_shape = (int(d), h_pts, w_pts)
+            if self._volume_shape != new_shape:
+                self._volume_shape = new_shape
+                self._allocate_backend()
+        self._geometry_set = True
+        self._invalidate_obj_cache()
+
+    @property
+    def crop_slices(self) -> tuple[slice, slice, slice]:
+        """Slices that crop the support volume down to the specimen box on ALL three axes
+        (removing ``box_margin_A``); for a cubic specimen box the crop is cubic."""
+        d, h, w = self.volume_shape
+        mz, my, mx = self._box_margin_A
+        s = float(self.sampling[0]) if self.sampling is not None else self.z_voxel_A
+        kz = int(round(mz / self.z_voxel_A))
+        ky, kx = int(round(my / s)), int(round(mx / s))
+        return (slice(kz, d - kz), slice(ky, h - ky), slice(kx, w - kx))
 
     def set_z_padding_A(self, pad_A: float) -> None:
-        """Set the beam-direction vacuum padding (each side, Å) and update the slab geometry.
-
-        Must be called before ``_initialize_obj`` (the preprocess handshake does this) so the
-        volume grid and propagator spacings are built for the padded box. Compute cost is
-        ~unchanged (the slab count is fixed; slabs just get thicker), only volume memory grows.
-
-        TODO(padding-units): padding currently arrives in pixels at the ptychography level and is
-        converted to Å — pixel units don't make sense for implicitly defined objects; consider
-        physical-unit padding (Å) throughout, including the lateral obj_padding_px.
-        """
+        """DEPRECATED: use ``set_geometry(box_margin_A=(pad, my, mx))``. Sets the z support
+        margin (each side, Å) and updates the slab geometry."""
+        warn(
+            "set_z_padding_A is deprecated - pass box_margin_A to set_geometry()/preprocess()",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        print("[DEPRECATED] set_z_padding_A -> set_geometry(box_margin_A=...); will be removed")
         pad_A = float(pad_A)
         if pad_A < 0:
             raise ValueError(f"z padding must be >= 0, got {pad_A}")
-        self._z_padding_A = pad_A
+        self._box_margin_A = (pad_A, self._box_margin_A[1], self._box_margin_A[2])
         if self.num_slices > 1:
             self.slice_thicknesses = self.box_thickness_A / self.num_slices
         self._invalidate_obj_cache()
@@ -349,8 +457,14 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
 
     @property
     def z_voxel_A(self) -> float:
-        """Specimen-frame z voxel size of the volume grid (Å)."""
-        return self.box_thickness_A / self.volume_shape[0]
+        """Specimen-frame z grid spacing of the volume grid (Å), point convention.
+
+        ``D`` grid points span the box thickness, so spacing is ``box / (D - 1)`` — matching
+        the actual ``linspace(-1, 1, D)`` materialization grid (the old ``box / D`` under-read
+        the real spacing by one part in D) and the lateral point-grid convention.
+        """
+        d = int(self.volume_shape[0])
+        return self.box_thickness_A / max(d - 1, 1)
 
     @property
     def slab_thickness_A(self) -> float:
@@ -417,8 +531,13 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         voxels** over the padded box (``box_thickness_A / mean(sampling)``) unless
         ``num_z_voxels`` was set.
         """
+        if self._geometry_set:
+            # Physical-units geometry (set_geometry) is authoritative; ignore the legacy
+            # pixel-padding handshake that the base obj_padding_px setter still triggers.
+            return
         if sampling is not None:
-            self.sampling = sampling
+            samp = np.asarray(sampling, dtype=float).ravel()
+            self.sampling = tuple(samp[-2:]) if samp.size >= 2 else sampling
         shape_t = tuple(int(x) for x in shape)
         if shape_t[0] != self.num_slices:
             raise ValueError(
@@ -506,17 +625,16 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         ``(num_slices, batch, Hroi, Wroi)``.
         """
         self._invalidate_obj_cache()
-        coords = patch_data.coords_yx  # (B, Hroi, Wroi, 2) normalized beam-frame (row, col)
+        coords = patch_data.coords_yx_A  # (B, Hroi, Wroi, 2) beam-frame (row, col), physical Å
         rot = patch_data.rotations.to(device=coords.device, dtype=coords.dtype)  # (B, 3, 3)
         h_z, h_y, h_x = self._box_half_extents
-        y_b = coords[..., 0] * h_y  # (B, Hroi, Wroi), physical Å
-        x_b = coords[..., 1] * h_x
+        y_b = coords[..., 0]  # (B, Hroi, Wroi), physical Å (origin = specimen-box center)
+        x_b = coords[..., 1]
         if (
-            patch_data.shifts_px is not None
-        ):  # per-tilt alignment shifts (beam frame, pre-rotation)
-            samp = self.sampling
-            y_b = y_b - (patch_data.shifts_px[:, 0] * float(samp[0])).view(-1, 1, 1)
-            x_b = x_b - (patch_data.shifts_px[:, 1] * float(samp[1])).view(-1, 1, 1)
+            patch_data.shifts_A is not None
+        ):  # per-tilt alignment shifts (beam frame, pre-rotation), Å
+            y_b = y_b - patch_data.shifts_A[:, 0].view(-1, 1, 1)
+            x_b = x_b - patch_data.shifts_A[:, 1].view(-1, 1, 1)
         z_centers = self._slab_z_centers_t.to(coords.dtype)  # (S,)
         z_offsets = self._slab_sample_offsets().to(coords.dtype)  # (K,)
         t_slab = self.slab_thickness_A
