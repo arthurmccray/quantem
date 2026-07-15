@@ -6,7 +6,7 @@ backend and tested through the same payload interface. A compact inverse-crime r
 smoke exercises the PPLR fan-out through the full PtychoTomography loop.
 """
 
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -29,7 +29,7 @@ PPLR = {
 
 
 def make_kplanes_obj(**kwargs) -> ObjectKPlanesTomo:
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         thickness_A=8.0,
         num_slices=4,
         num_z_voxels=8,
@@ -79,7 +79,7 @@ class TestConstructionAndForward:
         with torch.no_grad():
             final = obj.model.sigma_net
             final = final[-1] if isinstance(final, torch.nn.Sequential) else final
-            final.weight.normal_(0, 0.1)
+            cast(torch.Tensor, final.weight).normal_(0, 0.1)
         out = obj.forward(payload(17, 35.0))
         out.imag.sum().backward()
         grid_grads = [p.grad for p in obj.model.get_params()["grids"]]
@@ -87,7 +87,7 @@ class TestConstructionAndForward:
 
     def test_from_model_rejects_non_kplanes(self):
         with pytest.raises(TypeError, match="KPlanes"):
-            ObjectKPlanesTomo.from_model(torch.nn.Linear(3, 1), thickness_A=8.0)
+            ObjectKPlanesTomo.from_model(torch.nn.Linear(3, 1), thickness_A=8.0)  # pyright: ignore[reportArgumentType] -- intentional wrong model type for the TypeError test
 
     def test_tilted_variant_param_keys(self):
         obj = make_kplanes_obj(tilted=True, T=2)
@@ -159,7 +159,7 @@ class TestPretrainAndState:
         with torch.no_grad():
             final = obj.model.sigma_net
             final = final[-1] if isinstance(final, torch.nn.Sequential) else final
-            final.weight.normal_(0, 0.1)
+            cast(torch.Tensor, final.weight).normal_(0, 0.1)
         obj.constraints = {"tv_weight": 0.1, "positivity_weight": 0.5}
         loss = obj.apply_soft_constraints()
         assert torch.isfinite(loss)
@@ -300,7 +300,7 @@ class TestReconstructIntegration:
         vol_before = pt.volume.copy()
         path = tmp_path / "kplanes_tomo.zip"
         pt.save(path, mode="o")  # raw data excluded by default -> reattach via from_file(dset=)
-        wrapper2 = cast(PtychoTomoDatasetRaster, pt.dset)  # same wrapper, as the notebook flow
+        wrapper2 = cast(PtychoTomoDatasetRaster, pt.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam (same wrapper, as the notebook flow)
         loaded = PtychoTomography.from_file(path, dset=wrapper2)
         np.testing.assert_allclose(loaded.volume, vol_before, rtol=1e-4, atol=1e-5)
         assert loaded.dset.implicit_object is True  # re-synced by the from_file override

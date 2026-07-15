@@ -27,7 +27,7 @@ padded box.
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Sequence, cast
+from typing import Any, Callable, Sequence, cast
 from warnings import warn
 
 import matplotlib.pyplot as plt
@@ -127,6 +127,12 @@ class PtychoTomoObjConstraintParams:
         shrink_quantile: float | None = None
         fix_potential_baseline: bool = False
         fix_potential_baseline_factor: float = 1.0
+        # 2026-07-14: coordinates sampled per step by EACH soft constraint (positivity / L1 /
+        # sampled TV). 4096 (the historical hardcode) leaves sparsely-sampled corners of the
+        # volume unpoliced — seen as run-to-run hot-spot artifacts outside the particle support.
+        # Raise (e.g. 32768) to cut the stochastic penalty-gradient noise; cost is one extra
+        # model query batch per constraint per step.
+        constraint_num_samples: int = 4096
         _name: str = "volume"
 
         soft_constraint_keys = [
@@ -140,6 +146,7 @@ class PtychoTomoObjConstraintParams:
             "shrink_quantile",
             "fix_potential_baseline",
             "fix_potential_baseline_factor",
+            "constraint_num_samples",  # sampler size knob (not a loss weight) — see field docs
         ]
 
 
@@ -176,7 +183,9 @@ class VoxelGrid(nn.Module):
         return vals.view(-1, 1)
 
 
-class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume], ObjectBase):
+class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] -- cooperative super().__init__ chain
+    BaseConstraints[PtychoTomoObjConstraintParams.Volume], ObjectBase
+):
     """Base for joint ptycho-tomography object models: the shared rotated-query engine.
 
     Wraps a coordinate-queried ``nn.Module`` backend (``(N, 3)`` normalized ``(z, y, x)`` ->
@@ -543,7 +552,7 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             raise ValueError(
                 f"shape[0] ({shape_t[0]}) does not match num_slices ({self.num_slices})"
             )
-        self._obj_shape = shape_t  # type: ignore[assignment]
+        self._obj_shape = cast("tuple[int, int, int]", shape_t)  # validated 3D above
         self._invalidate_obj_cache()
         lat = (int(shape[1]), int(shape[2]))
         if self._volume_shape_explicit:
@@ -790,9 +799,10 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
+        n_samp = max(1, int(getattr(self.constraints, "constraint_num_samples", 4096)))
         w_tv = self.constraints.tv_weight
         if w_tv > 0:
-            tv_loss = self._sampled_tv3d_loss(w_tv)
+            tv_loss = self._sampled_tv3d_loss(w_tv, num_samples=n_samp)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
         w_plane = self.constraints.tv_plane_weight
@@ -802,12 +812,12 @@ class ObjectPtychoTomoBase(BaseConstraints[PtychoTomoObjConstraintParams.Volume]
             self.add_soft_constraint_loss("tv_plane_loss", plane_loss)
         w_pos = self.constraints.positivity_weight
         if w_pos > 0 and self.obj_type == "potential":
-            pos_loss = self._sampled_positivity_loss(w_pos)
+            pos_loss = self._sampled_positivity_loss(w_pos, num_samples=n_samp)
             loss = loss + pos_loss
             self.add_soft_constraint_loss("positivity_loss", pos_loss)
         w_l1 = self.constraints.sparsity_weight
         if w_l1 > 0:
-            l1_loss = self._sampled_l1_loss(w_l1)
+            l1_loss = self._sampled_l1_loss(w_l1, num_samples=n_samp)
             loss = loss + l1_loss
             self.add_soft_constraint_loss("sparsity_loss", l1_loss)
         self.accumulate_constraint_losses()
@@ -1255,9 +1265,9 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         self,
         pretrain_target: torch.Tensor | np.ndarray | None = None,
         num_iters: int = 200,
-        optimizer_params: "dict | OptimizerParamsType | None" = None,
-        scheduler_params: "dict | SchedulerParamsType | None" = None,
-        loss_fn: Callable | str = "l2",
+        optimizer_params: "dict[str, Any] | OptimizerParamsType | None" = None,
+        scheduler_params: "dict[str, Any] | SchedulerParamsType | None" = None,
+        loss_fn: Callable[..., torch.Tensor] | str = "l2",
         device: str | int | None = None,
         show: bool = True,
         normalize_object_plotting: bool = True,
@@ -1293,7 +1303,7 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
     def _pretrain(
         self,
         num_iters: int,
-        loss_fn: Callable,
+        loss_fn: nn.Module,
         show: bool = False,
         normalize_object_plotting: bool = True,
     ) -> None:

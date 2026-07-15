@@ -69,7 +69,6 @@ def _make_wrapper(arrays_per_tilt: list[np.ndarray]) -> PtychoTomoDatasetRaster:
     return PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
 
 
-
 def _make_probe() -> ProbePixelated:
     return ProbePixelated.from_array(
         num_probes=1,
@@ -255,7 +254,7 @@ class TestWiring:
         patch_data, *_ = pt.dset.forward(torch.arange(8), pt.obj_padding_px)
         with torch.no_grad():
             out_legacy = obj_legacy.forward(patch_data)
-            out_new = obj_new.forward(patch_data)
+            out_new = obj_new.forward(patch_data)  # pyright: ignore[reportArgumentType] -- payload seam: the tomo dset.forward emits PtychoTomoPatchData
         assert torch.allclose(out_legacy, out_new, atol=1e-6)
 
     def test_from_models_type_validation(self, inverse_crime_setup):
@@ -274,7 +273,7 @@ class TestWiring:
 
         bad_obj = ObjectPixelated.from_uniform(num_slices=1, obj_type="potential")
         with pytest.raises(TypeError, match="rotation-aware"):
-            PtychoTomography.from_models(wrapper, bad_obj, probe_model, DetectorPixelated())
+            PtychoTomography.from_models(wrapper, bad_obj, probe_model, DetectorPixelated())  # pyright: ignore[reportArgumentType] -- intentional wrong object type for the TypeError test
 
 
 class TestForwardConsistency:
@@ -362,7 +361,7 @@ class TestSerialization:
         assert snp["obj"].shape == tuple(loaded.obj_shape_crop)
         np.testing.assert_allclose(loaded.volume, vol_before, rtol=1e-5, atol=1e-6)
         # the loaded object must visualize (this exact path failed before the from_file fix)
-        fig, _axs = loaded.visualize(return_fig=True)
+        fig, _axs = loaded.visualize(return_fig=True)  # pyright: ignore[reportGeneralTypeIssues] -- return_fig=True always returns the (fig, axes) tuple
         assert fig is not None
         # continued reconstruction runs after reload
         loaded.reconstruct(

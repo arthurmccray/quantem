@@ -22,7 +22,7 @@ class PtychoTomographyVisualizations:
         ``cubic=True`` uses ``volume_cropped_cubic`` (center-cropped to a cube) so depth sections
         are framed consistently with the projection instead of showing z vacuum headroom.
         """
-        vol = self.volume_cropped_cubic if cubic else self.volume_cropped  # type: ignore[attr-defined]
+        vol = self.volume_cropped_cubic if cubic else self.volume_cropped  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         secs = []
         for ax in range(3):
             n = vol.shape[ax]
@@ -48,7 +48,7 @@ class PtychoTomographyVisualizations:
         secs = self._volume_sections(slab_frac, cubic=cubic)
         titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
         fig, axs = plt.subplots(1, 3, figsize=(3 * axsize[0], axsize[1]))
-        z_aspect = self.z_sampling / float(np.mean(self.sampling))  # type: ignore[attr-defined]
+        z_aspect = self.z_sampling / float(np.mean(self.sampling))  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         for i, (ax, sec, title) in enumerate(zip(axs, secs, titles)):
             im = ax.imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
             ax.set_title(title)
@@ -76,9 +76,9 @@ class PtychoTomographyVisualizations:
         fig = plt.figure(figsize=(13, 7))
         gs = gridspec.GridSpec(2, 1, height_ratios=[1, 2], hspace=0.35)
         ax_top = fig.add_subplot(gs[0])
-        iter_losses = self._iter_losses  # type: ignore[attr-defined]
+        iter_losses = self._iter_losses  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         if len(iter_losses):
-            self.plot_losses(figax=(fig, ax_top))  # type: ignore[attr-defined]
+            self.plot_losses(figax=(fig, ax_top))  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         else:
             ax_top.text(0.5, 0.5, "no iterations yet", ha="center", va="center")
             ax_top.set_axis_off()
@@ -87,21 +87,21 @@ class PtychoTomographyVisualizations:
         axs = np.array([fig.add_subplot(gs_bot[0, i]) for i in range(4)])
         secs = self._volume_sections(cubic=cubic)
         titles = ["volume (y, x)", "volume (z, x)", "volume (z, y)"]
-        z_aspect = self.z_sampling / float(np.mean(self.sampling))  # type: ignore[attr-defined]
+        z_aspect = self.z_sampling / float(np.mean(self.sampling))  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         for i, (sec, title) in enumerate(zip(secs, titles)):
             im = axs[i].imshow(sec, cmap=cmap, aspect=(z_aspect if i > 0 else 1.0))
             axs[i].set_title(title)
             if cbar:
                 plt.colorbar(im, ax=axs[i], fraction=0.046)
 
-        probe = self.probe  # type: ignore[attr-defined]
+        probe = self.probe  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         probe0 = probe.sum(0) if probe.ndim == 3 else probe
         show_2d(
             np.fft.fftshift(probe0),  # centered, complex (amplitude+phase rendering)
             figax=(fig, axs[3]),
             title="Probe",
             cbar=cbar,
-            scalebar={"sampling": float(self.sampling[0]), "units": "Å"},  # type: ignore[attr-defined]
+            scalebar={"sampling": float(self.sampling[0]), "units": "Å"},  # pyright: ignore[reportAttributeAccessIssue] -- host-class attr
         )
         if len(iter_losses):
             title = f"Final loss: {iter_losses[-1]:.3e} | Iters: {len(iter_losses)}"

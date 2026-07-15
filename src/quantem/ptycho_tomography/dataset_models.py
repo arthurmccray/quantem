@@ -45,6 +45,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     # registered buffer / parameter types (mirrors the base's _patch_indices declaration)
     _tilt_offsets: torch.Tensor
     _tilt_angles_deg: torch.Tensor
+    _scan_center_px: torch.Tensor
+    _pose_z1_init: torch.Tensor
+    _pose_z3_init: torch.Tensor
     _pose_z1: nn.Parameter
     _pose_dtheta: nn.Parameter
     _pose_z3: nn.Parameter
@@ -126,6 +129,11 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
         # relative to this point (see PtychoTomoPatchData).
         self.register_buffer("_scan_center_px", torch.full((2,), torch.nan, dtype=real_dtype))
+        # Baseline pose the parameters reset to (default zeros). set_tilt_axis_pose() uses this
+        # to fix a dataset-wide tilt-AXIS convention (e.g. z1=-90, z3=+90 turns the ZXZ x-tilt
+        # into a tilt about y — the ASE-simulated AuNP series' convention, found 2026-07-13).
+        self.register_buffer("_pose_z1_init", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_z3_init", torch.zeros(num_tilts, dtype=real_dtype))
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -317,7 +325,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def _set_initial_scan_positions_px(
         self,
-        obj_padding_px: np.ndarray | tuple | None,
+        obj_padding_px: np.ndarray | tuple[int, ...] | None,
         positions_mask: np.ndarray | None = None,
     ) -> None:
         """Delegate per tilt (identical geometry -> identical per-tilt positions), then
@@ -344,7 +352,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             device=self._scan_center_px.device,
         )
 
-    def _set_patch_indices(self, obj_padding_px: np.ndarray | tuple) -> None:
+    def _set_patch_indices(self, obj_padding_px: np.ndarray | tuple[int, ...]) -> None:
         """No-op: only implicit (coordinate-queried) object models are supported."""
         return
 
@@ -365,7 +373,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def forward(  # pyright: ignore[reportIncompatibleMethodOverride] -- intentional payload seam
         self,
         batch_indices: np.ndarray | torch.Tensor,
-        obj_padding_px: np.ndarray | tuple,
+        obj_padding_px: np.ndarray | tuple[int, ...],
     ) -> tuple[PtychoTomoPatchData, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Build the rotation-carrying object-query payload for a mixed-tilt batch.
 
@@ -415,12 +423,36 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         cols_A = (cols - center[1]) * float(samp[1])
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
+    def _ensure_pose_init_buffers(self) -> None:
+        """Create the pose-baseline buffers when absent (objects deserialized from saves/caches
+        that predate them bypass ``__init__``)."""
+        if "_pose_z1_init" not in self._buffers:
+            self.register_buffer("_pose_z1_init", torch.zeros_like(self._pose_z1.data))
+        if "_pose_z3_init" not in self._buffers:
+            self.register_buffer("_pose_z3_init", torch.zeros_like(self._pose_z3.data))
+
+    def set_tilt_axis_pose(self, z1_deg: float, z3_deg: float) -> None:
+        """Fix the series-wide tilt-axis convention via constant z1/z3 Euler offsets.
+
+        ``rot_beam_to_spec(z1, tilt, z3)`` with constant ``z1=-90, z3=+90`` rotates about the
+        specimen y axis instead of x — matching tilt series simulated with ASE ``atoms.rotate``
+        (the AuNP datasets). The values survive ``reset()`` (they define the dataset geometry,
+        not a learned correction).
+        """
+        self._ensure_pose_init_buffers()
+        with torch.no_grad():
+            self._pose_z1_init.fill_(float(z1_deg))
+            self._pose_z3_init.fill_(float(z3_deg))
+            self._pose_z1.copy_(self._pose_z1_init)
+            self._pose_z3.copy_(self._pose_z3_init)
+
     def reset(self) -> None:
         super().reset()
+        self._ensure_pose_init_buffers()
         with torch.no_grad():
-            self._pose_z1.zero_()
+            self._pose_z1.copy_(self._pose_z1_init)
             self._pose_dtheta.zero_()
-            self._pose_z3.zero_()
+            self._pose_z3.copy_(self._pose_z3_init)
             self._pose_shifts.zero_()
 
 

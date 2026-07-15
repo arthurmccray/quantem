@@ -189,7 +189,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
         # cast: dset is validated as a PtychoTomoDatasetRaster in from_models (it is a
         # sibling of the single-scan raster class, so isinstance narrowing can't apply)
-        dset_t = cast(PtychoTomoDatasetRaster, self.dset)
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         if not self.dset.preprocessed:
             self.vprint("Dataset was not preprocessed, proceeding with defaults.")
             dset_t.preprocess(
@@ -208,7 +208,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
                 device=self._single_device,
             )
 
-        obj = cast(ObjectPtychoTomoBase, self.obj_model)
+        obj = cast(ObjectPtychoTomoBase, self.obj_model)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         samp = np.asarray(self.dset.obj_sampling, dtype=float)  # (y, x), Å/px
         s = float(np.mean(samp))
 
@@ -308,7 +308,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         ptycho-tomography object model is coordinate-queried, so its soft constraints never
         require the materialized volume (which would force a full-grid query each batch).
         """
-        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         total_loss = torch.tensor(0, device=self._single_device, dtype=self._dtype_real)
         total_loss = total_loss + obj_model.apply_soft_constraints(mask=obj_model.mask)
         total_loss = total_loss + self.probe_model.apply_soft_constraints(self.probe_model.probe)
@@ -324,14 +324,14 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         dense voxel grid, but never forced onto the GPU. ``get_snapshot_by_iter`` re-materializes
         the volume on demand. The probe is shared across tilts and is not snapshotted.
         """
-        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         state = {k: v.detach().cpu().clone() for k, v in obj_model.model.state_dict().items()}
         # snapshots carry an object state_dict rather than the base (obj, probe) arrays
-        self._snapshots.append({"iteration": self.num_iters, "state_dict": state})  # type: ignore[typeddict-item]
+        self._snapshots.append({"iteration": self.num_iters, "state_dict": state})  # pyright: ignore[reportArgumentType] -- tomo snapshot payload; the Snapshot TypedDict lives in diffractive_imaging
 
     def get_snapshot_by_iter(  # pyright: ignore[reportIncompatibleMethodOverride] -- volume snapshot
         self, iteration: int, closest: bool = False, cropped: bool = True
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Materialize the object volume checkpointed at a stored iteration.
 
         Snapshots hold only the backend ``state_dict``; this temporarily loads it into the live
@@ -355,12 +355,12 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             raise ValueError(
                 f"No snapshot at iteration {iteration}; set closest=True for the nearest stored."
             )
-        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)
+        obj_model = cast(ObjectPtychoTomoBase, self.obj_model)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         model = obj_model.model
         saved = deepcopy(model.state_dict())
         try:
             model.load_state_dict(
-                {k: v.to(obj_model.device) for k, v in snp["state_dict"].items()}  # type: ignore[typeddict-item]
+                {k: v.to(obj_model.device) for k, v in snp["state_dict"].items()}  # pyright: ignore[reportGeneralTypeIssues] -- tomo snapshot key; the Snapshot TypedDict lives in diffractive_imaging
             )
             obj_model._invalidate_obj_cache()
             vol = self.volume_cropped if cropped else self.volume

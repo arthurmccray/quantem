@@ -5,9 +5,12 @@ forward (physical-Å rotation, per-axis normalization, slab centers, box masking
 references, independent of any data files.
 """
 
+from typing import cast
+
 import pytest
 import torch
 
+from quantem.diffractive_imaging.object_models import object_type
 from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, rot_beam_to_spec
 from quantem.ptycho_tomography.object_models import ObjectVoxelTomo, VoxelGrid
 
@@ -23,7 +26,7 @@ def make_initialized_voxel_obj(
     num_slices: int = 4,
     lateral_full: int = 17,
     sampling: float = 0.5,
-    obj_type: str = "potential",
+    obj_type: object_type = "potential",
 ) -> ObjectVoxelTomo:
     """Build an ObjectVoxelTomo and run the preprocess-time geometry handshake manually."""
     if volume is not None:
@@ -382,7 +385,7 @@ class TestHardPositivity:
             volume=vol, volume_shape=(5, 7, 7), obj_type="pure_phase"
         )
         obj2.project_parameters()
-        assert (torch.as_tensor(obj2._model.volume.detach()) < 0).any()
+        assert (torch.as_tensor(cast(torch.Tensor, obj2._model.volume).detach()) < 0).any()
 
     def test_shrink_quantile_pins_vacuum_planes(self):
         vol = torch.zeros(6, 10, 10)
