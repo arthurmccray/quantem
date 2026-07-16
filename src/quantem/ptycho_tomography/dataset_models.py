@@ -46,6 +46,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _tilt_offsets: torch.Tensor
     _tilt_angles_deg: torch.Tensor
     _scan_center_px: torch.Tensor
+    _rot_axis_offset_A: torch.Tensor
     _pose_z1_init: torch.Tensor
     _pose_z3_init: torch.Tensor
     _pose_z1: nn.Parameter
@@ -421,7 +422,37 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         samp = self.obj_sampling
         rows_A = (rows - center[0]) * float(samp[0])
         cols_A = (cols - center[1]) * float(samp[1])
+        self._ensure_rot_offset_buffer()
+        off = self._rot_axis_offset_A
+        if bool((off != 0).any()):
+            rows_A = rows_A - off[0]
+            cols_A = cols_A - off[1]
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
+
+    def _ensure_rot_offset_buffer(self) -> None:
+        """Create the rotation-axis offset buffer when absent (cache-loaded objects bypass
+        ``__init__``)."""
+        if "_rot_axis_offset_A" not in self._buffers:
+            real_dtype = getattr(torch, config.get("dtype_real"))
+            self.register_buffer(
+                "_rot_axis_offset_A", torch.zeros(2, dtype=real_dtype, device=self.device)
+            )
+
+    def set_rotation_center_offset_A(self, drow_A: float, dcol_A: float) -> None:
+        """TEMPORARY (2026-07-15) — REMOVE once proper pose optimization lands.
+
+        Shift the beam-frame coordinate origin (== the tilt-axis position) by a known offset in
+        Å from the scan-grid center. Needed because abTEM ``GridScan`` construction leaves the
+        scan-pattern center short of the simulation cell center (the true rotation center) by up
+        to half a scan step per axis — a rotation-center error that produces arc/"banana" atom
+        artifacts growing with scan step (measured: 0.30/0.49/0.75/0.99 Å at 0.6/1.0/1.5/2.0 Å
+        steps). Pass the (row, col) offset FROM the scan center TO the true rotation center.
+        Survives ``reset()`` (dataset geometry, not a learned correction).
+        """
+        self._ensure_rot_offset_buffer()
+        with torch.no_grad():
+            self._rot_axis_offset_A[0] = float(drow_A)
+            self._rot_axis_offset_A[1] = float(dcol_A)
 
     def _ensure_pose_init_buffers(self) -> None:
         """Create the pose-baseline buffers when absent (objects deserialized from saves/caches
