@@ -425,5 +425,116 @@ class TestSnapshotsAndPadding:
         )
 
 
+class TestSlabWindow:
+    """Per-scan-position slab-window mode (2026-07-16, plan-view campaign).
+
+    The slab stack is decoupled from the box thickness (``set_slab_extent_A``) and displaced
+    per scan position onto the tilted specimen slab (``set_slab_window``); the probe is
+    Fresnel pre-propagated by the same offset. Classic mode with a stack long enough to cover
+    everything is the physics reference — windowed forwards must reproduce it.
+    """
+
+    WIN_EXTENT_A = 36.0  # covers box/cos(30°) + 2·tan(30°)·r_patch ≈ 32.4 Å at ±30°
+    WIN_SLICES = 18  # dz = 2 Å, same as the classic 12 Å / 6-slice default
+
+    def _make_pt(self, arrays, window: bool) -> PtychoTomography:
+        wrapper = _make_wrapper(arrays)
+        obj = ObjectVoxelTomo.from_uniform(
+            thickness_A=THICKNESS_A, num_slices=self.WIN_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
+        )
+        obj.set_slab_extent_A(self.WIN_EXTENT_A)
+        pt = PtychoTomography.from_models(
+            dset=wrapper,
+            obj_model=obj,
+            probe_model=_make_probe(),
+            detector_model=DetectorPixelated(),
+            rng=0,
+            verbose=False,
+        )
+        pt.preprocess(obj_padding_px=(PAD, PAD))
+        if window:
+            wrapper.set_slab_window(True)
+        return pt
+
+    def test_window_dz_matches_pure_tilt_formula(self, inverse_crime_setup):
+        arrays, _gt = inverse_crime_setup
+        pt = self._make_pt(arrays, window=True)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        idx = torch.arange(dset.num_gpts)
+        payload, _pos, _frac, _descan = dset.forward(idx, pt.obj_padding_px)
+        dz = payload.window_dz_A
+        assert dz is not None and dz.shape == (dset.num_gpts,)
+        # expected: window center on the specimen mid-plane => dz = -tan(tilt) * y_scan_A
+        center = dset._scan_center_px
+        samp = dset.obj_sampling
+        y_c = (dset.scan_positions_px[idx, 0] - center[0]) * float(samp[0])
+        tilts = dset._tilt_angles_deg[dset.tilt_index_of(idx)]
+        expected = -torch.tan(torch.deg2rad(tilts)) * y_c
+        assert torch.allclose(dz, expected.to(dz.dtype), atol=1e-5)
+        # the transient probe stash was set by forward and matches the payload
+        assert dset._last_window_dz_A is dz
+
+    def test_pre_propagate_probes_roundtrip_and_slab_consistency(self, inverse_crime_setup):
+        arrays, _gt = inverse_crime_setup
+        pt = self._make_pt(arrays, window=False)
+        probes = pt.probe_model.forward(torch.zeros(3, 2))  # (P, 3, H, W)
+        dz = torch.tensor([-4.0, 0.0, 4.0])
+        out = pt._pre_propagate_probes(probes, dz)
+        # dz = 0 is exactly the identity
+        assert torch.allclose(out[:, 1], probes[:, 1], atol=1e-6)
+        # propagating by +dz then -dz is the identity (unitary Fresnel factor)
+        back = pt._pre_propagate_probes(out, -dz)
+        assert torch.allclose(back, probes, atol=1e-5)
+        # propagating by one slab thickness == the multislice inter-slice propagator
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        t_slab = obj.slab_thickness_A
+        stepped = pt._pre_propagate_probes(probes, torch.full((3,), t_slab))
+        via_propagator = pt._propagate_array(probes, pt._propagators[0])
+        assert torch.allclose(stepped, via_propagator, atol=1e-5)
+
+    def test_windowed_forward_matches_classic_reference(self, inverse_crime_setup):
+        """4a ≡ 4b: same object/probe/extent, window offsets on vs off, tilts 0 and ±30°.
+
+        The 36 Å stack covers all material both ways at these tilts, so the windowed forward
+        must reproduce the classic one up to quadrature/interpolation differences from the
+        (continuously) shifted sample z's. At 0° the offsets vary only with scan row
+        (tan(0) = 0 -> dz = 0 exactly), so the match is exact there.
+        """
+        arrays, gt = inverse_crime_setup
+        pt_a = self._make_pt(arrays, window=False)
+        pt_b = self._make_pt(arrays, window=True)
+        for pt in (pt_a, pt_b):
+            obj = pt.obj_model
+            assert isinstance(obj, ObjectVoxelTomo)
+            obj.set_volume(gt)
+        preds_a = _forward_all(pt_a)
+        preds_b = _forward_all(pt_b)
+        n_scan = int(np.prod(SCAN_GPTS))
+        for t_i, tilt in enumerate(TILTS):
+            if abs(tilt) > 31.0:
+                continue  # 36 Å window does not cover the patch corners beyond ±30°
+            a = preds_a[t_i * n_scan : (t_i + 1) * n_scan]
+            b = preds_b[t_i * n_scan : (t_i + 1) * n_scan]
+            rel = float((a - b).norm() / a.norm())
+            if tilt == 0.0:
+                assert rel < 1e-5, f"tilt 0 must match exactly, rel={rel:.2e}"
+            else:
+                assert rel < 0.05, f"tilt {tilt}: windowed forward diverges, rel={rel:.2e}"
+
+    def test_slab_extent_updates_slice_thicknesses_and_coverage_warns(self, inverse_crime_setup):
+        arrays, _gt = inverse_crime_setup
+        pt = self._make_pt(arrays, window=True)
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        assert obj.slab_thickness_A == pytest.approx(self.WIN_EXTENT_A / self.WIN_SLICES)
+        # shrink the stack below box/cos(60°) + patch spread -> the coverage check must warn
+        obj.set_slab_extent_A(10.0)
+        pt.compute_propagator_arrays()
+        with pytest.warns(UserWarning, match="slab-window"):
+            pt._check_slab_coverage()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

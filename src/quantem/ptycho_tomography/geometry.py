@@ -125,9 +125,18 @@ class PtychoTomoPatchData:
     shifts_A:
         Optional ``(B, 2)`` beam-frame alignment shifts in Å, subtracted before rotation
         (per-tilt pose refinement; unused/None in v1).
+    window_dz_A:
+        Optional ``(B,)`` per-batch-element slab-window offset along the beam in Å (plan-view
+        slab-window mode, 2026-07-16): the multislice slab stack for element ``b`` is displaced
+        by ``window_dz_A[b]`` along the beam so it tracks the tilted specimen slab at that scan
+        position instead of spanning the whole rotated extent. The object model adds it to the
+        beam-frame z of every quadrature point; the reconstruction loop must pre-propagate the
+        probe by the same distance (Fresnel factor) so the physics stays consistent. None =
+        classic fixed stack.
     """
 
     coords_yx_A: torch.Tensor
     rotations: torch.Tensor
     tilt_indices: torch.Tensor
     shifts_A: torch.Tensor | None = None
+    window_dz_A: torch.Tensor | None = None

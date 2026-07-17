@@ -43,6 +43,10 @@ from quantem.ptycho_tomography.ptycho_tomography_visualizations import (
 class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     """Joint multislice-ptychography + tomography reconstruction of one 3D object."""
 
+    # cached (key, ROI k² grid) for the slab-window probe pre-propagation (built lazily per
+    # (roi_shape, sampling); plain attr, not module state)
+    _window_k2_cache: "tuple[tuple[int, int, float, float], torch.Tensor] | None" = None
+
     @classmethod
     def from_models(  # pyright: ignore[reportIncompatibleMethodOverride] -- narrowed model types
         cls,
@@ -280,24 +284,96 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     def _check_slab_coverage(self) -> None:
         """Warn if the beam-frame multislice slab cannot cover the rotated object support.
 
-        The slab spans the padded box along the beam; an isolated object whose support fits in a
-        ball of diameter <= box_thickness_A is covered at every tilt. We can't know the true
-        support, so warn only on the clear inconsistency ``slab extent < box thickness`` (always
-        wrong) and leave wide/planar-sample coverage (lateral extent >> thickness) to the user.
+        Classic mode: the slab spans the padded box along the beam; warn on the clear
+        inconsistency ``slab extent < box thickness`` (always wrong). Slab-window mode
+        (2026-07-16): each scan position gets its own window centered on the specimen mid-plane,
+        so the necessary extent is the box thickness seen along the tilted beam plus the patch's
+        z-spread: ``box_thickness/cos(θmax) + 2·tan(θmax)·r_patch`` — warn below that. Coverage
+        failures are otherwise SILENT (out-of-support quadrature points contribute zero), so
+        this check is the only runtime guard.
         """
         obj = self.obj_model
         if not isinstance(obj, ObjectPtychoTomoBase):  # pragma: no cover - guarded by from_models
             return
-        slab = obj.slab_thickness_A * obj.num_slices
-        if slab < obj.box_thickness_A * (1 - 1e-6):
-            from warnings import warn
+        from warnings import warn
 
+        slab = obj.slab_thickness_A * obj.num_slices
+        dset = self.dset
+        if isinstance(dset, PtychoTomoDatasetRaster) and dset.slab_window:
+            theta = float(torch.deg2rad(dset._tilt_angles_deg.abs().max()))
+            c, t = float(np.cos(theta)), float(np.tan(theta))
+            samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]  # lateral (y, x)
+            r_patch = float(np.max(np.asarray(self.roi_shape) * samp)) / 2.0
+            required = obj.box_thickness_A / max(c, 1e-3) + 2.0 * t * r_patch
+            if slab < required * (1 - 1e-6):
+                warn(
+                    f"slab-window mode: slab extent ({slab:.1f} Å) < box/cos(θmax) + "
+                    f"2·tan(θmax)·r_patch ({required:.1f} Å at θmax = {np.rad2deg(theta):.0f}°); "
+                    "material at the patch edges will be silently cropped along the beam.",
+                    stacklevel=2,
+                )
+        elif slab < obj.box_thickness_A * (1 - 1e-6):
             warn(
                 f"multislice slab extent ({slab:.2f} Å) is smaller than the object box thickness "
                 f"({obj.box_thickness_A:.2f} Å); the rotated object will be cropped along the "
                 "beam.",
                 stacklevel=2,
             )
+
+    def compute_propagator_arrays(self):
+        """Base propagators, but with the LATERAL (y, x) sampling explicitly.
+
+        ``self.sampling`` is a (z, y, x) triple for the 3D object; the base call passes it
+        straight into a 2-element zip against ``roi_shape``, silently building the row k-grid
+        with the z-voxel spacing (off from the lateral pixel by <0.1% after the point-grid
+        snapping). Harmless in practice but wrong semantics — and the slab-window probe
+        pre-propagation must share the exact k-grid with the inter-slice propagators.
+        """
+        samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]
+        self.propagators = self.probe_model._compute_propagator_arrays(
+            (float(samp[0]), float(samp[1])), self.num_slices, self.slice_thicknesses
+        )
+
+    def forward_operator(
+        self,
+        obj_patches: torch.Tensor,
+        shifted_input_probes: torch.Tensor,
+        descan: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Base forward operator plus the slab-window probe pre-propagation (2026-07-16).
+
+        In slab-window mode the dataset stashes the per-batch window offset ``dz`` (Å along the
+        beam) during ``dset.forward``; the physical probe is fixed in the lab, so the probe
+        entering a window displaced by ``dz`` is the probe Fresnel-propagated by ``dz`` — the
+        same ``exp(-iπ λ dz k²)`` factor as the inter-slice propagators, per batch element.
+        The stash is consumed exactly once per batch step (train and validation both rebuild it
+        via ``dset.forward``); nothing changes when the mode is off.
+        """
+        dz = getattr(self.dset, "_last_window_dz_A", None)
+        if dz is not None:
+            # consume-once: no staleness, clean serialization
+            cast(PtychoTomoDatasetRaster, self.dset)._last_window_dz_A = None  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+            shifted_input_probes = self._pre_propagate_probes(shifted_input_probes, dz)
+        return super().forward_operator(obj_patches, shifted_input_probes, descan)
+
+    def _pre_propagate_probes(self, probes: torch.Tensor, dz_A: torch.Tensor) -> torch.Tensor:
+        """Fresnel-propagate probes ``(P, B, H, W)`` by per-batch ``dz_A`` (B,) in Å."""
+        from quantem.core.utils.utils import electron_wavelength_angstrom
+
+        h, w = int(self.roi_shape[0]), int(self.roi_shape[1])
+        samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]  # lateral (y, x)
+        key = (h, w, float(samp[0]), float(samp[1]))
+        cache = self._window_k2_cache
+        if cache is None or cache[0] != key:
+            kr = torch.fft.fftfreq(h, d=float(samp[0]), device=probes.device)
+            kc = torch.fft.fftfreq(w, d=float(samp[1]), device=probes.device)
+            k2 = (kr[:, None] ** 2 + kc[None, :] ** 2).to(self._dtype_real)
+            cache = (key, k2)
+            self._window_k2_cache = cache
+        lam = float(electron_wavelength_angstrom(self.probe_model.probe_params["energy"]))
+        dz = dz_A.to(device=probes.device, dtype=self._dtype_real)
+        phase = torch.exp(-1.0j * torch.pi * lam * dz.view(1, -1, 1, 1) * cache[1][None, None])
+        return torch.fft.ifft2(torch.fft.fft2(probes) * phase)
 
     # endregion --- preprocessing ---
 

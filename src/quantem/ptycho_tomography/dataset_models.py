@@ -45,6 +45,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     # registered buffer / parameter types (mirrors the base's _patch_indices declaration)
     _tilt_offsets: torch.Tensor
     _tilt_angles_deg: torch.Tensor
+    _slab_window_flag: torch.Tensor
+    # transient per-batch stash (slab-window mode): consumed once by
+    # PtychoTomography.forward_operator, never serialized non-None
+    _last_window_dz_A: torch.Tensor | None = None
     _scan_center_px: torch.Tensor
     _rot_axis_offset_A: torch.Tensor
     _pose_z1_init: torch.Tensor
@@ -395,10 +399,62 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         coords_A = self._scan_coords_A(bidx)
         tilt_idx = self.tilt_index_of(bidx)
         rotations = self.rotations()[tilt_idx]
+        window_dz = self._window_dz_A(bidx, rotations) if self.slab_window else None
+        # transient per-batch stash for the reconstruction loop's probe pre-propagation
+        # (PtychoTomography.forward_operator consumes it exactly once and clears it)
+        self._last_window_dz_A = window_dz
         payload = PtychoTomoPatchData(
-            coords_yx_A=coords_A, rotations=rotations, tilt_indices=tilt_idx
+            coords_yx_A=coords_A,
+            rotations=rotations,
+            tilt_indices=tilt_idx,
+            window_dz_A=window_dz,
         )
         return payload, positions_px, torch.zeros_like(positions_px), None
+
+    @property
+    def slab_window(self) -> bool:
+        """Slab-window mode flag (plan-view, 2026-07-16): per-scan-position slab-stack offsets.
+
+        Opt-in via :meth:`set_slab_window`; must be paired with the object model's
+        ``set_slab_extent_A`` and the reconstruction loop's probe pre-propagation.
+        """
+        buf = self._buffers.get("_slab_window_flag")
+        return bool(buf.item()) if buf is not None else False
+
+    def set_slab_window(self, enabled: bool) -> None:
+        """Enable/disable per-scan-position slab-window offsets (survives ``reset()``)."""
+        if "_slab_window_flag" not in self._buffers:
+            self.register_buffer(
+                "_slab_window_flag", torch.zeros((), dtype=torch.bool, device=self.device)
+            )
+        with torch.no_grad():
+            self._slab_window_flag.fill_(bool(enabled))
+
+    def _window_dz_A(self, batch_indices: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
+        """Per-batch slab-window offset along the beam, ``(B,)`` in Å.
+
+        Places the window center on the specimen mid-plane (``z_spec = 0``) at each scan
+        position: with beam→specimen rotation ``r``, the beam-frame z of that plane under the
+        beam center ``(y_c, x_c)`` solves ``r00·z + r01·y_c + r02·x_c = 0``. Convention-free
+        (no tilt-sign special case) and exact for any pose; requires ``|r00| = |cos(tilt)|``
+        bounded away from 0 (asserts tilt < ~84°).
+        """
+        center = self._scan_center_px
+        samp = self.obj_sampling
+        positions = self.scan_positions_px[batch_indices]  # (B, 2) un-rounded px
+        y_c = (positions[:, 0] - center[0]) * float(samp[0])
+        x_c = (positions[:, 1] - center[1]) * float(samp[1])
+        self._ensure_rot_offset_buffer()
+        off = self._rot_axis_offset_A
+        if bool((off != 0).any()):
+            y_c = y_c - off[0]
+            x_c = x_c - off[1]
+        r = rotations.to(device=y_c.device, dtype=y_c.dtype)
+        r00 = r[:, 0, 0]
+        assert bool((r00.abs() > 0.1).all()), (
+            "slab-window mode needs |cos(tilt)| > 0.1 (tilt < ~84°); got a near-grazing pose"
+        )
+        return -(r[:, 0, 1] * y_c + r[:, 0, 2] * x_c) / r00
 
     def _scan_coords_A(self, batch_indices: torch.Tensor) -> torch.Tensor:
         """Physical beam-frame ``(row, col)`` patch coordinates in Å, ``(B, Hroi, Wroi, 2)``.

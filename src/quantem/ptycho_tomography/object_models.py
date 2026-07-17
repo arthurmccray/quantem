@@ -268,7 +268,13 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         self._lateral_box_A: tuple[float, float] | None = None
         self._box_margin_A: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._geometry_set: bool = False
-        self.slice_thicknesses = self.box_thickness_A / num_slices if num_slices > 1 else None
+        # Slab-window mode (2026-07-16, plan-view): when set, the multislice slab stack spans
+        # ``_slab_extent_A`` along the beam instead of the (specimen-frame) padded box thickness
+        # — the stack is then positioned per scan position via ``PtychoTomoPatchData.window_dz_A``
+        # and out-of-support quadrature points are trimmed by the existing in-box mask. None =
+        # classic behavior (stack ≡ padded box thickness).
+        self._slab_extent_A: float | None = None
+        self.slice_thicknesses = self.slab_extent_A / num_slices if num_slices > 1 else None
         self._set_pretrained_weights(self._model)
         self._num_z_voxels = int(num_z_voxels) if num_z_voxels is not None else None
 
@@ -405,7 +411,7 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         self._box_margin_A = (mz, n_my * s, n_mx * s)
         self.sampling = (s, s)
         if self.num_slices > 1:
-            self.slice_thicknesses = self.box_thickness_A / self.num_slices
+            self.slice_thicknesses = self.slab_extent_A / self.num_slices
         h_pts, w_pts = n_by + 2 * n_my + 1, n_bx + 2 * n_mx + 1
         self._obj_shape = (self.num_slices, h_pts, w_pts)
         if self._volume_shape_explicit:
@@ -451,7 +457,7 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             raise ValueError(f"z padding must be >= 0, got {pad_A}")
         self._box_margin_A = (pad_A, self._box_margin_A[1], self._box_margin_A[2])
         if self.num_slices > 1:
-            self.slice_thicknesses = self.box_thickness_A / self.num_slices
+            self.slice_thicknesses = self.slab_extent_A / self.num_slices
         self._invalidate_obj_cache()
 
     @property
@@ -476,15 +482,45 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         return self.box_thickness_A / max(d - 1, 1)
 
     @property
+    def slab_extent_A(self) -> float:
+        """Total beam-frame extent of the multislice slab stack, Å.
+
+        Defaults to the padded box thickness (classic mode: the stack spans the support box for
+        every tilt). :meth:`set_slab_extent_A` decouples it for the plan-view slab-window mode,
+        where the stack is shorter than the rotated support extent and is positioned per scan
+        position by ``PtychoTomoPatchData.window_dz_A``.
+        """
+        extent = getattr(self, "_slab_extent_A", None)  # deserialized pre-2026-07-16 objects
+        return float(extent) if extent is not None else self.box_thickness_A
+
+    def set_slab_extent_A(self, extent_A: float | None) -> None:
+        """Set (or clear, with None) the slab-stack extent, decoupled from the box thickness.
+
+        Slab-window mode: choose ``extent_A >= box_thickness/cos(θ_max) + 2·tan(θ_max)·r_patch``
+        so every material crossing within a patch fits the per-position window (the coverage is
+        NOT checked at runtime — out-of-window material silently contributes nothing).
+        Must be paired with ``PtychoTomoDatasetRaster.set_slab_window(True)``; updates
+        ``slice_thicknesses`` (and thus the propagators built at preprocess time).
+        """
+        if extent_A is not None:
+            extent_A = float(extent_A)
+            if extent_A <= 0:
+                raise ValueError(f"slab extent must be > 0 Å, got {extent_A}")
+        self._slab_extent_A = extent_A
+        if self.num_slices > 1:
+            self.slice_thicknesses = self.slab_extent_A / self.num_slices
+        self._invalidate_obj_cache()
+
+    @property
     def slab_thickness_A(self) -> float:
-        """Thickness of each multislice slab (uniform), Å. Slabs span the padded box."""
-        return self.box_thickness_A / self.num_slices
+        """Thickness of each multislice slab (uniform), Å. Slabs span ``slab_extent_A``."""
+        return self.slab_extent_A / self.num_slices
 
     @property
     def _slab_z_centers_t(self) -> torch.Tensor:
         real_dtype = getattr(torch, config.get("dtype_real"))
         return slab_z_centers(
-            self.num_slices, self.box_thickness_A, device=self.device, dtype=real_dtype
+            self.num_slices, self.slab_extent_A, device=self.device, dtype=real_dtype
         )
 
     @property
@@ -656,6 +692,17 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         lat_z = rzy * y_b + rzx * x_b  # (B, H, W)
         lat_y = ryy * y_b + ryx * x_b
         lat_x = rxy * y_b + rxx * x_b
+
+        # slab-window mode (2026-07-16): displace each batch element's slab stack along the
+        # beam by window_dz_A[b] — equivalent to adding dz to every quadrature z, folded into
+        # the z-independent lateral terms so the chunked query below is untouched. The paired
+        # probe pre-propagation lives in the reconstruction loop.
+        window_dz = getattr(patch_data, "window_dz_A", None)
+        if window_dz is not None:
+            dz = window_dz.to(device=coords.device, dtype=coords.dtype).view(-1, 1, 1)
+            lat_z = lat_z + rzz * dz
+            lat_y = lat_y + ryz * dz
+            lat_x = lat_x + rxz * dz
 
         # Batch the (slice, z_off) backend queries and query only the in-box samples. The S*K
         # slab-quadrature sample sets are flattened into one (S*K,) z-axis and processed in chunks
