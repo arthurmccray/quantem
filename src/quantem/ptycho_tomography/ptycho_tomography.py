@@ -364,7 +364,8 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]  # lateral (y, x)
         key = (h, w, float(samp[0]), float(samp[1]))
         cache = self._window_k2_cache
-        if cache is None or cache[0] != key:
+        # device check: a deserialized cache comes back on CPU (plain attr, not moved by .to())
+        if cache is None or cache[0] != key or cache[1].device != probes.device:
             kr = torch.fft.fftfreq(h, d=float(samp[0]), device=probes.device)
             kc = torch.fft.fftfreq(w, d=float(samp[1]), device=probes.device)
             k2 = (kr[:, None] ** 2 + kc[None, :] ** 2).to(self._dtype_real)
