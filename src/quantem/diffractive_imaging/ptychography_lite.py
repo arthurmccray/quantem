@@ -4,7 +4,6 @@ from typing import Any, Callable, Literal, Self, Sequence
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from quantem.core import config
 from quantem.core.datastructures import Dataset4dstem
@@ -15,6 +14,15 @@ from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectDIP, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbeDIP, ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
+
+
+def _scheduler_spec(scheduler_type: str, scheduler_factor: float) -> dict[str, Any]:
+    scheduler_dict: dict[str, Any] = {
+        "name": "exponential" if scheduler_type == "exp" else scheduler_type
+    }
+    if scheduler_type in ("exp", "plateau"):
+        scheduler_dict["factor"] = scheduler_factor
+    return scheduler_dict
 
 
 class PtychoLite(Ptychography):
@@ -71,13 +79,13 @@ class PtychoLite(Ptychography):
             Object parameterization.
         num_probes : int
             Number of probe components (mixed state when >1).
-        energy, defocus, semiangle_cutoff, rolloff, polar_parameters
+        energy, defocus, semiangle_cutoff, polar_parameters
             Probe settings passed to ProbePixelated.
         vacuum_probe_intensity : np.ndarray | Dataset4dstem | None
             Optional corner-centered vacuum probe intensity for scaling/centering.
         initial_probe_weights : list[float] | np.ndarray | None
             Optional initial component weights (length=num_probes).
-        log_dir, log_prefix, log_suffix, log_images_every, log_probe_images, device, verbose, rng
+        log_dir, log_prefix, log_images_every, log_probe_images, device, verbose, rng
             Standard Ptychography configuration.
         """
 
@@ -205,6 +213,7 @@ class PtychoLite(Ptychography):
         opt_params: dict[str, Any] | None
         scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -212,29 +221,20 @@ class PtychoLite(Ptychography):
                 },
             }
             scheduler_params = {
-                "object": {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                "object": dict(scheduler_dict),
             }
             if learn_probe:
                 opt_params["probe"] = {
                     "name": "adamw",
                     "lr": lr_probe,
                 }
-                scheduler_params["probe"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                scheduler_params["probe"] = dict(scheduler_dict)
             if needs_dataset_optimizer:
                 opt_params["dataset"] = {
                     "name": "adamw",
                     "lr": lr_scan_positions,
                 }
-                scheduler_params["dataset"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                scheduler_params["dataset"] = dict(scheduler_dict)
         else:
             opt_params = None
             scheduler_params = None
@@ -290,8 +290,8 @@ class PtychoLiteDIP(Ptychography):
     """
     High-level convenience wrapper around Ptychography.
 
-    Provides a from_dataset() constructor that builds pixelated object and probe
-    models from simple flags, then initializes a full Ptychography instance.
+    Provides a from_ptycholite() constructor that builds DIP object and probe
+    models from an existing PtychoLite, then initializes a full Ptychography instance.
     """
 
     @classmethod
@@ -307,7 +307,7 @@ class PtychoLiteDIP(Ptychography):
         normalize_object_plotting: bool = True,
         # model settings
         cnn_num_layers: int = 3,
-        final_activation: "str | Callable[..., Any]" = nn.Identity(),
+        final_activation: "str | Callable[..., Any]" = "identity",
         # logging/device
         log_dir: os.PathLike[str] | str | None = None,
         log_prefix: str = "",
@@ -387,7 +387,7 @@ class PtychoLiteDIP(Ptychography):
             logger = LoggerPtychography(
                 log_dir=log_dir,
                 run_prefix=log_prefix,
-                run_suffix="pix",
+                run_suffix="dip",
                 log_images_every=log_images_every,
                 log_probe_images=log_probe_images,
             )
@@ -404,7 +404,7 @@ class PtychoLiteDIP(Ptychography):
             detector_model=ptycholite.detector_model,
             logger=logger if logger is not None else ptycholite.logger,
             device=device,
-            verbose=ptycholite.verbose,
+            verbose=verbose,
             rng=ptycholite.rng,
         )
 
@@ -452,6 +452,7 @@ class PtychoLiteDIP(Ptychography):
         opt_params: dict[str, Any] | None
         scheduler_params: dict[str, Any] | None
         if setup_new_optimizers or (needs_dataset_optimizer and "dataset" not in self.optimizers):
+            scheduler_dict = _scheduler_spec(scheduler_type, scheduler_factor)
             opt_params = {
                 "object": {
                     "name": "adamw",
@@ -459,29 +460,20 @@ class PtychoLiteDIP(Ptychography):
                 },
             }
             scheduler_params = {
-                "object": {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                "object": dict(scheduler_dict),
             }
             if learn_probe:
                 opt_params["probe"] = {
                     "name": "adamw",
                     "lr": lr_probe,
                 }
-                scheduler_params["probe"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                scheduler_params["probe"] = dict(scheduler_dict)
             if needs_dataset_optimizer:
                 opt_params["dataset"] = {
                     "name": "adamw",
                     "lr": lr_scan_positions,
                 }
-                scheduler_params["dataset"] = {
-                    "name": scheduler_type,
-                    "factor": scheduler_factor,
-                }
+                scheduler_params["dataset"] = dict(scheduler_dict)
         else:
             opt_params = None
             scheduler_params = None

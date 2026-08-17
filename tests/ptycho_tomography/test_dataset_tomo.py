@@ -116,7 +116,7 @@ class TestPreprocess:
         w = _build_wrapper(free=True)
         for ds in w.tilt_datasets:
             assert ds._intensities_4d.size == 0
-            assert ds._amplitudes.numel() == 0
+            assert ds._amplitudes is None
             assert ds._patch_indices.numel() == 0
         # wrapper storage unaffected
         assert w.amplitudes.numel() == w.num_gpts * ROI * ROI
@@ -126,7 +126,8 @@ class TestPreprocess:
     def test_keep_per_tilt_arrays(self):
         w = _build_wrapper(free=False)
         for ds in w.tilt_datasets:
-            assert ds._amplitudes.numel() > 0
+            # amplitudes are lazy upstream; centered_amplitudes is the resident array
+            assert ds._centered_amplitudes.numel() > 0
 
     def test_scan_positions_concatenated_per_tilt(self):
         w = _build_wrapper()

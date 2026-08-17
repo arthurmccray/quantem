@@ -212,8 +212,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.reset_optimizer()
         self.dset.reset_optimizer()
 
-    def _record_iter(self, iter_loss: float) -> None:
+    def _record_iter(self, iter_loss: float, autograd: bool) -> None:
         self._iter_losses.append(iter_loss)
+        self._iter_recon_types.append("AD" if autograd else "GD")
         optimizers = self.optimizers
         all_keys = set(self._iter_lrs.keys()) | set(optimizers.keys())
         for key in all_keys:
@@ -318,10 +319,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             device if isinstance(device, list) else getattr(self, "_multi_gpu_devices", None)
         )
 
+        if (isinstance(devices_to_use, list) or is_distributed_launch()) and not autograd:
+            raise ValueError("Multi-GPU reconstruction requires autograd=True.")
+
         # Route to multi-GPU path
         if isinstance(devices_to_use, list) and not is_distributed_launch():
-            if not autograd:
-                raise ValueError("Multi-GPU reconstruction requires autograd=True.")
             return self._spawn_reconstruct(
                 devices=devices_to_use,
                 num_iters=num_iters,
@@ -420,6 +422,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.set_schedulers(self.scheduler_params, num_iter=num_iters)
 
         self.criterion = loss_type  # resolve name/instance -> DataCriterion
+        if not autograd and self._criterion.target_space != "amplitude":
+            raise ValueError(
+                "autograd=False uses the amplitude-projection update, which requires an "
+                f"amplitude-space loss; got loss_type with target_space="
+                f"{self._criterion.target_space!r}."
+            )
         self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
@@ -463,7 +471,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 )
                 pred_intensities = self.detector_model.forward(overlap)
 
-                batch_consistency_loss, targets = self.error_estimate(
+                batch_consistency_loss = self.error_estimate(
                     pred_intensities,
                     targets=targets,
                     global_n=global_n,
@@ -519,7 +527,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                             obj_patches, shifted_probes, descan_shifts
                         )
                         pred_intensities = self.detector_model.forward(overlap)
-                        batch_val_loss, _ = self.error_estimate(
+                        batch_val_loss = self.error_estimate(
                             pred_intensities,
                             targets=targets,
                             global_n=global_n,
@@ -539,7 +547,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         self._iter_val_losses.append(val_loss)
 
             if _dist_rank == 0:
-                self._record_iter(total_loss)  # TODO record val loss as well
+                self._record_iter(total_loss, autograd)  # TODO record val loss as well
 
             # Step schedulers with current loss
             self.step_schedulers(total_loss)
@@ -666,6 +674,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         # When reset=False the worker inherited existing history, so its lists are [old...new...].
         # n_before lets us take only the genuinely new tail in both cases.
         n_before = len(self._iter_losses)
+        v_before = len(self._iter_val_losses)
         is_reset = recon_kwargs.get("reset", False)
 
         if is_reset:
@@ -680,7 +689,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self._iter_recon_types.extend(result.get("iter_recon_types", []))
         else:
             self._iter_losses.extend(result["iter_losses"][n_before:])
-            self._iter_val_losses.extend(result["iter_val_losses"][n_before:])
+            self._iter_val_losses.extend(result["iter_val_losses"][v_before:])
             for k, v in result.get("iter_lrs", {}).items():
                 if k not in self._iter_lrs:
                     self._iter_lrs[k] = []
@@ -701,7 +710,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         return {
             param_name: optimizer.param_groups[0]["lr"]
             for param_name, optimizer in self.optimizers.items()
-            if optimizer is not None
         }
 
     def backward(
@@ -895,8 +903,6 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             Device to load the object on
         verbose : int | bool | None
             Verbosity level
-        rng : np.random.Generator | int | None
-            Random number generator
         auto_reload_dataset : bool
             Whether to automatically reload and preprocess the dataset from saved metadata
 
@@ -938,7 +944,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                             )
 
                     dset = PtychographyDatasetRaster.from_dataset4dstem(
-                        raw_dset, verbose=verbose or 1
+                        raw_dset, verbose=1 if verbose is None else verbose
                     )
                     # Apply preprocessing with saved parameters
                     preprocessing_params = metadata.get("preprocessing_params", {})
@@ -977,6 +983,9 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             #     "No dataset provided and could not automatically reload dataset. "
             #     "Please provide a dataset parameter or ensure the object was saved with dataset metadata."
             # )
+
+        if verbose is not None:
+            ptycho.verbose = verbose
 
         if device is not None:
             ptycho.to(device)

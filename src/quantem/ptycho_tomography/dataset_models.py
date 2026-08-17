@@ -368,7 +368,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         """Drop per-tilt heavy arrays after aggregation (geometry/CoM metadata retained)."""
         for ds in self.tilt_datasets:
             ds._intensities_4d = np.empty((0, 0, 0, 0), dtype=np.float32)
-            ds._amplitudes = torch.empty(0)
+            # ``_amplitudes`` is lazy upstream (recomputed from centered_amplitudes on demand),
+            # so None -- not an empty tensor, which the property would hand back as real data.
+            ds._amplitudes = None
             ds._centered_amplitudes = torch.empty(0)
             ds._intensities = torch.empty(0)
             ds._centered_intensities = torch.empty(0)

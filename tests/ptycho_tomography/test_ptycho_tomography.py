@@ -136,7 +136,7 @@ def _eval_data_loss(pt: PtychoTomography) -> float:
             patches = pt.obj_model.forward(patch_data)
             _, overlap = pt.forward_operator(patches, probes, descan)
             pred = pt.detector_model.forward(overlap)
-            loss, _ = pt.error_estimate(pred, targets=targets, global_n=n)
+            loss = pt.error_estimate(pred, targets=targets, global_n=n)
             total += loss.item()
     return total
 

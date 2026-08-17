@@ -125,7 +125,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._iter_lrs: dict[str, list[float]] = {}  # LRs/step_sizes across iterations
         self._snapshots: list[Snapshot] = []
         self._obj_padding_px = np.array([0, 0])
-        self.obj_fov_mask = torch.ones(self.dset._obj_shape_full_2d(self.obj_padding_px).shape)
+        self.obj_fov_mask = torch.ones(tuple(self.dset._obj_shape_full_2d(self.obj_padding_px)))
         self.batch_size = self.dset.num_gpts
         self._val_ratio = 0.0
         self._val_mode: Literal["grid", "random"] = "grid"
@@ -133,9 +133,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         if (
             isinstance(probe_model, ProbePixelated)
             and (probe_model.vacuum_probe_intensity is not None)
-            and (dset.amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+            # ``centered_amplitudes`` shares amplitudes' shape but is always resident (amplitudes is
+            # recomputed lazily), so use it here to avoid materializing the full raw array.
+            and (dset.centered_amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
         ):
-            probe_model.rescale_vacuum_probe((dset.amplitudes.shape[1], dset.amplitudes.shape[2]))
+            probe_model.rescale_vacuum_probe(
+                (dset.centered_amplitudes.shape[1], dset.centered_amplitudes.shape[2])
+            )
 
         # Remove centralized optimizer storage - now managed by individual models
         self.probe_model = probe_model
@@ -146,7 +150,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self.to(self._single_device)
 
     # region --- preprocessing ---
-    ## hopefully will be able to remove some of thes preprocessing flags,
+    ## hopefully will be able to remove some of these preprocessing flags,
     ## convert plotting and vectorized to kwargs
     def preprocess(
         self,
@@ -191,8 +195,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         # change obj_padding_px and whatever else needs to be changed
         self.obj_padding_px = obj_padding_px  # also initializes the object model
-        self.dset._set_initial_scan_positions_px(self.obj_padding_px)
-        self.dset._set_patch_indices(self.obj_padding_px)
 
         self.compute_propagator_arrays()
         self._set_obj_fov_mask(batch_size=batch_size)
@@ -208,7 +210,9 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         overlap = self._get_probe_overlap(batch_size)
         ov = overlap > overlap.max() * 0.3
         ov = ndi.binary_closing(ov, iterations=5)
-        ov = ndi.binary_dilation(ov, iterations=min(32, np.min(self.obj_padding_px) // 4))
+        dilation_iters = min(32, np.min(self.obj_padding_px) // 4)
+        if dilation_iters > 0:
+            ov = ndi.binary_dilation(ov, iterations=dilation_iters)
         ov = ndi.gaussian_filter(ov.astype(config.get("dtype_real")), sigma=gaussian_sigma)
         self.obj_fov_mask = ov
         self.obj_model.mask = ov
@@ -453,7 +457,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property
     def probe(self) -> np.ndarray:
-        """Complex valued probe(s). Shape [num_probes, roi_reight, roi_width]"""
+        """Complex valued probe(s). Shape [num_probes, roi_height, roi_width]"""
         return self._to_numpy(self.probe_model.probe)
 
     @property
@@ -800,11 +804,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 "Preprocessing has not been completed. Please run Ptycho.preprocess()"
             )
 
-    def _check_rm_preprocessed(self, new_val: Any, name: str) -> None:
-        if hasattr(self, name):
-            if getattr(self, name) != new_val:
-                self._preprocessed = False
-
     def _to_numpy(self, array: "np.ndarray | torch.Tensor") -> np.ndarray:
         return to_numpy(array)
 
@@ -873,15 +872,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         cropped = center_crop_arr(rotated_array, tuple(self.obj_shape_crop), pad_if_needed=False)
 
         return cropped
-
-    def _repeat_arr(
-        self, arr: "np.ndarray|torch.Tensor", repeats: int, axis: int
-    ) -> "np.ndarray|torch.Tensor":
-        """repeat the input array along the desired axis."""
-        if config.get("has_torch"):
-            if isinstance(arr, torch.Tensor):
-                return torch.repeat_interleave(arr, repeats, dim=axis)
-        return np.repeat(arr, repeats, axis=axis)
 
     def reset_recon(self) -> None:
         self._reset_rng()
@@ -1072,7 +1062,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     # endregion
 
-    # region --- ptychography foRcard model ---
+    # region --- ptychography forward model ---
 
     def forward_operator(
         self,
@@ -1095,7 +1085,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         pred_intensities: torch.Tensor,
         targets: torch.Tensor,
         global_n: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """Data-fidelity loss for one batch via the active criterion (``self.criterion``).
 
         Maps predictions into the criterion's measurement space (amplitude or intensity),
@@ -1113,7 +1103,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         n = global_n if global_n is not None else self.dset.num_positions
         error = criterion(preds * mask, targets * mask, n)
         loss = error / self.dset.mean_diffraction_intensity
-        return loss, targets
+        return loss
 
     def overlap_projection(self, obj_patches, input_probe):
         """Multiplies `input_probes` with roi-shaped patches from `obj_array`.
@@ -1138,14 +1128,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # incoherent sum of all probe components
         eps = 1e-9  # this is to avoid diverging gradients at sqrt(0)
         overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")
-        amps = torch.sqrt(torch.sum(torch.abs(overlap_fft + eps) ** 2, dim=0))
+        amps = torch.sqrt(torch.sum(torch.abs(overlap_fft) ** 2, dim=0) + eps)
         if not corner_centered:  # default is shifted amplitudes matching exp data
             return torch.fft.fftshift(amps, dim=(-2, -1))
         else:
             return amps
 
     def estimate_intensities(self, overlap_array: "torch.Tensor") -> "torch.Tensor":
-        """Returns the estimated fourier amplitudes from real-valued `overlap_array`."""
+        """Returns the estimated fourier intensities from real-valued `overlap_array`."""
         # overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         # incoherent sum of all probe components
         overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")

@@ -122,6 +122,9 @@ class AmplitudeS3IM(DataCriterion):
     multi-GPU. It does, however, sit on a different absolute scale than the sum-based criteria
     (``L2``/``L1``/Poisson, which rescale to a full-dataset sum), so learning rates do **not**
     transfer between ``s3im_amplitude`` and those losses — retune the LR when switching.
+
+    Pass ``generator`` (a ``torch.Generator`` on the compute device) to make the random
+    permutations — and hence the loss values — reproducible run-to-run.
     """
 
     target_space: TargetSpace = "amplitude"
@@ -133,18 +136,20 @@ class AmplitudeS3IM(DataCriterion):
         patch_height: int = 32,
         window_size: int = 11,
         sigma: float = 1.5,
+        generator: torch.Generator | None = None,
     ):
         self.lambda_s3im = float(lambda_s3im)
         self.repeats = int(repeats)
         self.patch_height = int(patch_height)
         self.window_size = int(window_size)
         self.sigma = float(sigma)
+        self.generator = generator
 
     def _s3im(self, src: torch.Tensor, tar: torch.Tensor) -> torch.Tensor:
         num = src.numel()
         idx_list = [torch.arange(num, device=src.device)]
         for _ in range(self.repeats - 1):
-            idx_list.append(torch.randperm(num, device=src.device))
+            idx_list.append(torch.randperm(num, device=src.device, generator=self.generator))
         idx = torch.cat(idx_list)
         ph = self.patch_height
         usable = (idx.numel() // ph) * ph  # trim so it reshapes to (ph, -1)

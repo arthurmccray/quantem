@@ -15,6 +15,12 @@ from quantem.diffractive_imaging.ptychography_base import PtychographyBase, Snap
 
 
 class PtychographyVisualizations(PtychographyBase):
+    def _scalebar_real(self) -> dict[str, Any]:
+        return {"sampling": self.sampling[1], "units": "Å"}
+
+    def _scalebar_recip(self) -> dict[str, Any]:
+        return {"sampling": self.reciprocal_sampling[1], "units": r"$\mathrm{A^{-1}}$"}
+
     def show_obj(
         self,
         obj: np.ndarray | None = None,
@@ -42,8 +48,6 @@ class PtychographyVisualizations(PtychographyBase):
         obj_iter = "Final"
         if obj is None:
             if snapshot_iter is not None:
-                if snapshot_iter < 0:
-                    snapshot_iter = len(self.snapshots) + snapshot_iter
                 snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
                 obj_np = snp["obj"]
                 obj_iter = snp["iteration"]
@@ -88,7 +92,7 @@ class PtychographyVisualizations(PtychographyBase):
             titles.extend([t + "Phase", t + "Amplitude"])
             cmaps.extend([ph_cmap, "gray"])
 
-        scalebar = [{"sampling": self.sampling[0], "units": "Å"}] + [None] * (len(ims) - 1)
+        scalebar = [self._scalebar_real()] + [None] * (len(ims) - 1)
 
         show_2d(
             ims,
@@ -159,16 +163,12 @@ class PtychographyVisualizations(PtychographyBase):
         elif self.obj_type == "pure_phase":
             windowed_obj = np.exp(1j * obj_np.sum(0)) * window_2d
         else:
-            windowed_obj = (
-                np.abs(obj_np).sum(0)
-                * window_2d
-                * np.exp(1j * np.angle(obj_np).sum(0) * window_2d)
-            )
+            windowed_obj = np.abs(obj_np).sum(0) * np.exp(1j * np.angle(obj_np).sum(0)) * window_2d
         obj_pad = np.pad(windowed_obj, pad, mode="constant", constant_values=0)
 
         obj_fft = np.fft.fftshift(np.fft.fft2(obj_pad))
 
-        fft_sampling = 1 / (self.sampling[0] * obj_pad.shape[0])
+        fft_sampling = 1 / (self.sampling[1] * obj_pad.shape[1])
         fft_scalebar = {"sampling": fft_sampling, "units": r"$\mathrm{A^{-1}}$"}
 
         t = kwargs.pop("title", "")
@@ -178,7 +178,7 @@ class PtychographyVisualizations(PtychographyBase):
             t += f"Iter {obj_iter} "
 
         if show_obj:
-            obj_scalebar = {"sampling": self.sampling[0], "units": "Å"}
+            obj_scalebar = self._scalebar_real()
             if self.obj_type == "potential":
                 obj_show = obj_pad
             else:  # complex or pure phase just show the phase
@@ -190,19 +190,17 @@ class PtychographyVisualizations(PtychographyBase):
                 ],
                 title=[t + "Object", t + "Fourier Transform"],
                 scalebar=[obj_scalebar, fft_scalebar],
-                return_fig=True,
                 **kwargs,
             )
-            ax[1].set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
+            ax[1].set_aspect(obj_pad.shape[-1] / obj_pad.shape[-2])
         else:
             fig, ax = show_2d(
                 np.abs(obj_fft),
                 scalebar=fft_scalebar,
                 title=t + "Fourier Transform",
-                return_fig=True,
                 **kwargs,
             )
-            ax.set_aspect(obj_np.shape[-1] / obj_np.shape[-2])
+            ax.set_aspect(obj_pad.shape[-1] / obj_pad.shape[-2])
         if return_fft:
             return obj_fft
         else:
@@ -236,8 +234,6 @@ class PtychographyVisualizations(PtychographyBase):
         probe_iter = "Final"
         if probe is None:
             if snapshot_iter is not None:
-                if snapshot_iter < 0:
-                    snapshot_iter = len(self.snapshots) + snapshot_iter
                 snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
                 probe = snp["probe"]
                 probe_iter = snp["iteration"]
@@ -256,7 +252,7 @@ class PtychographyVisualizations(PtychographyBase):
         if probe_iter != "Final":
             t += f"Iter {probe_iter} "
 
-        scalebar = [{"sampling": self.sampling[0], "units": "Å"}]
+        scalebar = [self._scalebar_real()]
         if sum_probes:
             probes = [np.fft.fftshift(probe.sum(0))]
         else:
@@ -318,8 +314,6 @@ class PtychographyVisualizations(PtychographyBase):
         """
         if probe is None:
             if snapshot_iter is not None:
-                if snapshot_iter < 0:
-                    snapshot_iter = len(self.snapshots) + snapshot_iter
                 snp = self.get_snapshot_by_iter(snapshot_iter, closest=True, cropped=True)
                 probe = snp["probe"]
             else:
@@ -373,7 +367,7 @@ class PtychographyVisualizations(PtychographyBase):
             top_img = np.fft.fftshift(top_img)
             bottom_img = np.fft.fftshift(bottom_img)
 
-        scalebar = [{"sampling": self.sampling[0], "units": "Å"}, None]
+        scalebar = [self._scalebar_real(), None]
         titles = [f"Top Surface {label}", f"Bottom Surface {label}"]
 
         fig, axs = show_2d(
@@ -410,9 +404,7 @@ class PtychographyVisualizations(PtychographyBase):
                 probe = probe[None, ...]
 
         probes = [np.fft.fftshift(np.fft.fft2(probe[i])) for i in range(len(probe))]
-        scalebar = [{"sampling": self.reciprocal_sampling[0], "units": r"$\mathrm{A^{-1}}$"}] + [
-            None
-        ] * (len(probes) - 1)
+        scalebar = [self._scalebar_recip()] + [None] * (len(probes) - 1)
         if len(probes) > 1:
             titles = self.get_probe_intensities(probe)
             titles = [
@@ -477,7 +469,7 @@ class PtychographyVisualizations(PtychographyBase):
         self,
         obj: np.ndarray | None = None,
         cbar: bool = False,
-        interval_type: Literal["quantile", "manual"] = "quantile",
+        interval_type: Literal["quantile", "manual", "minmax", "abs"] = "quantile",
         interval_scaling: Literal["each", "all"] = "each",
         max_width: int = 4,
         return_fig: bool = False,
@@ -491,7 +483,7 @@ class PtychographyVisualizations(PtychographyBase):
             The object to show. If None, the object from the last iteration is shown.
         cbar: bool, optional
             Whether to show a colorbar, by default False
-        interval_type: Literal["quantile", "manual"], optional
+        interval_type: Literal["quantile", "manual", "minmax", "abs"], optional
             The interval type to use for the colorbar, by default "quantile"
         interval_scaling: Literal["each", "all"], optional
             The interval scaling to use for the colorbar, by default "each"
@@ -514,9 +506,14 @@ class PtychographyVisualizations(PtychographyBase):
             if obj.ndim == 2:
                 obj = obj[None, ...]
 
+        # slice_thicknesses has length num_slices - 1; entry i is the gap to the next slice
+        thicknesses = self.slice_thicknesses
         t_parts = []
         for i in range(len(obj)):
-            t_parts.append(f"{i + 1}/{len(obj)} | {self.slice_thicknesses[i - 1]:.1f} Å")
+            t_part = f"{i + 1}/{len(obj)}"
+            if i < len(thicknesses):
+                t_part += f" | {thicknesses[i]:.1f} Å"
+            t_parts.append(t_part)
 
         if self.obj_type == "potential":
             objs_flat = [np.abs(obj[i]) for i in range(len(obj))]
@@ -533,7 +530,7 @@ class PtychographyVisualizations(PtychographyBase):
         titles = [titles_flat[i : i + max_width] for i in range(0, len(titles_flat), max_width)]
 
         scalebars: list = [[None for _ in row] for row in objs]
-        scalebars[0][0] = {"sampling": self.sampling[0], "units": "Å"}
+        scalebars[0][0] = self._scalebar_real()
 
         if interval_type == "quantile":
             norm = {"interval_type": "quantile"}
@@ -548,8 +545,8 @@ class PtychographyVisualizations(PtychographyBase):
                 norm["vmin"] = np.min(objs_flat)
                 norm["vmax"] = np.max(objs_flat)
             else:
-                norm["vmin"] = kwargs.get("vmin")
-                norm["vmax"] = kwargs.get("vmax")
+                norm["vmin"] = kwargs.pop("vmin", None)
+                norm["vmax"] = kwargs.pop("vmax", None)
         else:
             raise ValueError(f"Unknown interval type: {interval_type}")
 
@@ -594,7 +591,13 @@ class PtychographyVisualizations(PtychographyBase):
         if len(self.val_iter_losses) > 0:
             lines.extend(ax.semilogy(iters, self.iter_losses, c="k", label="train loss", lw=lw))
             lines.extend(
-                ax.semilogy(iters, self.val_iter_losses, c=colors[6], label="val loss", lw=lw)
+                ax.semilogy(
+                    np.arange(len(self.val_iter_losses)),
+                    self.val_iter_losses,
+                    c=colors[6],
+                    label="val loss",
+                    lw=lw,
+                )
             )
         else:
             lines.extend(ax.semilogy(iters, self.iter_losses, c="k", label="loss", lw=lw))
@@ -605,7 +608,7 @@ class PtychographyVisualizations(PtychographyBase):
         ax.set_xlabel("Iterations")
 
         # check if all lrs are constant and if so, don't plot lr
-        if all(np.all(lr == self.iter_lrs["object"][0]) for lr in self.iter_lrs.values()):
+        if all(np.all(lr == lr[0]) for lr in self.iter_lrs.values() if len(lr) > 0):
             plot_lrs = False
 
         if plot_lrs and len(self.iter_lrs) > 0:
@@ -655,7 +658,8 @@ class PtychographyVisualizations(PtychographyBase):
             # set title to each lr type
             title = ""
             for lr_type, lr_values in self.iter_lrs.items():
-                title += f"{lr_type} LR: {lr_values[0]:.1e} | "
+                if len(lr_values) > 0:
+                    title += f"{lr_type} LR: {lr_values[0]:.1e} | "
             ax.set_title(title[:-3], fontsize=10)
 
         labs = [lin.get_label() for lin in lines]
@@ -726,22 +730,28 @@ class PtychographyVisualizations(PtychographyBase):
         show_object : bool, optional
             Whether to show object reconstructions, by default True
         iters : list[int] | slice | None, optional
-            Specific iter iterations to display. If None, shows all available iters
+            Specific iter iterations to display. If None, shows all available iters.
+            Takes precedence over every_nth.
         every_nth : int | None, optional
-            Show every nth iter instead of all. Overrides iters parameter
+            Show every nth iter instead of all. Only used if iters is None
         max_n : int | None, optional
             Maximum number of iterations to display
         cbar : bool, optional
             Whether to show colorbars, by default False
         norm : str, optional
-            Normalization method for object display, by default "quantile",
+            Normalization method for object display, by default "quantile". Ignored if
+            show_probe and show_object are both True.
         interval_scaling : str, optional
             How to scale intervals: "each" for per-image scaling, "all" for global scaling across
-            all iterations, by default "each". Does not work if show_probe is True.
+            all iterations, by default "each". Ignored if show_probe and show_object are both
+            True.
         max_width : int, optional
             Maximum number of images per row, by default 4
         cropped : bool, optional
             Whether to show cropped objects (default True) or full objects
+        closest : bool, optional
+            Whether to fall back to the closest stored snapshot when an exact iteration is
+            not available, by default True
         **kwargs
             Additional arguments passed to show_2d
         """
@@ -780,6 +790,12 @@ class PtychographyVisualizations(PtychographyBase):
         ]
 
         if show_object and show_probe:
+            if norm != "quantile" or interval_scaling != "each":
+                warnings.warn(
+                    "norm and interval_scaling are ignored when both the object and probe "
+                    "are shown; pass show_probe=False to use them.",
+                    stacklevel=2,
+                )
             self._show_object_and_probe_iters(selected_snapshots, cbar, max_width, **kwargs)
         elif show_object:
             self._show_object_iters_only(
@@ -834,8 +850,8 @@ class PtychographyVisualizations(PtychographyBase):
                     norm_dict["vmin"] = float(np.min(all_values_flat))
                     norm_dict["vmax"] = float(np.max(all_values_flat))
             else:
-                norm_dict["vmin"] = kwargs.get("vmin")
-                norm_dict["vmax"] = kwargs.get("vmax")
+                norm_dict["vmin"] = kwargs.pop("vmin", None)
+                norm_dict["vmax"] = kwargs.pop("vmax", None)
         else:
             raise ValueError(f"Unknown norm type: {norm}")
 
@@ -845,7 +861,7 @@ class PtychographyVisualizations(PtychographyBase):
 
         scalebars: list = [[None for _ in row] for row in images_grid]
         if scalebars:
-            scalebars[0][0] = {"sampling": self.sampling[0], "units": "Å"}
+            scalebars[0][0] = self._scalebar_real()
 
         show_2d(
             images_grid,
@@ -884,10 +900,7 @@ class PtychographyVisualizations(PtychographyBase):
         # Set up scalebars
         scalebars: list = [[None for _ in row] for row in probes_grid]
         if scalebars:
-            scalebars[0][0] = {
-                "sampling": self.reciprocal_sampling[0],
-                "units": r"$\mathrm{A^{-1}}$",
-            }
+            scalebars[0][0] = self._scalebar_real()
 
         show_2d(
             probes_grid,
@@ -960,11 +973,8 @@ class PtychographyVisualizations(PtychographyBase):
 
         scalebars: list = [[None for _ in row] for row in all_images]
         if scalebars:
-            scalebars[0][0] = {"sampling": self.sampling[0], "units": "Å"}
-            scalebars[0][1] = {
-                "sampling": self.reciprocal_sampling[0],
-                "units": r"$\mathrm{A^{-1}}$",
-            }
+            scalebars[0][0] = self._scalebar_real()
+            scalebars[0][1] = self._scalebar_real()
 
         show_2d(
             all_images,
@@ -1285,7 +1295,7 @@ class PtychographyVisualizations(PtychographyBase):
         else:
             amplitudes = self._to_numpy(amplitudes.sum(0))
 
-        scalebar = [{"sampling": self.reciprocal_sampling[0], "units": r"$\mathrm{A^{-1}}$"}]
+        scalebar = [self._scalebar_recip()]
 
         if fft_shift:
             probe_plot = np.fft.fftshift(probe_plot)

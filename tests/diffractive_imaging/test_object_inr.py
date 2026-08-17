@@ -291,13 +291,14 @@ class TestObjectINRUnit:
     def test_potential_identity_default_and_positivity_penalty(self):
         """Default ``potential`` activation is identity (vacuum is exactly 0); the soft
         ``positivity_weight`` penalty drives a forced-negative potential non-negative."""
+        torch.manual_seed(0)  # rng=0 only seeds coordinate sampling; HSiren init uses global RNG
         obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
         obj._initialize_obj((1, 24, 24))
         # identity + zeroed final layer -> vacuum is exactly 0 (not softplus(0) = ln 2)
         assert float(obj._materialize_obj().abs().max()) == pytest.approx(0.0, abs=1e-6)
         # force the whole potential negative via the (zero-weight) final-layer bias
         with torch.no_grad():
-            obj.model.net[-2].bias.fill_(-0.5) # type:ignore 
+            obj.model.net[-2].bias.fill_(-0.5)  # type:ignore
         assert float(obj._materialize_obj().min()) == pytest.approx(-0.5, abs=1e-3)
         obj.constraints = {"positivity_weight": 1.0}
         assert float(obj._sampled_positivity_loss(1.0)) == pytest.approx(0.5, abs=0.05)
@@ -314,7 +315,7 @@ class TestObjectINRUnit:
         obj = ObjectINR.from_uniform(num_slices=1, obj_type="potential", hidden_features=32, rng=0)
         obj._initialize_obj((1, 16, 16))
         with torch.no_grad():
-            obj.model.net[-2].bias.fill_(1.0) # type:ignore  # constant +1 background
+            obj.model.net[-2].bias.fill_(1.0)  # type:ignore  # constant +1 background
         raw = obj._materialize_obj()
         assert float(raw.min()) == pytest.approx(1.0, abs=0.2)
         obj.constraints = {"fix_potential_baseline": True}
