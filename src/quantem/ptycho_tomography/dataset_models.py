@@ -40,6 +40,12 @@ from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, rot_beam_to_
 PoseInitValue = float | Sequence[float] | Sequence[Sequence[float]] | np.ndarray | torch.Tensor
 
 
+def _drop_attr(obj: nn.Module, name: str) -> None:
+    """Delete ``name`` from ``obj`` if it is set (no-op otherwise)."""
+    if name in obj.__dict__:
+        delattr(obj, name)
+
+
 class PtychoTomoDatasetRaster(DatasetConstraints):
     """Tilt series of raster 4D-STEM scans presented as one flat ptychography dataset.
 
@@ -628,6 +634,45 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         return self.scan_sampling * (self.gpts - 1)
 
     # endregion --- per-tilt scan geometry ---
+
+    # region --- back-compat shims (pre-merge caches) ---
+    @property
+    def com_transpose(self) -> bool:
+        """Diffraction-frame transpose flag, with a pre-merge-cache fallback.
+
+        Overrides the base getter only to run :meth:`_ensure_transpose_attr` first: this is the
+        earliest point a deserialized wrap touches the flag (``PtychographyBase.__init__`` ->
+        ``_obj_shape_full_2d`` -> ``_obj_shape_rot_2d`` -> ``_obj_shape_crop_2d``).
+        """
+        self._ensure_transpose_attr()
+        return self._transpose
+
+    @com_transpose.setter
+    def com_transpose(self, t: bool) -> None:
+        self._transpose = bool(t)
+
+    def _ensure_transpose_attr(self) -> None:
+        """Normalize the pre-merge ``_com_transpose`` attribute name onto ``_transpose``.
+
+        Objects deserialized from saves/caches bypass ``__init__``, so a wrap written before the
+        2026-08-17 ``diffractive_imaging`` merge restores the flag under its old name and the
+        base getter finds neither name (an ``AttributeError`` that ``nn.Module.__getattr__``
+        masks into a misleading missing-``_obj_shape_rot_2d`` message). Same situation, and same
+        treatment, as :meth:`_ensure_pose_init_buffers`. Renames the key in place so a re-save
+        writes the current name; the per-tilt datasets (pickled whole, so equally stale) are
+        normalized alongside.
+        """
+        if "_transpose" in self.__dict__:
+            return
+        legacy = bool(getattr(self, "_com_transpose", False))
+        self.com_transpose = legacy
+        _drop_attr(self, "_com_transpose")
+        for ds in getattr(self, "tilt_datasets", None) or []:
+            if "_transpose" not in ds.__dict__:
+                ds.com_transpose = bool(getattr(ds, "_com_transpose", legacy))
+                _drop_attr(ds, "_com_transpose")
+
+    # endregion --- back-compat shims ---
 
     def preprocess(
         self,

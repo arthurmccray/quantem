@@ -4,6 +4,8 @@ Uses small random Dataset4dstem stacks (the wrapper's mechanics don't need physi
 the physically meaningful end-to-end checks live in test_ptycho_tomography.py.
 """
 
+import json
+
 import numpy as np
 import pytest
 import torch
@@ -29,6 +31,14 @@ def _make_dset4d(seed: int, scale: float = 1.0) -> Dataset4dstem:
         sampling=(STEP, STEP, Q_SAMP, Q_SAMP),
         units=("A", "A", "A^-1", "A^-1"),
     )
+
+
+def _to_legacy(obj: torch.nn.Module) -> None:
+    """Rewrite the CoM-transpose flag to its pre-merge attribute name: exactly the state a cache
+    written before the 2026-08-17 merge restores (deserialization bypasses ``__init__``)."""
+    value = obj.com_transpose  # pyright: ignore[reportAttributeAccessIssue] -- ptycho datasets only
+    delattr(obj, "_transpose")
+    setattr(obj, "_com_transpose", value)
 
 
 def _build_wrapper(preprocess: bool = True, free: bool = True) -> PtychoTomoDatasetRaster:
@@ -253,6 +263,59 @@ class TestStateAndSerialization:
         assert len(loaded.tilt_datasets) == w.num_tilts
         assert loaded.implicit_object is True
         # forward still works after reload
+        payload, *_ = loaded.forward(torch.tensor([0, 25]), (8, 8))
+        assert payload.rotations.shape == (2, 3, 3)
+
+
+class TestPreMergeCacheBackCompat:
+    """Wraps written before the 2026-08-17 diffractive_imaging merge stored the CoM-transpose
+    flag as ``_com_transpose``; deserialization bypasses ``__init__``, so without the shim the
+    getter finds neither that name nor the current ``_transpose``."""
+
+    def test_legacy_attribute_name_is_normalized(self):
+        w = _build_wrapper()
+        _to_legacy(w)
+        assert w.com_transpose is False
+        assert "_com_transpose" not in w.__dict__  # renamed in place, so a re-save is clean
+
+    def test_legacy_true_value_is_preserved(self):
+        w = _build_wrapper()
+        delattr(w, "_transpose")
+        setattr(w, "_com_transpose", True)
+        assert w.com_transpose is True
+
+    def test_legacy_per_tilt_datasets_are_normalized(self):
+        w = _build_wrapper()
+        _to_legacy(w)
+        for ds in w.tilt_datasets:
+            _to_legacy(ds)
+        _ = w.com_transpose
+        for ds in w.tilt_datasets:
+            assert ds.com_transpose is False
+
+    def test_missing_flag_defaults_to_false(self):
+        """Neither name present (an even older save) -> the __init__ default, not a crash."""
+        w = _build_wrapper()
+        delattr(w, "_transpose")
+        assert w.com_transpose is False
+
+    def test_reload_of_rewritten_store(self, tmp_path):
+        """The real failure: rewrite the persisted key, reload, and use the wrap."""
+        w = _build_wrapper()
+        w.implicit_object = True
+        path = tmp_path / "tomo_dset_legacy"
+        w.save(path, mode="o")
+        meta_path = path / "zarr.json"
+        meta = json.loads(meta_path.read_text())
+        attrs = meta["attributes"]
+        assert "_transpose" in attrs, "current code should persist _transpose"
+        attrs["_com_transpose"] = attrs.pop("_transpose")  # pre-merge on-disk layout
+        meta_path.write_text(json.dumps(meta))
+
+        loaded = autoserialize_load(path)
+        assert loaded.com_transpose is False
+        # the geometry chain that raised the misleading _obj_shape_rot_2d AttributeError
+        assert tuple(loaded._obj_shape_crop_2d) == tuple(w._obj_shape_crop_2d)
         payload, *_ = loaded.forward(torch.tensor([0, 25]), (8, 8))
         assert payload.rotations.shape == (2, 3, 3)
 

@@ -71,6 +71,14 @@ def _make_wrapper(arrays_per_tilt: list[np.ndarray]) -> PtychoTomoDatasetRaster:
     return PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
 
 
+def _to_legacy(obj: torch.nn.Module) -> None:
+    """Rewrite the CoM-transpose flag to its pre-merge attribute name: exactly the state a cache
+    written before the 2026-08-17 merge restores (deserialization bypasses ``__init__``)."""
+    value = obj.com_transpose  # pyright: ignore[reportAttributeAccessIssue] -- ptycho datasets only
+    delattr(obj, "_transpose")
+    setattr(obj, "_com_transpose", value)
+
+
 def _make_probe(c10: float = C10) -> ProbePixelated:
     return ProbePixelated.from_array(
         num_probes=1,
@@ -687,6 +695,36 @@ class TestPoseResume:
         # and reset() still goes back to the restored baselines, not to zeros
         d2.reset()
         assert torch.allclose(d2._pose_shifts.detach().cpu(), torch.tensor(shifts))
+
+
+class TestPreMergeCacheBackCompat:
+    def test_from_models_on_a_pre_merge_wrap(self):
+        """Gate B's failure: a cached wrap carrying only the pre-merge ``_com_transpose`` name
+        blew up in ``PtychographyBase.__init__`` -> ``_obj_shape_full_2d`` with a misleading
+        ``no attribute '_obj_shape_rot_2d'``."""
+        rng = np.random.default_rng(0)
+        arrays = [rng.uniform(0.5, 1.0, size=(*SCAN_GPTS, N, N)).astype(np.float32) for _ in TILTS]
+        wrapper = _make_wrapper(arrays)
+        wrapper.preprocess(obj_padding_px=(PAD, PAD))
+        # degrade to the pre-merge on-disk layout (deserialization bypasses __init__)
+        _to_legacy(wrapper)
+        for ds in wrapper.tilt_datasets:
+            _to_legacy(ds)
+
+        pt = PtychoTomography.from_models(
+            dset=wrapper,
+            obj_model=ObjectVoxelTomo.from_uniform(
+                thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
+            ),
+            probe_model=_make_probe(),
+            detector_model=DetectorPixelated(),
+            rng=0,
+            verbose=False,
+        )
+        assert pt.dset.com_transpose is False
+        assert "_com_transpose" not in wrapper.__dict__
+        # the geometry chain that raised the misleading _obj_shape_rot_2d AttributeError
+        assert np.all(np.asarray(pt.dset._obj_shape_crop_2d) > 0)
 
 
 if __name__ == "__main__":
