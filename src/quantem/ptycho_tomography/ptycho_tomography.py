@@ -24,6 +24,7 @@ Typical use::
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal, Self, Sequence, cast
+from warnings import warn
 
 import numpy as np
 import torch
@@ -174,8 +175,6 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         # ---- deprecated pixel-padding arguments (legacy mapping keeps old runs reproducible)
         legacy = obj_padding_px is not None or z_padding_px is not None
         if legacy:
-            from warnings import warn
-
             warn(
                 "obj_padding_px / z_padding_px are deprecated - use specimen_box_A (Å) and "
                 "box_margin_A (Å); the pixel arguments will be removed",
@@ -295,8 +294,6 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         obj = self.obj_model
         if not isinstance(obj, ObjectPtychoTomoBase):  # pragma: no cover - guarded by from_models
             return
-        from warnings import warn
-
         slab = obj.slab_thickness_A * obj.num_slices
         dset = self.dset
         if isinstance(dset, PtychoTomoDatasetRaster) and dset.slab_window:
@@ -340,19 +337,27 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Base forward operator plus the slab-window probe pre-propagation (2026-07-16).
+        """Base forward operator plus the probe z-offset pre-propagation (2026-07-16 / 08-17).
 
-        In slab-window mode the dataset stashes the per-batch window offset ``dz`` (Å along the
-        beam) during ``dset.forward``; the physical probe is fixed in the lab, so the probe
-        entering a window displaced by ``dz`` is the probe Fresnel-propagated by ``dz`` — the
-        same ``exp(-iπ λ dz k²)`` factor as the inter-slice propagators, per batch element.
-        The stash is consumed exactly once per batch step (train and validation both rebuild it
-        via ``dset.forward``); nothing changes when the mode is off.
+        The dataset stashes ``_last_probe_dz_A`` (Å along the beam) during ``dset.forward``:
+        the slab-window offset MINUS the per-tilt learned defocus offset. The physical probe is
+        fixed in the lab, so the probe entering a window displaced by ``dz`` is the probe
+        Fresnel-propagated by ``dz`` — the same ``exp(-iπ λ dz k²)`` factor as the inter-slice
+        propagators, per batch element — and a defocus offset is the same operation with the
+        opposite sign (``effective defocus = probe defocus + offset``; see
+        ``PtychoTomoDatasetRaster.forward``). Note this is deliberately NOT
+        ``_last_window_dz_A``: that one also moves the object query, and the defocus must move
+        only the probe. The stash is consumed exactly once per batch step (train and validation
+        both rebuild it via ``dset.forward``); nothing changes when both are off (``None``).
         """
-        dz = getattr(self.dset, "_last_window_dz_A", None)
+        dz = getattr(self.dset, "_last_probe_dz_A", None)
+        if dz is None:  # pre-defocus wrappers stash only the window offset
+            dz = getattr(self.dset, "_last_window_dz_A", None)
         if dz is not None:
             # consume-once: no staleness, clean serialization
-            cast(PtychoTomoDatasetRaster, self.dset)._last_window_dz_A = None  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+            dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+            dset_t._last_probe_dz_A = None
+            dset_t._last_window_dz_A = None
             shifted_input_probes = self._pre_propagate_probes(shifted_input_probes, dz)
         return super().forward_operator(obj_patches, shifted_input_probes, descan)
 
@@ -559,6 +564,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
         Iteration snapshots (lightweight object state_dicts) round-trip like the base class's;
         pass ``skip=("_snapshots",)`` to drop them for a leaner save.
+
         """
         return super().save(
             path,

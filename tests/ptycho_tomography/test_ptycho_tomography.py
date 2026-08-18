@@ -40,13 +40,14 @@ NUM_SLICES = 6
 NUM_Z_VOX = 6
 
 
-def _probe_array() -> np.ndarray:
+def _probe_array(c10: float = C10) -> np.ndarray:
+    """Aperture-limited probe with defocus ``-c10`` (the polar convention: ``C10 = -defocus``)."""
     sampling = 1 / Q_MAX / 2
     reciprocal_sampling = 2 * Q_MAX / N
     qx = qy = np.fft.fftfreq(N, sampling)
     q = np.sqrt(qx[:, None] ** 2 + qy[None, :] ** 2)
     aperture = np.sqrt(np.clip((Q_PROBE - q) / reciprocal_sampling + 0.5, 0, 1))
-    chi = q**2 * electron_wavelength_angstrom(PROBE_ENERGY) * np.pi * C10
+    chi = q**2 * electron_wavelength_angstrom(PROBE_ENERGY) * np.pi * c10
     probe_fourier = aperture * np.exp(-1j * chi)
     probe_fourier /= np.sqrt(np.sum(np.abs(probe_fourier) ** 2))
     return (np.fft.ifft2(probe_fourier) * N).astype(np.complex64)
@@ -69,22 +70,22 @@ def _make_wrapper(arrays_per_tilt: list[np.ndarray]) -> PtychoTomoDatasetRaster:
     return PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
 
 
-def _make_probe() -> ProbePixelated:
+def _make_probe(c10: float = C10) -> ProbePixelated:
     return ProbePixelated.from_array(
         num_probes=1,
-        probe_params={"energy": PROBE_ENERGY, "C10": C10, "semiangle_cutoff": _semiangle_mrad()},
-        probe_array=_probe_array(),
+        probe_params={"energy": PROBE_ENERGY, "C10": c10, "semiangle_cutoff": _semiangle_mrad()},
+        probe_array=_probe_array(c10),
     )
 
 
-def _make_ptycho(wrapper: PtychoTomoDatasetRaster) -> PtychoTomography:
+def _make_ptycho(wrapper: PtychoTomoDatasetRaster, c10: float = C10) -> PtychoTomography:
     obj = ObjectVoxelTomo.from_uniform(
         thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
     )
     pt = PtychoTomography.from_models(
         dset=wrapper,
         obj_model=obj,
-        probe_model=_make_probe(),
+        probe_model=_make_probe(c10),
         detector_model=DetectorPixelated(),
         rng=0,
         verbose=False,
@@ -534,6 +535,99 @@ class TestSlabWindow:
         pt.compute_propagator_arrays()
         with pytest.warns(UserWarning, match="slab-window"):
             pt._check_slab_coverage()
+
+
+class TestPerTiltDefocus:
+    """Per-tilt learnable defocus offset (task 2): sign convention and wiring."""
+
+    DELTA_A = 7.0  # defocus perturbation (Å)
+
+    def test_pre_propagation_is_a_C10_shift(self, inverse_crime_setup):
+        """``_pre_propagate_probes(P(C10), dz) == P(C10 + dz)`` — i.e. propagating the probe
+        FORWARD by dz INCREASES C10, and therefore DECREASES the defocus (``C10 = -defocus``).
+        This is the physics the offset's sign is derived from."""
+        arrays, _gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        p_base = torch.as_tensor(_probe_array(C10))[None, None]  # (P=1, B=1, H, W)
+        p_shifted = torch.as_tensor(_probe_array(C10 + self.DELTA_A))[None, None]
+        out = pt._pre_propagate_probes(p_base, torch.tensor([self.DELTA_A]))
+        assert torch.allclose(out, p_shifted, atol=1e-6)
+
+    def test_defocus_offset_sign_matches_probe(self, inverse_crime_setup):
+        """SIGN RULE: ``effective defocus = probe-model defocus + _defocus_offset_A``.
+
+        Reference: a probe at defocus ``f`` with no offset. Test: a probe built at defocus
+        ``f + delta`` run with offset ``-delta`` must reproduce it exactly (and must NOT with
+        offset ``+delta``). In ``C10 = -defocus`` terms the perturbed probe is ``C10 - delta``.
+        """
+        arrays, gt = inverse_crime_setup
+        delta = self.DELTA_A
+        pt_ref = _make_ptycho(_make_wrapper(arrays), c10=C10)
+        pt_off = _make_ptycho(_make_wrapper(arrays), c10=C10 - delta)  # defocus f + delta
+        for pt in (pt_ref, pt_off):
+            obj = pt.obj_model
+            assert isinstance(obj, ObjectVoxelTomo)
+            obj.set_volume(gt)
+        dset = pt_off.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+
+        ref = _forward_all(pt_ref)
+        dset.set_defocus_init(-delta)
+        matched = _forward_all(pt_off)
+        rel = float((matched - ref).norm() / ref.norm())
+        assert rel < 1e-5, f"offset -delta did not undo a +delta defocus (rel={rel:.2e})"
+
+        dset.set_defocus_init(+delta)  # the wrong sign must be clearly worse
+        wrong = _forward_all(pt_off)
+        assert float((wrong - ref).norm() / ref.norm()) > 100 * max(rel, 1e-9)
+
+    def test_per_tilt_offsets_are_applied_per_tilt(self, inverse_crime_setup):
+        """A nonzero offset on ONE tilt changes only that tilt's predictions."""
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        base = _forward_all(pt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        offsets = [0.0] * len(TILTS)
+        offsets[3] = self.DELTA_A
+        dset.set_defocus_init(offsets)
+        moved = _forward_all(pt)
+        n_scan = int(np.prod(SCAN_GPTS))
+        for t_i in range(len(TILTS)):
+            block = slice(t_i * n_scan, (t_i + 1) * n_scan)
+            diff = float((moved[block] - base[block]).norm() / base[block].norm())
+            if t_i == 3:
+                assert diff > 1e-3, "the perturbed tilt did not change"
+            else:
+                assert diff < 1e-6, f"tilt {t_i} changed but was not perturbed"
+
+    def test_defocus_gradient_reaches_the_parameter(self, inverse_crime_setup):
+        """A full forward/backward puts a finite gradient on the defocus offsets."""
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        dset.set_learn_defocus(True)
+        dset.set_defocus_init([0.0, 3.0, 0.0, -3.0, 0.0])
+        dset._set_targets(pt._criterion.target_space if pt._criterion is not None else "amplitude")
+        idx = torch.arange(dset.num_gpts)
+        targets = dset.targets[idx].to(pt._single_device)
+        patch_data, _pos, frac, descan = dset.forward(idx, pt.obj_padding_px)
+        probes = pt.probe_model.forward(frac)
+        patches = pt.obj_model.forward(patch_data)
+        _, overlap = pt.forward_operator(patches, probes, descan)
+        pred = pt.detector_model.forward(overlap)
+        pt.error_estimate(pred, targets=targets, global_n=dset.num_gpts).backward()
+        grad = dset._defocus_offset_A.grad
+        assert grad is not None and torch.isfinite(grad).all()
+        # tilts 1 and 3 are away from the truth, so their gradients must be the large ones
+        assert grad.abs()[[1, 3]].min() > grad.abs()[[0, 2, 4]].max()
 
 
 if __name__ == "__main__":
