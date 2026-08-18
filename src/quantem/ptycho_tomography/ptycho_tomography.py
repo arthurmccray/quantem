@@ -47,6 +47,11 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     # cached (key, ROI k² grid) for the slab-window probe pre-propagation (built lazily per
     # (roi_shape, sampling); plain attr, not module state)
     _window_k2_cache: "tuple[tuple[int, int, float, float], torch.Tensor] | None" = None
+    # per-tilt pose / defocus state carried across a save -> from_file(dset=fresh_wrapper)
+    # round trip (the dataset itself is excluded from the archive by default, and the caller
+    # rebuilds a FRESH wrapper whose pose slots are back at their defaults). Written by save(),
+    # re-applied by from_file(); see _collect_pose_state.
+    _pose_state_metadata: "dict[str, Any] | None" = None
 
     @classmethod
     def from_models(  # pyright: ignore[reportIncompatibleMethodOverride] -- narrowed model types
@@ -115,7 +120,83 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             raise TypeError(f"loaded object is not a PtychoTomography, got {type(pt)}")
         if dset is not None:
             pt.dset.implicit_object = pt.obj_model.is_implicit
+            pt._apply_pose_state(pt._pose_state_metadata)
         return pt
+
+    # region --- pose / defocus resume state ---
+    _POSE_STATE_PARAMS = (
+        "_pose_shifts",
+        "_pose_z1",
+        "_pose_z3",
+        "_pose_dtheta",
+        "_defocus_offset_A",
+    )
+    _POSE_STATE_BUFFERS = (
+        "_pose_shifts_init",
+        "_pose_z1_init",
+        "_pose_z3_init",
+        "_pose_dtheta_init",
+        "_defocus_offset_init_A",
+    )
+
+    def _collect_pose_state(self) -> "dict[str, Any]":
+        """Snapshot the dataset's pose/defocus parameters, baselines and learn flags (CPU)."""
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        dset_t._ensure_pose_state()
+        state: dict[str, Any] = {"reference_tilt_idx": dset_t.reference_tilt_idx}
+        for name in self._POSE_STATE_PARAMS:
+            state[name] = getattr(dset_t, name).data.detach().cpu().clone()
+        for name in self._POSE_STATE_BUFFERS:
+            state[name] = getattr(dset_t, name).detach().cpu().clone()
+        for flag in PtychoTomoDatasetRaster._POSE_LEARN_FLAGS:
+            state[flag] = bool(getattr(dset_t, flag))
+        return state
+
+    def _apply_pose_state(self, state: "dict[str, Any] | None") -> None:
+        """Re-apply a :meth:`_collect_pose_state` snapshot onto the attached dataset.
+
+        A rebuilt wrapper starts from default (zero, frozen) pose slots, so without this a
+        ``--resume-from`` would silently drop every learned pose and defocus offset and restart
+        the refinement from scratch (gotcha #14: the resume handshake is where geometry state
+        goes missing). Mismatched tilt counts are skipped with a warning rather than raising —
+        the object is still usable, just without the pose history.
+        """
+        if not state:
+            return
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        dset_t._ensure_pose_state()
+        n = dset_t.num_tilts
+        saved = state.get("_pose_z1")
+        if saved is not None and int(saved.shape[0]) != n:
+            warn(
+                f"saved pose state has {int(saved.shape[0])} tilts but the attached dataset has "
+                f"{n}; pose/defocus state was NOT restored",
+                stacklevel=2,
+            )
+            return
+        with torch.no_grad():
+            for name in self._POSE_STATE_PARAMS:
+                value = state.get(name)
+                if value is not None:
+                    target = getattr(dset_t, name)
+                    target.data.copy_(value.to(device=target.device, dtype=target.dtype))
+            for name in self._POSE_STATE_BUFFERS:
+                value = state.get(name)
+                if value is not None:
+                    target = getattr(dset_t, name)
+                    target.copy_(value.to(device=target.device, dtype=target.dtype))
+        idx = state.get("reference_tilt_idx")
+        if idx is not None:
+            dset_t.reference_tilt_idx = int(idx)
+        dset_t.set_learn_pose(
+            shifts=bool(state.get("_learn_pose_shifts", False)),
+            z1=bool(state.get("_learn_pose_z1", False)),
+            z3=bool(state.get("_learn_pose_z3", False)),
+            dtheta=bool(state.get("_learn_pose_dtheta", False)),
+        )
+        dset_t.set_learn_defocus(bool(state.get("_learn_defocus", False)))
+
+    # endregion --- pose / defocus resume state ---
 
     # region --- preprocessing ---
     def preprocess(  # pyright: ignore[reportIncompatibleMethodOverride] -- physical-units geometry
@@ -565,13 +646,25 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         Iteration snapshots (lightweight object state_dicts) round-trip like the base class's;
         pass ``skip=("_snapshots",)`` to drop them for a leaner save.
 
+        Because the dataset is excluded, the per-tilt pose/defocus parameters (which live on
+        the wrapper) are stashed in ``_pose_state_metadata`` here and re-applied by
+        ``from_file`` onto the freshly rebuilt wrapper — otherwise a resume would silently
+        restart the pose refinement from its defaults. Cleared afterwards so a live object
+        never carries a stale copy.
         """
-        return super().save(
-            path,
-            mode=mode,
-            store=store,
-            skip=skip,
-            compression_level=compression_level,
-            save_raw_data=save_raw_data,
-            verbose=verbose,
-        )
+        stashed = not save_raw_data and getattr(self, "_dset", None) is not None
+        if stashed:
+            self._pose_state_metadata = self._collect_pose_state()
+        try:
+            return super().save(
+                path,
+                mode=mode,
+                store=store,
+                skip=skip,
+                compression_level=compression_level,
+                save_raw_data=save_raw_data,
+                verbose=verbose,
+            )
+        finally:
+            if stashed:
+                self._pose_state_metadata = None

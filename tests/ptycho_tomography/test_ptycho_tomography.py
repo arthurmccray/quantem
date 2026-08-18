@@ -630,5 +630,62 @@ class TestPerTiltDefocus:
         assert grad.abs()[[1, 3]].min() > grad.abs()[[0, 2, 4]].max()
 
 
+class TestPoseResume:
+    def test_pose_and_defocus_survive_save_from_file(self, inverse_crime_setup, tmp_path):
+        """save -> from_file(dset=fresh wrapper) must carry the pose/defocus state.
+
+        The wrapper is rebuilt from scratch on resume (gotcha #14), so without an explicit
+        hand-off the learned pose and every learn flag would silently reset to the defaults.
+        """
+        arrays, _gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        shifts = [[0.0, 0.0], [0.5, -0.5], [0.0, 0.0], [-0.25, 0.75], [1.0, 0.25]]
+        dset.set_pose_init(shifts=shifts, z1=0.4, z3=-0.6, dtheta=0.1)
+        dset.set_defocus_init([0.0, 4.0, 0.0, -4.0, 2.0])
+        dset.set_learn_pose(shifts=True, z1=True, z3=False, dtheta=True)
+        dset.set_learn_defocus(True)
+        with torch.no_grad():  # pretend a few optimizer steps moved the live pose off its init
+            dset._pose_shifts.add_(0.3)
+            dset._pose_z1.add_(0.05)
+            dset._defocus_offset_A.add_(1.5)
+
+        path = tmp_path / "pose_resume.zip"
+        pt.save(path, mode="o")
+        assert pt._pose_state_metadata is None  # not left behind on the live object
+        wrapper2 = _make_wrapper(arrays)
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
+        d2 = loaded.dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        for name in (
+            "_pose_shifts",
+            "_pose_z1",
+            "_pose_z3",
+            "_pose_dtheta",
+            "_defocus_offset_A",
+            "_pose_shifts_init",
+            "_pose_z1_init",
+            "_pose_z3_init",
+            "_pose_dtheta_init",
+            "_defocus_offset_init_A",
+        ):
+            got = getattr(d2, name).detach().cpu()
+            want = getattr(dset, name).detach().cpu()
+            assert torch.allclose(got, want, atol=1e-6), name
+        assert d2.learn_pose_shifts and d2.learn_pose_z1 and d2.learn_pose_dtheta
+        assert d2.learn_defocus and not d2.learn_pose_z3
+        assert d2.reference_tilt_idx == dset.reference_tilt_idx
+        assert set(d2.get_optimization_parameters()) == {
+            "pose_shifts",
+            "pose_angles",
+            "defocus",
+        }
+        # and reset() still goes back to the restored baselines, not to zeros
+        d2.reset()
+        assert torch.allclose(d2._pose_shifts.detach().cpu(), torch.tensor(shifts))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
