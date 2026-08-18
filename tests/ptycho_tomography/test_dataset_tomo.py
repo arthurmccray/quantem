@@ -942,6 +942,49 @@ class TestPoseGradientAccumulation:
         w.step_optimizer()
         assert not torch.equal(w._pose_shifts.detach(), start)
 
+    def test_first_adam_step_is_exactly_lr_per_component(self):
+        """Adam's first step is ``lr * sign(g)`` per component, whatever the gradient scale.
+
+        This is the arithmetic that makes "the pose barely moved" diagnosable: after one step at
+        lr, every non-reference component must have moved by exactly lr. A run that moves far
+        less either is not stepping or is sign-alternating, and the two are distinguishable only
+        with the step count (see :meth:`pose_step_stats`). Gradients here are drawn with the
+        measured signal-to-noise (mean ~0.15, std 0.45) so the test exercises the realistic case
+        where the per-batch sign is unreliable but the accumulated mean is not.
+        """
+        from quantem.core.ml.optimizer_mixin import OptimizerParams
+
+        m, lr = 64, 0.1
+        w = _pose_wrapper()
+        w.set_learn_pose(shifts=True, z1=False, z3=False)
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=m)
+        w.set_optimizer(OptimizerParams.Adam(lr=lr))
+        start = w._pose_shifts.detach().clone()
+        rng = np.random.default_rng(0)
+        mean = torch.tensor([[-0.14, 0.29], [-0.03, 0.15], [0.10, 0.03]])
+        for _ in range(m):
+            noise = torch.as_tensor(rng.normal(0.0, 0.45, size=(w.num_tilts, 2)))
+            w._pose_shifts.grad = mean + noise.to(mean.dtype)
+            w.step_optimizer()
+        stats = w.pose_step_stats()
+        assert stats["steps_taken"] == 1, stats
+        assert stats["accum_batches_per_step"] == m
+        delta = (w._pose_shifts.detach() - start).abs()
+        others = [t for t in range(w.num_tilts) if t != REF_TILT]
+        assert torch.allclose(delta[others], torch.full_like(delta[others], lr), atol=1e-5), delta
+        assert float(delta[REF_TILT].max()) == 0.0  # gauge
+        assert stats["log"][0]["max_abs_shift_delta"] == pytest.approx(lr, abs=1e-5)
+
+    def test_step_stats_count_every_step(self):
+        w = self._wrap(batches_per_epoch=2)
+        for _ in range(6):  # 3 completed accumulations
+            w._pose_shifts.grad = torch.ones_like(w._pose_shifts)
+            w.step_optimizer()
+        stats = w.pose_step_stats()
+        assert stats["steps_taken"] == 3, stats
+        assert stats["pending_accumulated"] == 0
+        assert [e["step"] for e in stats["log"]] == [1, 2, 3]
+
     def test_reset_clears_the_accumulator(self):
         w = self._wrap(batches_per_epoch=4)
         w._pose_shifts.grad = torch.ones_like(w._pose_shifts)

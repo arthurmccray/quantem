@@ -90,6 +90,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _defocus_active: bool
     _pose_accum_M: int
     _pose_accum_count: int
+    _pose_steps_taken: int
 
     # the pose/defocus parameters, in one place (gauge masking + gradient accumulation)
     _POSE_PARAM_NAMES = (
@@ -206,6 +207,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_accum_M = 1
         self._pose_accum_count = 0
         self._pose_accum: dict[str, torch.Tensor] | None = None
+        self._pose_steps_taken = 0
+        self._pose_step_log: list[dict] = []
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -333,6 +336,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_accum_count = 0
         if "_pose_accum" not in self.__dict__:
             self._pose_accum = None
+        if "_pose_steps_taken" not in self.__dict__:
+            self._pose_steps_taken = 0
+        if "_pose_step_log" not in self.__dict__:
+            self._pose_step_log = []
         self._fold_legacy_rot_axis_offset()
         if "_defocus_active" not in self.__dict__:
             self._refresh_defocus_active()
@@ -646,9 +653,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         *steps* every M-th call, using the MEAN of the M accumulated gradients.
         """
         if self._pose_accum_M <= 1:
-            self.zero_reference_pose_grads()
-            super().step_optimizer()
-            self.pin_reference_pose()
+            self._masked_step(n_accumulated=1)
             return
 
         params = {name: getattr(self, name) for name in self._POSE_PARAM_NAMES}
@@ -670,11 +675,56 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             if acc is None:
                 continue
             param.grad = acc / float(self._pose_accum_count)
-        self.zero_reference_pose_grads()
-        super().step_optimizer()
-        self.pin_reference_pose()
+        self._masked_step(n_accumulated=self._pose_accum_count)
         self._pose_accum = None
         self._pose_accum_count = 0
+
+    _POSE_STEP_LOG_MAX = 12
+
+    def _masked_step(self, n_accumulated: int) -> None:
+        """Gauge-mask, step, re-pin, and RECORD what the step actually did.
+
+        The record exists because "the pose barely moved" is indistinguishable from "the pose
+        never stepped" from the outside: Adam's first step is exactly ``lr * sign(g)`` per
+        component, so a run whose parameters move by far less than ``lr`` per step is either
+        sign-alternating or not stepping at all, and only the step count and the gradient that
+        was actually handed to the optimizer separate the two (2026-08-18).
+        """
+        self.zero_reference_pose_grads()
+        before = {n: getattr(self, n).detach().clone() for n in self._POSE_PARAM_NAMES}
+        grad_max = 0.0
+        for name in self._POSE_PARAM_NAMES:
+            g = getattr(self, name).grad
+            if g is not None:
+                grad_max = max(grad_max, float(g.abs().max()))
+        super().step_optimizer()
+        self.pin_reference_pose()
+        self._pose_steps_taken = int(getattr(self, "_pose_steps_taken", 0)) + 1
+        if len(self._pose_step_log) < self._POSE_STEP_LOG_MAX:
+            delta = (self._pose_shifts.detach() - before["_pose_shifts"]).cpu()
+            self._pose_step_log.append(
+                {
+                    "step": self._pose_steps_taken,
+                    "n_accumulated": int(n_accumulated),
+                    "max_abs_grad": grad_max,
+                    "max_abs_shift_delta": float(delta.abs().max()),
+                    "shift_delta": delta.tolist(),
+                }
+            )
+
+    def pose_step_stats(self, reset: bool = False) -> dict:
+        """Steps taken so far, plus the per-step record of the first few steps."""
+        self._ensure_pose_state()
+        out = {
+            "steps_taken": int(self._pose_steps_taken),
+            "accum_batches_per_step": int(self._pose_accum_M),
+            "pending_accumulated": int(self._pose_accum_count),
+            "log": list(self._pose_step_log),
+        }
+        if reset:
+            self._pose_steps_taken = 0
+            self._pose_step_log = []
+        return out
 
     def flush_pose_accum(self) -> bool:
         """Step now on a partial accumulation (end of an epoch that did not fill M)."""
@@ -684,9 +734,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             acc = (self._pose_accum or {}).get(name)
             if acc is not None:
                 getattr(self, name).grad = acc / float(self._pose_accum_count)
-        self.zero_reference_pose_grads()
-        super().step_optimizer()
-        self.pin_reference_pose()
+        self._masked_step(n_accumulated=self._pose_accum_count)
         self._pose_accum = None
         self._pose_accum_count = 0
         return True
@@ -1162,6 +1210,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._refresh_defocus_active()
         self._pose_accum = None
         self._pose_accum_count = 0
+        self._pose_steps_taken = 0
+        self._pose_step_log = []
 
 
 PtychoTomoDatasetType = PtychoTomoDatasetRaster
