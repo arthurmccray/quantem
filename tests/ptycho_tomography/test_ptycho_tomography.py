@@ -18,6 +18,7 @@ from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.probe_models import ProbePixelated
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
+from quantem.ptycho_tomography.geometry import PtychoTomoPatchData
 from quantem.ptycho_tomography.object_models import ObjectVoxelTomo
 from quantem.ptycho_tomography.ptycho_tomography import PtychoTomography
 
@@ -464,6 +465,7 @@ class TestSlabWindow:
         assert isinstance(dset, PtychoTomoDatasetRaster)
         idx = torch.arange(dset.num_gpts)
         payload, _pos, _frac, _descan = dset.forward(idx, pt.obj_padding_px)
+        assert isinstance(payload, PtychoTomoPatchData)
         dz = payload.window_dz_A
         assert dz is not None and dz.shape == (dset.num_gpts,)
         # expected: window center on the specimen mid-plane => dz = -tan(tilt) * y_scan_A

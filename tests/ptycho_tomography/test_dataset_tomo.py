@@ -127,6 +127,7 @@ class TestPreprocess:
         w = _build_wrapper(free=False)
         for ds in w.tilt_datasets:
             # amplitudes are lazy upstream; centered_amplitudes is the resident array
+            assert ds._centered_amplitudes is not None
             assert ds._centered_amplitudes.numel() > 0
 
     def test_scan_positions_concatenated_per_tilt(self):
@@ -448,6 +449,7 @@ class TestPoseGaugeAndOptimizer:
                 "defocus": OptimizerParams.Adam(lr=1e-1),
             }
         )
+        assert w.optimizer is not None
         lrs = sorted(g["lr"] for g in w.optimizer.param_groups)
         assert lrs == pytest.approx([1e-3, 1e-2, 1e-1])
 

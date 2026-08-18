@@ -35,6 +35,10 @@ from quantem.diffractive_imaging.dataset_models import (
 )
 from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, rot_beam_to_spec
 
+# A pose/defocus baseline value: a scalar (same at every tilt), a per-tilt sequence, or (for
+# the 2-component shifts) a per-tilt sequence of pairs / a single pair.
+PoseInitValue = float | Sequence[float] | Sequence[Sequence[float]] | np.ndarray | torch.Tensor
+
 
 class PtychoTomoDatasetRaster(DatasetConstraints):
     """Tilt series of raster 4D-STEM scans presented as one flat ptychography dataset.
@@ -344,7 +348,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def _as_pose_tensor(
         self,
-        value: "float | Sequence[float] | np.ndarray | torch.Tensor",
+        value: PoseInitValue,
         shape: tuple[int, ...],
         name: str,
     ) -> torch.Tensor:
@@ -454,10 +458,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def set_pose_init(
         self,
-        shifts: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
-        z1: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
-        z3: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
-        dtheta: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
+        shifts: PoseInitValue | None = None,
+        z1: PoseInitValue | None = None,
+        z3: PoseInitValue | None = None,
+        dtheta: PoseInitValue | None = None,
     ) -> None:
         """Set the pose BASELINE (what ``reset()`` restores) and copy it into the live pose.
 
@@ -483,9 +487,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 self._pose_dtheta_init.copy_(self._as_pose_tensor(dtheta, (n,), "dtheta"))
                 self._pose_dtheta.data.copy_(self._pose_dtheta_init)
 
-    def set_defocus_init(
-        self, offsets_A: "float | Sequence[float] | np.ndarray | torch.Tensor"
-    ) -> None:
+    def set_defocus_init(self, offsets_A: PoseInitValue) -> None:
         """Set the per-tilt defocus-offset baseline (Å) and copy it into the live parameter.
 
         Sign: ``effective defocus at tilt t = the probe model's defocus + offset_A[t]`` — see
@@ -565,7 +567,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         groups = super().get_optimization_parameters()
         if self._learn_pose_shifts:
             groups["pose_shifts"] = [self._pose_shifts]
-        angles = [
+        angles: list[torch.Tensor] = [
             param
             for param, on in (
                 (self._pose_z1, self._learn_pose_z1),
