@@ -862,6 +862,19 @@ class TestPoseGradientAccumulation:
         w.set_pose_accum(steps_per_iter=0, batches_per_epoch=289)
         assert w.pose_accum_steps == 1
 
+    def test_missing_batches_per_epoch_raises_instead_of_falling_back(self):
+        """The silent fallback to M=1 ran a whole AuNP campaign per-batch while asking for
+        per-epoch accumulation; it is now fatal."""
+        w = _pose_wrapper()
+        with pytest.raises(ValueError, match="batches_per_epoch"):
+            w.set_pose_accum(steps_per_iter=1)
+        with pytest.raises(ValueError, match="batches_per_epoch"):
+            w.set_pose_accum(steps_per_iter=4, batches_per_epoch=None)
+        with pytest.raises(ValueError, match="batches_per_epoch must be"):
+            w.set_pose_accum(steps_per_iter=1, batches_per_epoch=0)
+        w.set_pose_accum(steps_per_iter=0)  # per-batch needs nothing
+        assert w.pose_accum_steps == 1
+
     def test_M_batches_give_exactly_one_update(self):
         """M-1 calls must not move the parameter; the M-th must."""
         m = 4

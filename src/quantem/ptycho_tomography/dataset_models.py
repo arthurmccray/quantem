@@ -606,7 +606,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             ``0`` or ``None`` = per-batch stepping (the pre-2026-08-18 behaviour).
         batches_per_epoch
             Length of the training loader. The dataset cannot know the batch size, so the
-            runner passes it; if omitted, any previously set value is reused.
+            runner MUST pass it whenever ``steps_per_iter >= 1``; omitting it raises rather
+            than silently falling back to per-batch stepping.
 
         The accumulator is kept SEPARATE from ``.grad`` because the reconstruction loop zeroes
         gradients at the start of every batch. Accumulation happens inside
@@ -619,7 +620,20 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_accum_M = 1
         else:
             if batches_per_epoch is None:
-                batches_per_epoch = int(getattr(self, "_pose_batches_per_epoch", 0)) or 1
+                # Deliberately fatal. This used to fall back to M = 1, i.e. silently to the
+                # per-batch path the caller was trying to leave — which is exactly how
+                # verify_recon.py ran a whole AuNP campaign at M = 1 while asking for M = 289
+                # (found 2026-08-18). A wrong answer that looks like the right one is worse
+                # than a crash.
+                raise ValueError(
+                    "set_pose_accum(steps_per_iter="
+                    f"{steps_per_iter}) needs batches_per_epoch (the training loader length); "
+                    "the dataset cannot know the batch size. Use "
+                    "pose_opts.batches_per_epoch(pt, batch_size), or pass steps_per_iter=0 for "
+                    "the per-batch path."
+                )
+            if int(batches_per_epoch) < 1:
+                raise ValueError(f"batches_per_epoch must be >= 1, got {batches_per_epoch}")
             self._pose_batches_per_epoch = int(batches_per_epoch)
             self._pose_accum_M = max(1, int(batches_per_epoch) // max(1, int(steps_per_iter)))
         self._pose_accum = None
