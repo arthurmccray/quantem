@@ -13,7 +13,9 @@ rotation-aware object models consume. Only implicit (coordinate-queried) object 
 supported — there is no integer patch-index path through a rotated volume.
 """
 
-from typing import Literal
+import warnings
+from dataclasses import replace
+from typing import Literal, Sequence
 
 import numpy as np
 import torch
@@ -22,6 +24,11 @@ import torch.nn as nn
 from quantem.core import config
 from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
+from quantem.core.ml.optimizer_mixin import (
+    OptimizerMixin,
+    OptimizerParams,
+    OptimizerParamsType,
+)
 from quantem.diffractive_imaging.dataset_models import (
     DatasetConstraints,
     PtychographyDatasetRaster,
@@ -46,17 +53,40 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _tilt_offsets: torch.Tensor
     _tilt_angles_deg: torch.Tensor
     _slab_window_flag: torch.Tensor
-    # transient per-batch stash (slab-window mode): consumed once by
-    # PtychoTomography.forward_operator, never serialized non-None
+    # transient per-batch stashes, consumed once by PtychoTomography.forward_operator, never
+    # serialized non-None. ``_last_window_dz_A`` is the pure slab-window offset (also on the
+    # payload, i.e. what moves the OBJECT query); ``_last_probe_dz_A`` is what the probe is
+    # Fresnel pre-propagated by -- window offset MINUS the per-tilt defocus offset.
     _last_window_dz_A: torch.Tensor | None = None
+    _last_probe_dz_A: torch.Tensor | None = None
     _scan_center_px: torch.Tensor
     _rot_axis_offset_A: torch.Tensor
     _pose_z1_init: torch.Tensor
     _pose_z3_init: torch.Tensor
+    _pose_dtheta_init: torch.Tensor
+    _pose_shifts_init: torch.Tensor
+    _defocus_offset_init_A: torch.Tensor
     _pose_z1: nn.Parameter
     _pose_dtheta: nn.Parameter
     _pose_z3: nn.Parameter
     _pose_shifts: nn.Parameter
+    _defocus_offset_A: nn.Parameter
+    _learn_pose_shifts: bool
+    _learn_pose_z1: bool
+    _learn_pose_z3: bool
+    _learn_pose_dtheta: bool
+    _learn_defocus: bool
+    _reference_tilt_idx: int
+    _defocus_active: bool
+
+    # pose/defocus learn flags, in the order ``_ensure_pose_state`` materializes them
+    _POSE_LEARN_FLAGS = (
+        "_learn_pose_shifts",
+        "_learn_pose_z1",
+        "_learn_pose_z3",
+        "_learn_pose_dtheta",
+        "_learn_defocus",
+    )
 
     def __init__(
         self,
@@ -119,8 +149,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         )
         self.register_buffer("_tilt_angles_deg", torch.as_tensor(angles, dtype=real_dtype))
         # Per-tilt pose-correction slots (tomography convention: z1 / x-tilt offset / z3 Euler
-        # angles + beam-frame shifts). Frozen in v1; enabling pose refinement later is a
-        # requires_grad flip + an optimizer group, not an interface change.
+        # angles + beam-frame shifts) plus the per-tilt defocus offset. All default to frozen;
+        # ``set_learn_pose`` / ``set_learn_defocus`` flip requires_grad and add the matching
+        # optimizer groups (see get_optimization_parameters).
         num_tilts = len(tilt_datasets)
         self._pose_z1 = nn.Parameter(torch.zeros(num_tilts, dtype=real_dtype), requires_grad=False)
         self._pose_dtheta = nn.Parameter(
@@ -130,15 +161,27 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_shifts = nn.Parameter(
             torch.zeros(num_tilts, 2, dtype=real_dtype), requires_grad=False
         )
+        self._defocus_offset_A = nn.Parameter(
+            torch.zeros(num_tilts, dtype=real_dtype), requires_grad=False
+        )
         # Beam-frame coordinate origin in scan-grid pixels (set at preprocess): the center of
         # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
         # relative to this point (see PtychoTomoPatchData).
         self.register_buffer("_scan_center_px", torch.full((2,), torch.nan, dtype=real_dtype))
-        # Baseline pose the parameters reset to (default zeros). set_tilt_axis_pose() uses this
-        # to fix a dataset-wide tilt-AXIS convention (e.g. z1=-90, z3=+90 turns the ZXZ x-tilt
-        # into a tilt about y — the ASE-simulated AuNP series' convention, found 2026-07-13).
+        # Baseline pose/defocus the parameters reset to (default zeros). set_tilt_axis_pose()
+        # uses the z1/z3 baselines to fix a dataset-wide tilt-AXIS convention (e.g. z1=-90,
+        # z3=+90 turns the ZXZ x-tilt into a tilt about y — the ASE-simulated AuNP series'
+        # convention, found 2026-07-13); set_pose_init / set_defocus_init set the rest.
         self.register_buffer("_pose_z1_init", torch.zeros(num_tilts, dtype=real_dtype))
         self.register_buffer("_pose_z3_init", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_dtheta_init", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_shifts_init", torch.zeros(num_tilts, 2, dtype=real_dtype))
+        self.register_buffer("_defocus_offset_init_A", torch.zeros(num_tilts, dtype=real_dtype))
+        for _flag in self._POSE_LEARN_FLAGS:
+            setattr(self, _flag, False)
+        # Gauge: the reference tilt (smallest |tilt|) is pinned; see set_learn_pose().
+        self._reference_tilt_idx = int(np.argmin(np.abs(angles)))
+        self._defocus_active = False
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -206,6 +249,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def rotations(self) -> torch.Tensor:
         """Current beam->specimen rotation matrices per tilt, ``(num_tilts, 3, 3)``."""
+        self._ensure_pose_state()
         return rot_beam_to_spec(
             self._pose_z1,
             self._tilt_angles_deg + self._pose_dtheta,
@@ -215,6 +259,351 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         )
 
     # endregion --- tilt geometry ---
+
+    # region --- pose / defocus refinement ---
+    def _ensure_pose_state(self) -> None:
+        """Materialize the pose/defocus parameters, baselines and flags; fold legacy state.
+
+        Objects deserialized from a save/cache written before a given slot existed bypass
+        ``__init__`` entirely (gotcha #23), so every pose access funnels through here. It also
+        folds a legacy ``_rot_axis_offset_A`` buffer into ``_pose_shifts_init`` exactly once
+        (see :meth:`set_rotation_center_offset_A`), so old caches keep the geometry the numbers
+        recorded with them were measured at.
+        """
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        n = self.num_tilts
+        for name, shape in (
+            ("_pose_z1", (n,)),
+            ("_pose_dtheta", (n,)),
+            ("_pose_z3", (n,)),
+            ("_pose_shifts", (n, 2)),
+            ("_defocus_offset_A", (n,)),
+        ):
+            if self._parameters.get(name) is None:
+                setattr(
+                    self,
+                    name,
+                    nn.Parameter(
+                        torch.zeros(shape, dtype=real_dtype, device=self.device),
+                        requires_grad=False,
+                    ),
+                )
+        for init_name, param_name in (
+            ("_pose_z1_init", "_pose_z1"),
+            ("_pose_z3_init", "_pose_z3"),
+            ("_pose_dtheta_init", "_pose_dtheta"),
+            ("_pose_shifts_init", "_pose_shifts"),
+            ("_defocus_offset_init_A", "_defocus_offset_A"),
+        ):
+            if init_name not in self._buffers:
+                param: nn.Parameter = getattr(self, param_name)
+                self.register_buffer(init_name, torch.zeros_like(param.data))
+        for flag in self._POSE_LEARN_FLAGS:
+            if flag not in self.__dict__:
+                setattr(self, flag, False)
+        if "_reference_tilt_idx" not in self.__dict__:
+            self._reference_tilt_idx = int(torch.argmin(self._tilt_angles_deg.abs()).item())
+        self._fold_legacy_rot_axis_offset()
+        if "_defocus_active" not in self.__dict__:
+            self._refresh_defocus_active()
+
+    def _ensure_pose_init_buffers(self) -> None:
+        """Back-compat alias for :meth:`_ensure_pose_state` (kept: external callers exist)."""
+        self._ensure_pose_state()
+
+    def _fold_legacy_rot_axis_offset(self) -> None:
+        """Fold a legacy ``_rot_axis_offset_A`` buffer into the pose-shift baseline, once.
+
+        The retired rotation-center hack subtracted a constant beam-frame ``(row, col)`` offset
+        from the patch coordinates AND from the slab-window offset — exactly what a constant
+        per-tilt ``_pose_shifts`` entry now does (the object model subtracts ``shifts_A`` from
+        the beam-frame coordinates before rotating, ``object_models.py``). So the fold is an
+        identity on the emitted geometry. The legacy buffer is zeroed afterwards, making this
+        idempotent; nothing writes it any more.
+        """
+        self._ensure_rot_offset_buffer()
+        off = self._rot_axis_offset_A
+        if not bool((off != 0).any()):
+            return
+        with torch.no_grad():
+            add = off.to(device=self._pose_shifts_init.device, dtype=self._pose_shifts_init.dtype)
+            self._pose_shifts_init.add_(add.view(1, 2))
+            self._pose_shifts.data.add_(add.view(1, 2))
+            off.zero_()
+
+    def _refresh_defocus_active(self) -> None:
+        """Cache whether the probe needs the per-tilt defocus pre-propagation at all.
+
+        Recomputed only when the defocus state changes (a ``.any()`` per batch would be a
+        device sync on the hot path); ``learn_defocus`` forces it on because the parameter can
+        leave zero at any optimizer step.
+        """
+        self._defocus_active = bool(self._learn_defocus) or bool(
+            (self._defocus_offset_A.data != 0).any()
+        )
+
+    def _as_pose_tensor(
+        self,
+        value: "float | Sequence[float] | np.ndarray | torch.Tensor",
+        shape: tuple[int, ...],
+        name: str,
+    ) -> torch.Tensor:
+        """Broadcast a scalar / per-tilt array to a pose baseline's shape."""
+        t = torch.as_tensor(value).to(device=self.device, dtype=self._tilt_angles_deg.dtype)
+        if t.ndim == 0:
+            t = t.expand(shape)
+        elif len(shape) == 2 and tuple(t.shape) == (shape[1],):
+            t = t.view(1, -1).expand(shape)
+        if tuple(t.shape) != tuple(shape):
+            raise ValueError(f"{name} must broadcast to {tuple(shape)}, got {tuple(t.shape)}")
+        return t.contiguous()
+
+    @property
+    def reference_tilt_idx(self) -> int:
+        """Index of the gauge-fixing reference tilt (default ``argmin |tilt|``)."""
+        self._ensure_pose_state()
+        return int(self._reference_tilt_idx)
+
+    @reference_tilt_idx.setter
+    def reference_tilt_idx(self, idx: int) -> None:
+        self._ensure_pose_state()
+        i = int(idx)
+        if not 0 <= i < self.num_tilts:
+            raise ValueError(f"reference_tilt_idx must be in [0, {self.num_tilts}), got {i}")
+        self._reference_tilt_idx = i
+
+    @property
+    def learn_pose_shifts(self) -> bool:
+        self._ensure_pose_state()
+        return bool(self._learn_pose_shifts)
+
+    @property
+    def learn_pose_z1(self) -> bool:
+        self._ensure_pose_state()
+        return bool(self._learn_pose_z1)
+
+    @property
+    def learn_pose_z3(self) -> bool:
+        self._ensure_pose_state()
+        return bool(self._learn_pose_z3)
+
+    @property
+    def learn_pose_dtheta(self) -> bool:
+        self._ensure_pose_state()
+        return bool(self._learn_pose_dtheta)
+
+    @property
+    def learn_defocus(self) -> bool:
+        self._ensure_pose_state()
+        return bool(self._learn_defocus)
+
+    def set_learn_pose(self, shifts: bool, z1: bool, z3: bool, dtheta: bool = False) -> None:
+        """Enable per-tilt pose refinement; flips ``requires_grad`` on the pose parameters.
+
+        Slots (all per tilt, all in this dataset model because the geometry is per tilt):
+
+        - ``shifts`` — beam-frame ``(dy, dx)`` in Å, subtracted from the patch coordinates
+          *before* rotation (and from the slab-window offset's beam center, identically).
+        - ``z1`` / ``z3`` — the Z-X-Z Euler angles of ``rot_beam_to_spec(z1, tilt + dtheta, z3)``
+          in degrees; this is the tomography module's pose parameterization.
+        - ``dtheta`` — a per-tilt tilt-ANGLE correction in degrees. Opt-in (default off) and a
+          deliberate deviation from ``quantem.tomography``, which holds the tilt angle fixed:
+          goniometer readout errors are real on experimental data and are not representable by
+          z1/z3.
+
+        Gauge (tomography-module style)
+        -------------------------------
+        A free-form 3D object has 3 translation + 3 rotation gauge degrees of freedom: moving
+        the object and moving every tilt's pose the opposite way leaves the data unchanged, so
+        the joint problem is rank-deficient and the whole series would drift. The gauge is fixed
+        by **pinning the reference tilt** (``reference_tilt_idx``, default ``argmin |tilt|``):
+        its gradient is zeroed before each optimizer step and its pose is restored to its
+        *baseline* after each step, for every slot including the defocus offset (see
+        :meth:`step_optimizer`).
+
+        Note that pinning loses no physical degree of freedom. The rotation-center error the
+        retired :meth:`set_rotation_center_offset_A` corrected is a constant beam-frame shift
+        ``s`` at every tilt; modulo the object-translation gauge that is equivalent to the
+        per-tilt shifts ``s_t = s - [R_t^T (0, s_y, s_x)]_{y,x}`` (plus the corresponding
+        beam-frame z component, which the defocus offset carries), which vanishes at the
+        reference tilt and so is fully reachable with the reference pinned.
+
+        The reference tilt is restored to its *baseline*, not hard-zeroed, so a nonzero
+        baseline set by :meth:`set_tilt_axis_pose` (z1 = -90 / z3 = +90 for the archived AuNP
+        v1-v4 series) or by the deprecated rotation-center wrapper stays intact; with the
+        default zero baselines this is literally "re-zero the reference tilt".
+
+        Survives ``reset()`` and is serialized (plain attributes on the module).
+        """
+        self._ensure_pose_state()
+        self._learn_pose_shifts = bool(shifts)
+        self._learn_pose_z1 = bool(z1)
+        self._learn_pose_z3 = bool(z3)
+        self._learn_pose_dtheta = bool(dtheta)
+        self._pose_shifts.requires_grad_(bool(shifts))
+        self._pose_z1.requires_grad_(bool(z1))
+        self._pose_z3.requires_grad_(bool(z3))
+        self._pose_dtheta.requires_grad_(bool(dtheta))
+
+    def set_learn_defocus(self, enabled: bool) -> None:
+        """Enable the per-tilt learnable defocus offset (see :meth:`set_defocus_init`)."""
+        self._ensure_pose_state()
+        self._learn_defocus = bool(enabled)
+        self._defocus_offset_A.requires_grad_(bool(enabled))
+        self._refresh_defocus_active()
+
+    def set_pose_init(
+        self,
+        shifts: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
+        z1: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
+        z3: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
+        dtheta: "float | Sequence[float] | np.ndarray | torch.Tensor | None" = None,
+    ) -> None:
+        """Set the pose BASELINE (what ``reset()`` restores) and copy it into the live pose.
+
+        Each argument is a scalar (same value at every tilt), a per-tilt array
+        (``(num_tilts,)``; ``(num_tilts, 2)`` or a single ``(2,)`` pair for ``shifts``), or
+        ``None`` to leave that slot alone. This is both the "start the search here" knob and
+        the perturbation knob for the recon-side validation (V1a): set a known nonzero pose,
+        enable learning, and check it returns to the truth.
+        """
+        self._ensure_pose_state()
+        n = self.num_tilts
+        with torch.no_grad():
+            if shifts is not None:
+                self._pose_shifts_init.copy_(self._as_pose_tensor(shifts, (n, 2), "shifts"))
+                self._pose_shifts.data.copy_(self._pose_shifts_init)
+            if z1 is not None:
+                self._pose_z1_init.copy_(self._as_pose_tensor(z1, (n,), "z1"))
+                self._pose_z1.data.copy_(self._pose_z1_init)
+            if z3 is not None:
+                self._pose_z3_init.copy_(self._as_pose_tensor(z3, (n,), "z3"))
+                self._pose_z3.data.copy_(self._pose_z3_init)
+            if dtheta is not None:
+                self._pose_dtheta_init.copy_(self._as_pose_tensor(dtheta, (n,), "dtheta"))
+                self._pose_dtheta.data.copy_(self._pose_dtheta_init)
+
+    def set_defocus_init(
+        self, offsets_A: "float | Sequence[float] | np.ndarray | torch.Tensor"
+    ) -> None:
+        """Set the per-tilt defocus-offset baseline (Å) and copy it into the live parameter.
+
+        Sign: ``effective defocus at tilt t = the probe model's defocus + offset_A[t]`` — see
+        :meth:`forward`.
+        """
+        self._ensure_pose_state()
+        with torch.no_grad():
+            self._defocus_offset_init_A.copy_(
+                self._as_pose_tensor(offsets_A, (self.num_tilts,), "offsets_A")
+            )
+            self._defocus_offset_A.data.copy_(self._defocus_offset_init_A)
+        self._refresh_defocus_active()
+
+    @property
+    def pose_shifts_A(self) -> torch.Tensor:
+        """Live per-tilt beam-frame shifts, ``(num_tilts, 2)`` Å."""
+        self._ensure_pose_state()
+        return self._pose_shifts
+
+    @property
+    def defocus_offsets_A(self) -> torch.Tensor:
+        """Live per-tilt defocus offsets, ``(num_tilts,)`` Å."""
+        self._ensure_pose_state()
+        return self._defocus_offset_A
+
+    def _reference_pose_slots(self) -> "tuple[tuple[nn.Parameter, torch.Tensor], ...]":
+        """``(parameter, baseline)`` pairs the reference tilt is pinned across."""
+        return (
+            (self._pose_shifts, self._pose_shifts_init),
+            (self._pose_z1, self._pose_z1_init),
+            (self._pose_z3, self._pose_z3_init),
+            (self._pose_dtheta, self._pose_dtheta_init),
+            (self._defocus_offset_A, self._defocus_offset_init_A),
+        )
+
+    def zero_reference_pose_grads(self) -> None:
+        """Zero the reference tilt's pose/defocus gradients (gauge; see :meth:`set_learn_pose`).
+
+        Called from :meth:`step_optimizer` AFTER the DDP all-reduce, so every rank masks the
+        same (already averaged) gradient and stays bit-identical.
+        """
+        self._ensure_pose_state()
+        i = self.reference_tilt_idx
+        for param, _init in self._reference_pose_slots():
+            if param.grad is not None:
+                param.grad[i] = 0.0
+
+    def pin_reference_pose(self) -> None:
+        """Restore the reference tilt's pose/defocus to its baseline (gauge)."""
+        self._ensure_pose_state()
+        i = self.reference_tilt_idx
+        with torch.no_grad():
+            for param, init in self._reference_pose_slots():
+                param.data[i] = init[i]
+
+    def step_optimizer(self) -> None:
+        """Optimizer step with the reference tilt's pose held at its baseline (gauge).
+
+        Zeroing the gradient alone is not enough — a stateful optimizer (Adam moments, weight
+        decay) can still move a parameter with a zero gradient — so the reference pose is also
+        written back after the step.
+        """
+        self.zero_reference_pose_grads()
+        super().step_optimizer()
+        self.pin_reference_pose()
+
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        """PPLR groups: the base's ``descan``/``scan_positions`` plus the pose/defocus groups.
+
+        Groups appear only while their learn flag is on: ``pose_shifts``, ``pose_angles``
+        (z1 + z3, and dtheta when enabled), ``defocus``. This dict IS the optimizer and DDP
+        surface — ``PtychographyBase._broadcast_parameters`` and ``_all_reduce_gradients``
+        (``ptychography_base.py:913-956``) both iterate exactly it, so overriding it here is
+        the whole multi-GPU integration; nothing else needed checking.
+        """
+        self._ensure_pose_state()
+        groups = super().get_optimization_parameters()
+        if self._learn_pose_shifts:
+            groups["pose_shifts"] = [self._pose_shifts]
+        angles = [
+            param
+            for param, on in (
+                (self._pose_z1, self._learn_pose_z1),
+                (self._pose_z3, self._learn_pose_z3),
+                (self._pose_dtheta, self._learn_pose_dtheta),
+            )
+            if on
+        ]
+        if angles:
+            groups["pose_angles"] = angles
+        if self._learn_defocus:
+            groups["defocus"] = [self._defocus_offset_A]
+        return groups
+
+    def _normalize_optimizer_params(
+        self, params: "OptimizerParamsType | dict[str, object]"
+    ) -> "dict[str, OptimizerParamsType]":
+        """Fan a single optimizer spec out to whichever pose/defocus groups are enabled.
+
+        Same contract as the base (``diffractive_imaging/dataset_models.py:195-238``) but over
+        this class's group set; the group list comes from ``get_optimization_parameters()`` so
+        the two can never disagree. An explicit PPLR dict passes through unchanged.
+        """
+        norm = OptimizerMixin._normalize_optimizer_params(self, params)
+        if set(norm) != {self.DEFAULT_OPTIMIZER_KEY}:
+            return norm
+        spec = norm[self.DEFAULT_OPTIMIZER_KEY]
+        learnable = list(self.get_optimization_parameters())
+        if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
+            warnings.warn(
+                f"{type(self).__name__}: an optimizer was requested but nothing is learnable; "
+                "the optimizer will be removed. Enable pose/defocus refinement with "
+                "set_learn_pose(...) / set_learn_defocus(True).",
+                stacklevel=2,
+            )
+        return {key: replace(spec) for key in learnable} if learnable else {}
+
+    # endregion --- pose / defocus refinement ---
 
     # region --- per-tilt scan geometry (identical across tilts; raster-level properties) ---
     @property
@@ -389,6 +778,28 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         coordinates, as for any implicit object) and ``descan_shifts=None`` (frozen in v1; the
         targets are descan-centered). The first element is the opaque object-query payload the
         reconstruction loop forwards to the (rotation-aware) object model.
+
+        Pose and defocus
+        ----------------
+        ``payload.shifts_A`` carries the per-tilt beam-frame shift, which the object model
+        subtracts from the patch coordinates before rotating; ``_window_dz_A`` subtracts the
+        same shift from the beam center, so the two stay consistent.
+
+        Two z-offsets are stashed for the reconstruction loop and they are NOT the same thing:
+
+        - ``payload.window_dz_A`` / ``_last_window_dz_A`` — the pure slab-window offset. This
+          moves the OBJECT query along the beam. The learned defocus must never appear here:
+          defocus moves the probe, not the specimen.
+        - ``_last_probe_dz_A`` — what the probe is Fresnel pre-propagated by, i.e.
+          ``window_dz - defocus_offset[tilt]``.
+
+        **Defocus sign rule:** ``effective defocus = probe-model defocus + _defocus_offset_A``.
+        Propagating a probe forward by ``dz`` multiplies its Fourier transform by
+        ``exp(-i pi lambda dz k^2)``, while defocus ``f`` enters the probe as
+        ``exp(+i pi lambda f k^2)`` (``C10 = -f``, ``complex_probe.evaluate_probe``), so
+        propagating forward by ``dz`` DECREASES the effective defocus by ``dz`` — hence the
+        minus sign on the offset. Pinned by
+        ``test_dataset_tomo.py::TestDefocusOffset::test_defocus_offset_sign_matches_probe``.
         """
         if not self._implicit_object:
             raise RuntimeError(
@@ -396,19 +807,27 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 "pair it with an ObjectPtychoTomoBase subclass."
             )
         self.apply_hard_constraints(obj_padding_px)
+        self._ensure_pose_state()
         bidx = torch.as_tensor(batch_indices).to(self._tilt_offsets.device)
         positions_px = self.scan_positions_px[bidx]
         coords_A = self._scan_coords_A(bidx)
         tilt_idx = self.tilt_index_of(bidx)
         rotations = self.rotations()[tilt_idx]
-        window_dz = self._window_dz_A(bidx, rotations) if self.slab_window else None
-        # transient per-batch stash for the reconstruction loop's probe pre-propagation
-        # (PtychoTomography.forward_operator consumes it exactly once and clears it)
+        shifts = self._pose_shifts[tilt_idx]  # (B, 2) beam-frame Å, pre-rotation
+        window_dz = self._window_dz_A(bidx, rotations, shifts) if self.slab_window else None
+        probe_dz = window_dz
+        if self._defocus_active:
+            offset = self._defocus_offset_A[tilt_idx]  # (B,) Å
+            probe_dz = -offset if window_dz is None else window_dz - offset
+        # transient per-batch stashes for the reconstruction loop's probe pre-propagation
+        # (PtychoTomography.forward_operator consumes them exactly once and clears them)
         self._last_window_dz_A = window_dz
+        self._last_probe_dz_A = probe_dz
         payload = PtychoTomoPatchData(
             coords_yx_A=coords_A,
             rotations=rotations,
             tilt_indices=tilt_idx,
+            shifts_A=shifts,
             window_dz_A=window_dz,
         )
         return payload, positions_px, torch.zeros_like(positions_px), None
@@ -432,7 +851,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         with torch.no_grad():
             self._slab_window_flag.fill_(bool(enabled))
 
-    def _window_dz_A(self, batch_indices: torch.Tensor, rotations: torch.Tensor) -> torch.Tensor:
+    def _window_dz_A(
+        self,
+        batch_indices: torch.Tensor,
+        rotations: torch.Tensor,
+        shifts_A: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Per-batch slab-window offset along the beam, ``(B,)`` in Å.
 
         Places the window center on the specimen mid-plane (``z_spec = 0``) at each scan
@@ -440,17 +864,19 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         beam center ``(y_c, x_c)`` solves ``r00·z + r01·y_c + r02·x_c = 0``. Convention-free
         (no tilt-sign special case) and exact for any pose; requires ``|r00| = |cos(tilt)|``
         bounded away from 0 (asserts tilt < ~84°).
+
+        ``shifts_A`` (``(B, 2)``, the per-tilt pose shift) is subtracted from the beam center
+        with the same sign the object model applies it to the patch coordinates — it used to be
+        the constant ``_rot_axis_offset_A``, which is now folded into the pose shifts.
         """
         center = self._scan_center_px
         samp = self.obj_sampling
         positions = self.scan_positions_px[batch_indices]  # (B, 2) un-rounded px
         y_c = (positions[:, 0] - center[0]) * float(samp[0])
         x_c = (positions[:, 1] - center[1]) * float(samp[1])
-        self._ensure_rot_offset_buffer()
-        off = self._rot_axis_offset_A
-        if bool((off != 0).any()):
-            y_c = y_c - off[0]
-            x_c = x_c - off[1]
+        if shifts_A is not None:
+            y_c = y_c - shifts_A[:, 0]
+            x_c = x_c - shifts_A[:, 1]
         r = rotations.to(device=y_c.device, dtype=y_c.dtype)
         r00 = r[:, 0, 0]
         assert bool((r00.abs() > 0.1).all()), (
@@ -480,11 +906,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         samp = self.obj_sampling
         rows_A = (rows - center[0]) * float(samp[0])
         cols_A = (cols - center[1]) * float(samp[1])
-        self._ensure_rot_offset_buffer()
-        off = self._rot_axis_offset_A
-        if bool((off != 0).any()):
-            rows_A = rows_A - off[0]
-            cols_A = cols_A - off[1]
+        # NOTE: the per-tilt pose shift is NOT applied here — it rides on the payload
+        # (``shifts_A``) and the object model subtracts it before rotating, which keeps the
+        # shift differentiable through one well-defined seam. The retired
+        # ``_rot_axis_offset_A`` subtraction lived here; it is folded into the pose shifts.
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
     def _ensure_rot_offset_buffer(self) -> None:
@@ -497,38 +922,50 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             )
 
     def set_rotation_center_offset_A(self, drow_A: float, dcol_A: float) -> None:
-        """TEMPORARY (2026-07-15) — REMOVE once proper pose optimization lands.
+        """DEPRECATED (2026-08-17) — a thin wrapper over the pose shifts; use ``set_pose_init``.
 
-        Shift the beam-frame coordinate origin (== the tilt-axis position) by a known offset in
-        Å from the scan-grid center. Needed because abTEM ``GridScan`` construction leaves the
-        scan-pattern center short of the simulation cell center (the true rotation center) by up
-        to half a scan step per axis — a rotation-center error that produces arc/"banana" atom
-        artifacts growing with scan step (measured: 0.30/0.49/0.75/0.99 Å at 0.6/1.0/1.5/2.0 Å
+        Was: shift the beam-frame coordinate origin (== the tilt-axis position) by a known
+        offset in Å from the scan-grid center, because abTEM ``GridScan`` construction leaves
+        the scan-pattern center short of the simulation cell center (the true rotation center)
+        by up to half a scan step per axis — a rotation-center error producing arc/"banana"
+        atom artifacts growing with scan step (0.30/0.49/0.75/0.99 Å at 0.6/1.0/1.5/2.0 Å
         steps). Pass the (row, col) offset FROM the scan center TO the true rotation center.
-        Survives ``reset()`` (dataset geometry, not a learned correction).
-        """
-        self._ensure_rot_offset_buffer()
-        with torch.no_grad():
-            self._rot_axis_offset_A[0] = float(drow_A)
-            self._rot_axis_offset_A[1] = float(dcol_A)
 
-    def _ensure_pose_init_buffers(self) -> None:
-        """Create the pose-baseline buffers when absent (objects deserialized from saves/caches
-        that predate them bypass ``__init__``)."""
-        if "_pose_z1_init" not in self._buffers:
-            self.register_buffer("_pose_z1_init", torch.zeros_like(self._pose_z1.data))
-        if "_pose_z3_init" not in self._buffers:
-            self.register_buffer("_pose_z3_init", torch.zeros_like(self._pose_z3.data))
+        Now: writes that offset as a CONSTANT beam-frame shift into ``_pose_shifts_init`` (all
+        tilts), which the object model subtracts pre-rotation exactly as the old coordinate
+        subtraction did — the emitted geometry is unchanged to float precision. Because the
+        gauge pins the reference tilt to its *baseline* (not to hard zero), a constant nonzero
+        baseline is legal and the learned shifts explore around it. Modulo the object-translation
+        gauge the same geometry is also reachable as ``s_t = s - [R_t^T (0, s_y, s_x)]_{y,x}``,
+        which vanishes at the reference tilt (PLAN §1); the constant form is used here because
+        it reproduces the recorded pre-pose numbers exactly.
+
+        Kept (not deleted) until V2a shows the learned shifts recover the offset on their own.
+        """
+        warnings.warn(
+            "set_rotation_center_offset_A is deprecated; it now writes a constant beam-frame "
+            "shift into the pose baseline. Use set_pose_init(shifts=(drow_A, dcol_A)) and, "
+            "better, learn it with set_learn_pose(shifts=True, ...).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self._ensure_pose_state()
+        with torch.no_grad():
+            self._pose_shifts_init[:, 0] = float(drow_A)
+            self._pose_shifts_init[:, 1] = float(dcol_A)
+            self._pose_shifts.data.copy_(self._pose_shifts_init)
 
     def set_tilt_axis_pose(self, z1_deg: float, z3_deg: float) -> None:
         """Fix the series-wide tilt-axis convention via constant z1/z3 Euler offsets.
 
         ``rot_beam_to_spec(z1, tilt, z3)`` with constant ``z1=-90, z3=+90`` rotates about the
         specimen y axis instead of x — matching tilt series simulated with ASE ``atoms.rotate``
-        (the AuNP datasets). The values survive ``reset()`` (they define the dataset geometry,
-        not a learned correction).
+        (the ARCHIVED AuNP v1-v4 datasets; v5+ fix the tilt axis at the simulation source and
+        must NOT use this). The values survive ``reset()`` (they define the dataset geometry,
+        not a learned correction) and, being baselines, are what the pinned reference tilt is
+        held at when pose refinement is on.
         """
-        self._ensure_pose_init_buffers()
+        self._ensure_pose_state()
         with torch.no_grad():
             self._pose_z1_init.fill_(float(z1_deg))
             self._pose_z3_init.fill_(float(z3_deg))
@@ -537,12 +974,14 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def reset(self) -> None:
         super().reset()
-        self._ensure_pose_init_buffers()
+        self._ensure_pose_state()
         with torch.no_grad():
             self._pose_z1.copy_(self._pose_z1_init)
-            self._pose_dtheta.zero_()
+            self._pose_dtheta.copy_(self._pose_dtheta_init)
             self._pose_z3.copy_(self._pose_z3_init)
-            self._pose_shifts.zero_()
+            self._pose_shifts.copy_(self._pose_shifts_init)
+            self._defocus_offset_A.copy_(self._defocus_offset_init_A)
+        self._refresh_defocus_active()
 
 
 PtychoTomoDatasetType = PtychoTomoDatasetRaster
