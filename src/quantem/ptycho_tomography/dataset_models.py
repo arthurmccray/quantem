@@ -88,7 +88,17 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _learn_defocus: bool
     _reference_tilt_idx: int
     _defocus_active: bool
+    _pose_accum_M: int
+    _pose_accum_count: int
 
+    # the pose/defocus parameters, in one place (gauge masking + gradient accumulation)
+    _POSE_PARAM_NAMES = (
+        "_pose_shifts",
+        "_pose_z1",
+        "_pose_z3",
+        "_pose_dtheta",
+        "_defocus_offset_A",
+    )
     # pose/defocus learn flags, in the order ``_ensure_pose_state`` materializes them
     _POSE_LEARN_FLAGS = (
         "_learn_pose_shifts",
@@ -192,6 +202,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # Gauge: the reference tilt (smallest |tilt|) is pinned; see set_learn_pose().
         self._reference_tilt_idx = int(np.argmin(np.abs(angles)))
         self._defocus_active = False
+        # Pose-gradient accumulation (see set_pose_accum): M = 1 is the per-batch default.
+        self._pose_accum_M = 1
+        self._pose_accum_count = 0
+        self._pose_accum: dict[str, torch.Tensor] | None = None
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -313,6 +327,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 setattr(self, flag, False)
         if "_reference_tilt_idx" not in self.__dict__:
             self._reference_tilt_idx = int(torch.argmin(self._tilt_angles_deg.abs()).item())
+        if "_pose_accum_M" not in self.__dict__:
+            self._pose_accum_M = 1
+        if "_pose_accum_count" not in self.__dict__:
+            self._pose_accum_count = 0
+        if "_pose_accum" not in self.__dict__:
+            self._pose_accum = None
         self._fold_legacy_rot_axis_offset()
         if "_defocus_active" not in self.__dict__:
             self._refresh_defocus_active()
@@ -519,14 +539,19 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._ensure_pose_state()
         return self._defocus_offset_A
 
+    _POSE_INIT_NAMES = (
+        "_pose_shifts_init",
+        "_pose_z1_init",
+        "_pose_z3_init",
+        "_pose_dtheta_init",
+        "_defocus_offset_init_A",
+    )
+
     def _reference_pose_slots(self) -> "tuple[tuple[nn.Parameter, torch.Tensor], ...]":
         """``(parameter, baseline)`` pairs the reference tilt is pinned across."""
-        return (
-            (self._pose_shifts, self._pose_shifts_init),
-            (self._pose_z1, self._pose_z1_init),
-            (self._pose_z3, self._pose_z3_init),
-            (self._pose_dtheta, self._pose_dtheta_init),
-            (self._defocus_offset_A, self._defocus_offset_init_A),
+        return tuple(
+            (getattr(self, p), getattr(self, i))
+            for p, i in zip(self._POSE_PARAM_NAMES, self._POSE_INIT_NAMES)
         )
 
     def zero_reference_pose_grads(self) -> None:
@@ -549,16 +574,122 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             for param, init in self._reference_pose_slots():
                 param.data[i] = init[i]
 
+    def set_pose_accum(
+        self, steps_per_iter: int | None = 1, batches_per_epoch: int | None = None
+    ) -> None:
+        """Accumulate the pose/defocus gradient over M batches and step once per M.
+
+        Why this is the standard path (2026-08-18). A mini-batch of scan positions spread over
+        the whole tilt series gives each tilt only ``batch_size / num_tilts`` positions, and on
+        a low-contrast specimen the resulting per-tilt shift gradient is dominated by *which*
+        positions were drawn: measured on the phantom, median ``|mean| / std = 0.27`` over
+        random batches, with the per-batch sign agreeing with the descent direction only
+        45-70 % of the time. Adam follows the per-batch sign, so it random-walks by ``lr`` per
+        step and nets ~2 % of it — independent of ``lr``. Accumulating first restores the
+        signal-to-noise, and it is what the tomography module effectively does: its pose step
+        sees a whole projection, not a slice of one. (The SNR is data dependent — atomic-
+        resolution AuNP positions carry a reliable sign and converge with per-batch Adam — so
+        this is a robustness fix, not a correction of something previously wrong.)
+
+        Parameters
+        ----------
+        steps_per_iter
+            Pose optimizer steps per epoch. ``1`` (default) = one step per epoch, i.e.
+            ``M = batches_per_epoch``. ``K > 1`` = ``M = batches_per_epoch // K``.
+            ``0`` or ``None`` = per-batch stepping (the pre-2026-08-18 behaviour).
+        batches_per_epoch
+            Length of the training loader. The dataset cannot know the batch size, so the
+            runner passes it; if omitted, any previously set value is reused.
+
+        The accumulator is kept SEPARATE from ``.grad`` because the reconstruction loop zeroes
+        gradients at the start of every batch. Accumulation happens inside
+        :meth:`step_optimizer`, i.e. AFTER the DDP all-reduce, so every rank accumulates the
+        same averaged gradient and their sums agree; the reference-tilt mask is applied to the
+        accumulated gradient just before the step.
+        """
+        self._ensure_pose_state()
+        if not steps_per_iter:
+            self._pose_accum_M = 1
+        else:
+            if batches_per_epoch is None:
+                batches_per_epoch = int(getattr(self, "_pose_batches_per_epoch", 0)) or 1
+            self._pose_batches_per_epoch = int(batches_per_epoch)
+            self._pose_accum_M = max(1, int(batches_per_epoch) // max(1, int(steps_per_iter)))
+        self._pose_accum = None
+        self._pose_accum_count = 0
+
+    @property
+    def pose_accum_steps(self) -> int:
+        """Batches accumulated per pose optimizer step (1 = step every batch)."""
+        self._ensure_pose_state()
+        return int(self._pose_accum_M)
+
+    def zero_optimizer_grad(self) -> None:
+        """Per-batch gradient zeroing — deliberately a plain pass-through.
+
+        The accumulator lives outside ``.grad`` (see :meth:`set_pose_accum`), so the loop's
+        per-batch zeroing is exactly what we want: every batch contributes its own clean
+        gradient, which :meth:`step_optimizer` adds to the accumulator before it is discarded.
+        Overridden only to make that contract explicit — moving the accumulation here would
+        read the PREVIOUS batch's gradient, which is zeroed before the backward, not after it.
+        """
+        super().zero_optimizer_grad()
+
     def step_optimizer(self) -> None:
         """Optimizer step with the reference tilt's pose held at its baseline (gauge).
 
         Zeroing the gradient alone is not enough — a stateful optimizer (Adam moments, weight
         decay) can still move a parameter with a zero gradient — so the reference pose is also
         written back after the step.
+
+        With :meth:`set_pose_accum` active (``M > 1``) this is called every batch but only
+        *steps* every M-th call, using the MEAN of the M accumulated gradients.
         """
+        if self._pose_accum_M <= 1:
+            self.zero_reference_pose_grads()
+            super().step_optimizer()
+            self.pin_reference_pose()
+            return
+
+        params = {name: getattr(self, name) for name in self._POSE_PARAM_NAMES}
+        if self._pose_accum is None:
+            self._pose_accum = {}
+        for name, param in params.items():
+            if param.grad is None:
+                continue
+            acc = self._pose_accum.get(name)
+            if acc is None or acc.shape != param.grad.shape or acc.device != param.grad.device:
+                acc = torch.zeros_like(param.grad)
+            self._pose_accum[name] = acc + param.grad.detach()
+        self._pose_accum_count += 1
+        if self._pose_accum_count < self._pose_accum_M:
+            return
+
+        for name, param in params.items():
+            acc = self._pose_accum.get(name)
+            if acc is None:
+                continue
+            param.grad = acc / float(self._pose_accum_count)
         self.zero_reference_pose_grads()
         super().step_optimizer()
         self.pin_reference_pose()
+        self._pose_accum = None
+        self._pose_accum_count = 0
+
+    def flush_pose_accum(self) -> bool:
+        """Step now on a partial accumulation (end of an epoch that did not fill M)."""
+        if self._pose_accum_M <= 1 or not self._pose_accum_count:
+            return False
+        for name in self._POSE_PARAM_NAMES:
+            acc = (self._pose_accum or {}).get(name)
+            if acc is not None:
+                getattr(self, name).grad = acc / float(self._pose_accum_count)
+        self.zero_reference_pose_grads()
+        super().step_optimizer()
+        self.pin_reference_pose()
+        self._pose_accum = None
+        self._pose_accum_count = 0
+        return True
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """PPLR groups: the base's ``descan``/``scan_positions`` plus the pose/defocus groups.
@@ -1029,6 +1160,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts.copy_(self._pose_shifts_init)
             self._defocus_offset_A.copy_(self._defocus_offset_init_A)
         self._refresh_defocus_active()
+        self._pose_accum = None
+        self._pose_accum_count = 0
 
 
 PtychoTomoDatasetType = PtychoTomoDatasetRaster

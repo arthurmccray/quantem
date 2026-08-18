@@ -829,3 +829,123 @@ class TestPoseSerialization:
         assert loaded.get_optimization_parameters() == {}
         assert loaded._defocus_offset_A.shape == (loaded.num_tilts,)
         loaded.reset()
+
+
+class TestPoseGradientAccumulation:
+    """Pose/defocus gradient accumulation (2026-08-18).
+
+    A mini-batch of scan positions spread over the tilt series gives each tilt too few
+    positions for a reliable per-tilt shift gradient on a low-contrast specimen (measured
+    |mean|/std = 0.27 on the phantom), so Adam random-walks by ``lr`` per batch. Accumulating
+    over M batches and stepping once restores the signal, and matches what the tomography
+    module effectively does (its pose step sees a whole projection).
+    """
+
+    def _wrap(self, steps_per_iter: int | None = 1, batches_per_epoch=4, lr=0.1):
+        from quantem.core.ml.optimizer_mixin import OptimizerParams
+
+        w = _pose_wrapper()
+        w.set_learn_pose(shifts=True, z1=True, z3=False, dtheta=False)
+        w.set_learn_defocus(True)
+        w.set_pose_accum(steps_per_iter=steps_per_iter, batches_per_epoch=batches_per_epoch)
+        w.set_optimizer(OptimizerParams.Adam(lr=lr))
+        return w
+
+    def test_M_is_batches_per_epoch_over_steps(self):
+        w = _pose_wrapper()
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=289)
+        assert w.pose_accum_steps == 289
+        w.set_pose_accum(steps_per_iter=4, batches_per_epoch=289)
+        assert w.pose_accum_steps == 72
+        w.set_pose_accum(steps_per_iter=None)
+        assert w.pose_accum_steps == 1  # per-batch, the pre-2026-08-18 behaviour
+        w.set_pose_accum(steps_per_iter=0, batches_per_epoch=289)
+        assert w.pose_accum_steps == 1
+
+    def test_M_batches_give_exactly_one_update(self):
+        """M-1 calls must not move the parameter; the M-th must."""
+        m = 4
+        w = self._wrap(batches_per_epoch=m)
+        assert w.pose_accum_steps == m
+        start = w._pose_shifts.detach().clone()
+        for k in range(m - 1):
+            w._pose_shifts.grad = torch.full_like(w._pose_shifts, float(k + 1))
+            w.step_optimizer()
+            assert torch.equal(w._pose_shifts.detach(), start), f"moved on batch {k + 1} of {m}"
+        w._pose_shifts.grad = torch.full_like(w._pose_shifts, float(m))
+        w.step_optimizer()
+        assert not torch.equal(w._pose_shifts.detach(), start)
+
+    def test_update_equals_the_mean_gradient_step(self):
+        """The accumulated step must equal a single step taken on the MEAN of the M gradients."""
+        m = 4
+        grads = [1.0, 3.0, -2.0, 6.0]
+        mean = sum(grads) / m
+
+        w_acc = self._wrap(batches_per_epoch=m)
+        start = w_acc._pose_shifts.detach().clone()
+        for g in grads:
+            w_acc._pose_shifts.grad = torch.full_like(w_acc._pose_shifts, g)
+            w_acc.step_optimizer()
+        accumulated = w_acc._pose_shifts.detach().clone()
+
+        w_ref = self._wrap(steps_per_iter=None)  # per-batch, one step
+        assert torch.equal(w_ref._pose_shifts.detach(), start)
+        w_ref._pose_shifts.grad = torch.full_like(w_ref._pose_shifts, mean)
+        w_ref.step_optimizer()
+        assert torch.allclose(accumulated, w_ref._pose_shifts.detach(), atol=1e-7)
+
+    def test_reference_tilt_stays_pinned_under_accumulation(self):
+        m = 3
+        w = self._wrap(batches_per_epoch=m)
+        for _ in range(m):
+            for param, _init in w._reference_pose_slots():
+                param.grad = torch.ones_like(param)
+            w.step_optimizer()
+        others = [t for t in range(w.num_tilts) if t != REF_TILT]
+        enabled = {"_pose_shifts", "_pose_z1", "_defocus_offset_A"}  # per self._wrap
+        for name, (param, init) in zip(w._POSE_PARAM_NAMES, w._reference_pose_slots()):
+            assert torch.equal(param.data[REF_TILT], init[REF_TILT]), f"{name} reference moved"
+            if name in enabled:
+                assert (param.data[others] != init[others]).all(), f"{name} did not move"
+            else:  # not in the optimizer, so it must not move at all
+                assert torch.equal(param.data, init), f"{name} moved but is not learnable"
+
+    def test_all_pose_slots_accumulate(self):
+        m = 2
+        w = self._wrap(batches_per_epoch=m)
+        starts = {n: getattr(w, n).detach().clone() for n in w._POSE_PARAM_NAMES}
+        for _ in range(m):
+            for name in w._POSE_PARAM_NAMES:
+                p = getattr(w, name)
+                p.grad = torch.ones_like(p)
+            w.step_optimizer()
+        for name in ("_pose_shifts", "_pose_z1", "_defocus_offset_A"):  # the enabled ones
+            assert not torch.equal(getattr(w, name).detach(), starts[name]), name
+
+    def test_flush_steps_a_partial_accumulation(self):
+        w = self._wrap(batches_per_epoch=8)
+        start = w._pose_shifts.detach().clone()
+        for _ in range(3):  # only 3 of 8
+            w._pose_shifts.grad = torch.full_like(w._pose_shifts, 2.0)
+            w.step_optimizer()
+        assert torch.equal(w._pose_shifts.detach(), start)
+        assert w.flush_pose_accum() is True
+        assert not torch.equal(w._pose_shifts.detach(), start)
+        assert w.flush_pose_accum() is False  # nothing left to flush
+
+    def test_per_batch_default_is_unchanged(self):
+        """M = 1 must behave exactly as before the accumulation work."""
+        w = self._wrap(steps_per_iter=None)
+        start = w._pose_shifts.detach().clone()
+        w._pose_shifts.grad = torch.ones_like(w._pose_shifts)
+        w.step_optimizer()
+        assert not torch.equal(w._pose_shifts.detach(), start)
+
+    def test_reset_clears_the_accumulator(self):
+        w = self._wrap(batches_per_epoch=4)
+        w._pose_shifts.grad = torch.ones_like(w._pose_shifts)
+        w.step_optimizer()
+        assert w._pose_accum_count == 1
+        w.reset()
+        assert w._pose_accum_count == 0 and w._pose_accum is None
