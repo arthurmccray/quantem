@@ -148,3 +148,52 @@ def test_patch_data_fields():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_float64_scalar_angles_keep_float64_precision():
+    """A PYTHON-float angle must be built directly in the requested dtype (2026-08-20 audit).
+
+    The old path went through `torch.tensor(float(a))` — the float32 default — and then
+    `.to(float64)`, which cannot recover what float32 already threw away: 37.123456789012345 deg
+    arrives as 37.12345504760742, off by 1.7e-6 deg, and every matrix element is then wrong by
+    ~3e-8 in a computation the caller asked to be done in float64.
+
+    Note what does NOT catch this: orthogonality and R(θ)R(−θ) = I hold for ANY θ, so a round
+    trip is exact even on the wrong angle. The test has to compare against the angle itself.
+    """
+    import math
+
+    theta = 37.123456789012345
+    r_scalar = rot_beam_to_spec(0.0, theta, 0.0, dtype=torch.float64)[0]
+    assert r_scalar.dtype is torch.float64
+
+    # 1. a scalar angle must agree BIT-FOR-BIT with the same angle passed as a float64 tensor
+    r_tensor = rot_beam_to_spec(
+        torch.tensor([0.0], dtype=torch.float64),
+        torch.tensor([theta], dtype=torch.float64),
+        torch.tensor([0.0], dtype=torch.float64),
+        dtype=torch.float64,
+    )[0]
+    assert torch.equal(r_scalar, r_tensor)
+
+    # 2. and with a double-precision reference for a pure tilt: rows/cols (z, y, x), the y-z
+    #    block carries cos/sin(theta) (sign convention read off test_pure_tilt_90_permutation)
+    c, sn = math.cos(math.radians(theta)), math.sin(math.radians(theta))
+    assert abs(float(r_scalar[0, 0]) - c) < 1e-15
+    assert abs(abs(float(r_scalar[0, 1])) - sn) < 1e-15
+    assert abs(abs(float(r_scalar[1, 0])) - sn) < 1e-15
+    assert abs(float(r_scalar[1, 1]) - c) < 1e-15
+
+    # 3. all three slots go through the same coercion, not just the tilt
+    z1, z3 = 11.111111111111111, -7.7777777777777
+    r_zzz = rot_beam_to_spec(z1, theta, z3, dtype=torch.float64)[0]
+    r_zzz_t = rot_beam_to_spec(
+        torch.tensor([z1], dtype=torch.float64),
+        torch.tensor([theta], dtype=torch.float64),
+        torch.tensor([z3], dtype=torch.float64),
+        dtype=torch.float64,
+    )[0]
+    assert torch.equal(r_zzz, r_zzz_t)
+
+    # 4. the default dtype is untouched
+    assert rot_beam_to_spec(0.0, theta, 0.0).dtype is torch.float32

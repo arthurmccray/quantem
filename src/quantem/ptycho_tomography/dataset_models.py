@@ -70,7 +70,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _last_window_dz_A: torch.Tensor | None = None
     _last_probe_dz_A: torch.Tensor | None = None
     _scan_center_px: torch.Tensor
-    _rot_axis_offset_A: torch.Tensor
     _pose_z1_init: torch.Tensor
     _pose_z3_init: torch.Tensor
     _pose_dtheta_init: torch.Tensor
@@ -294,7 +293,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         Objects deserialized from a save/cache written before a given slot existed bypass
         ``__init__`` entirely (gotcha #23), so every pose access funnels through here. It also
         folds a legacy ``_rot_axis_offset_A`` buffer into ``_pose_shifts_init`` exactly once
-        (see :meth:`set_rotation_center_offset_A`), so old caches keep the geometry the numbers
+        (see :meth:`_fold_legacy_rot_axis_offset`), so old caches keep the geometry the numbers
         recorded with them were measured at.
         """
         real_dtype = getattr(torch, config.get("dtype_real"))
@@ -351,22 +350,26 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def _fold_legacy_rot_axis_offset(self) -> None:
         """Fold a legacy ``_rot_axis_offset_A`` buffer into the pose-shift baseline, once.
 
-        The retired rotation-center hack subtracted a constant beam-frame ``(row, col)`` offset
-        from the patch coordinates AND from the slab-window offset — exactly what a constant
-        per-tilt ``_pose_shifts`` entry now does (the object model subtracts ``shifts_A`` from
-        the beam-frame coordinates before rotating, ``object_models.py``). So the fold is an
-        identity on the emitted geometry. The legacy buffer is zeroed afterwards, making this
-        idempotent; nothing writes it any more.
+        BACK-COMPAT ONLY (2026-08-20). The retired ``set_rotation_center_offset_A`` hack
+        subtracted a constant beam-frame ``(row, col)`` offset from the patch coordinates AND
+        from the slab-window offset — exactly what a constant per-tilt ``_pose_shifts`` entry
+        now does (the object model subtracts ``shifts_A`` from the beam-frame coordinates
+        before rotating, ``object_models.py``), so the fold is an identity on the emitted
+        geometry. Nothing creates or writes the buffer any more: it exists only in caches and
+        saves written before the hack was removed. It is dropped after folding, which makes
+        this idempotent and keeps the retired name out of anything re-serialized from here.
         """
-        self._ensure_rot_offset_buffer()
-        off = self._rot_axis_offset_A
-        if not bool((off != 0).any()):
+        off = self._buffers.get("_rot_axis_offset_A")
+        if off is None:
             return
-        with torch.no_grad():
-            add = off.to(device=self._pose_shifts_init.device, dtype=self._pose_shifts_init.dtype)
-            self._pose_shifts_init.add_(add.view(1, 2))
-            self._pose_shifts.data.add_(add.view(1, 2))
-            off.zero_()
+        if bool((off != 0).any()):
+            with torch.no_grad():
+                add = off.to(
+                    device=self._pose_shifts_init.device, dtype=self._pose_shifts_init.dtype
+                )
+                self._pose_shifts_init.add_(add.view(1, 2))
+                self._pose_shifts.data.add_(add.view(1, 2))
+        del self._buffers["_rot_axis_offset_A"]
 
     def _refresh_defocus_active(self) -> None:
         """Cache whether the probe needs the per-tilt defocus pre-propagation at all.
@@ -459,7 +462,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         :meth:`step_optimizer`).
 
         Note that pinning loses no physical degree of freedom. The rotation-center error the
-        retired :meth:`set_rotation_center_offset_A` corrected is a constant beam-frame shift
+        removed ``set_rotation_center_offset_A`` hack corrected is a constant beam-frame shift
         ``s`` at every tilt; modulo the object-translation gauge that is equivalent to the
         per-tilt shifts ``s_t = s - [R_t^T (0, s_y, s_x)]_{y,x}`` (plus the corresponding
         beam-frame z component, which the defocus offset carries), which vanishes at the
@@ -467,7 +470,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
         The reference tilt is restored to its *baseline*, not hard-zeroed, so a nonzero
         baseline set by :meth:`set_tilt_axis_pose` (z1 = -90 / z3 = +90 for the archived AuNP
-        v1-v4 series) or by the deprecated rotation-center wrapper stays intact; with the
+        v1-v4 series) or folded in from a legacy cache stays intact; with the
         default zero baselines this is literally "re-zero the reference tilt".
 
         Survives ``reset()`` and is serialized (plain attributes on the module).
@@ -1151,49 +1154,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # shift differentiable through one well-defined seam. The retired
         # ``_rot_axis_offset_A`` subtraction lived here; it is folded into the pose shifts.
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
-
-    def _ensure_rot_offset_buffer(self) -> None:
-        """Create the rotation-axis offset buffer when absent (cache-loaded objects bypass
-        ``__init__``)."""
-        if "_rot_axis_offset_A" not in self._buffers:
-            real_dtype = getattr(torch, config.get("dtype_real"))
-            self.register_buffer(
-                "_rot_axis_offset_A", torch.zeros(2, dtype=real_dtype, device=self.device)
-            )
-
-    def set_rotation_center_offset_A(self, drow_A: float, dcol_A: float) -> None:
-        """DEPRECATED (2026-08-17) — a thin wrapper over the pose shifts; use ``set_pose_init``.
-
-        Was: shift the beam-frame coordinate origin (== the tilt-axis position) by a known
-        offset in Å from the scan-grid center, because abTEM ``GridScan`` construction leaves
-        the scan-pattern center short of the simulation cell center (the true rotation center)
-        by up to half a scan step per axis — a rotation-center error producing arc/"banana"
-        atom artifacts growing with scan step (0.30/0.49/0.75/0.99 Å at 0.6/1.0/1.5/2.0 Å
-        steps). Pass the (row, col) offset FROM the scan center TO the true rotation center.
-
-        Now: writes that offset as a CONSTANT beam-frame shift into ``_pose_shifts_init`` (all
-        tilts), which the object model subtracts pre-rotation exactly as the old coordinate
-        subtraction did — the emitted geometry is unchanged to float precision. Because the
-        gauge pins the reference tilt to its *baseline* (not to hard zero), a constant nonzero
-        baseline is legal and the learned shifts explore around it. Modulo the object-translation
-        gauge the same geometry is also reachable as ``s_t = s - [R_t^T (0, s_y, s_x)]_{y,x}``,
-        which vanishes at the reference tilt (PLAN §1); the constant form is used here because
-        it reproduces the recorded pre-pose numbers exactly.
-
-        Kept (not deleted) until V2a shows the learned shifts recover the offset on their own.
-        """
-        warnings.warn(
-            "set_rotation_center_offset_A is deprecated; it now writes a constant beam-frame "
-            "shift into the pose baseline. Use set_pose_init(shifts=(drow_A, dcol_A)) and, "
-            "better, learn it with set_learn_pose(shifts=True, ...).",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._ensure_pose_state()
-        with torch.no_grad():
-            self._pose_shifts_init[:, 0] = float(drow_A)
-            self._pose_shifts_init[:, 1] = float(dcol_A)
-            self._pose_shifts.data.copy_(self._pose_shifts_init)
 
     def set_tilt_axis_pose(self, z1_deg: float, z3_deg: float) -> None:
         """Fix the series-wide tilt-axis convention via constant z1/z3 Euler offsets.

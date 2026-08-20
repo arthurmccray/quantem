@@ -71,10 +71,18 @@ def rot_beam_to_spec(
     tomography module's Z-X-Z convention; a pure tilt series is ``rot_beam_to_spec(0, tilts, 0)``.
     Scalars and 1D tensors broadcast together.
     """
+    want = dtype or torch.float32
     angles = []
     for a in (z1_deg, x_deg, z3_deg):
-        t = a if isinstance(a, torch.Tensor) else torch.tensor(float(a))
-        angles.append(torch.atleast_1d(t.to(device=device, dtype=dtype or torch.float32)))
+        # Build a scalar angle DIRECTLY in the requested dtype. `torch.tensor(float(a))` would
+        # land in the float32 default and `.to(float64)` cannot recover what that already threw
+        # away — worth 6.6e-8 in a float64 validation (2026-08-20 design audit).
+        t = (
+            a.to(device=device, dtype=want)
+            if isinstance(a, torch.Tensor)
+            else torch.tensor(float(a), device=device, dtype=want)
+        )
+        angles.append(torch.atleast_1d(t))
     z1, x, z3 = torch.broadcast_tensors(*angles)
     return _rz(-z1) @ _rx(x) @ _rz(-z3)
 

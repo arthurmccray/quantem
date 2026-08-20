@@ -647,6 +647,18 @@ class TestPosePlumbing:
 
 
 class TestLegacyRotationCenterShim:
+    """`set_rotation_center_offset_A` / `_rot_axis_offset_A` were REMOVED 2026-08-20.
+
+    All that survives is the load-time fold-in: a cache or save written before the removal can
+    still carry a `_rot_axis_offset_A` buffer, and it must keep emitting the geometry the
+    numbers recorded with it were measured at.
+    """
+
+    @staticmethod
+    def _load_legacy_buffer(w, off):
+        """Emulate deserializing a pre-2026-08-20 cache: only the legacy buffer is present."""
+        w.register_buffer("_rot_axis_offset_A", off.clone())
+
     def _legacy_coords(self, w, batch):
         """The pre-pose coordinate path: (grid - center) * sampling - _rot_axis_offset_A."""
         center = w._scan_center_px
@@ -664,19 +676,18 @@ class TestLegacyRotationCenterShim:
     def test_loaded_legacy_buffer_reproduces_the_old_coordinates(self):
         w = _pose_wrapper()
         off = torch.tensor([0.99, -0.49])
-        # emulate a cache written before the pose work: only the legacy buffer is set
-        w._ensure_rot_offset_buffer()
-        with torch.no_grad():
-            w._rot_axis_offset_A.copy_(off)
+        self._load_legacy_buffer(w, off)
         batch = torch.arange(w.num_gpts)
         legacy = self._legacy_coords(w, batch) - off  # what the old code emitted
         payload, *_ = w.forward(batch, PAD)  # first use -> folds the buffer
         assert payload.shifts_A is not None
         effective = payload.coords_yx_A - payload.shifts_A[:, None, None, :]
         assert torch.allclose(effective, legacy, atol=1e-6)
-        # folded exactly once, into the baseline, and the legacy buffer is retired
+        # folded exactly once, into the baseline, and the legacy buffer is dropped entirely
+        # (so nothing re-serialized from here carries the retired name)
         assert torch.allclose(w._pose_shifts_init, off.expand(w.num_tilts, 2))
-        assert torch.equal(w._rot_axis_offset_A, torch.zeros(2))
+        assert "_rot_axis_offset_A" not in w._buffers
+        assert not hasattr(w, "_rot_axis_offset_A")
         w.forward(batch, PAD)
         assert torch.allclose(w._pose_shifts_init, off.expand(w.num_tilts, 2))
 
@@ -684,9 +695,7 @@ class TestLegacyRotationCenterShim:
         w = _pose_wrapper()
         off = torch.tensor([0.99, -0.49])
         w.set_slab_window(True)
-        w._ensure_rot_offset_buffer()
-        with torch.no_grad():
-            w._rot_axis_offset_A.copy_(off)
+        self._load_legacy_buffer(w, off)
         batch = torch.arange(w.num_gpts)
         center, samp = w._scan_center_px, w.obj_sampling
         pos = w.scan_positions_px[batch]
@@ -698,15 +707,27 @@ class TestLegacyRotationCenterShim:
         assert payload.window_dz_A is not None
         assert torch.allclose(payload.window_dz_A, legacy_dz, atol=1e-6)
 
-    def test_deprecated_wrapper_writes_the_pose_baseline(self):
+    def test_folded_offset_survives_reset_as_the_hack_did(self):
         w = _pose_wrapper()
-        with pytest.deprecated_call():
-            w.set_rotation_center_offset_A(0.99, -0.49)
-        expected = torch.tensor([0.99, -0.49]).expand(w.num_tilts, 2)
+        off = torch.tensor([0.99, -0.49])
+        self._load_legacy_buffer(w, off)
+        w.forward(torch.arange(w.num_gpts), PAD)  # folds
+        expected = off.expand(w.num_tilts, 2)
         assert torch.allclose(w._pose_shifts_init, expected)
         assert torch.allclose(w._pose_shifts, expected)
         w.reset()
-        assert torch.allclose(w._pose_shifts, expected)  # survives reset, as the hack did
+        assert torch.allclose(w._pose_shifts, expected)  # baseline, as the hack was
+
+    def test_no_legacy_buffer_is_a_no_op(self):
+        w = _pose_wrapper()
+        w.forward(torch.arange(w.num_gpts), PAD)
+        assert "_rot_axis_offset_A" not in w._buffers
+        assert torch.count_nonzero(w._pose_shifts_init) == 0
+
+    def test_the_removed_api_is_gone(self):
+        w = _pose_wrapper()
+        assert not hasattr(w, "set_rotation_center_offset_A")
+        assert not hasattr(w, "_ensure_rot_offset_buffer")
 
 
 class TestDefocusOffset:
