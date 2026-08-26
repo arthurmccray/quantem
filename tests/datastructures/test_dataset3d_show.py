@@ -15,7 +15,7 @@ def dataset_with_10_frames():
 
 @pytest.fixture
 def dataset_with_100_frames():
-    """Create a Dataset3d with 100 frames for testing default max behavior."""
+    """Create a Dataset3d with 100 frames for testing default max_indices behavior."""
     return Dataset3d.from_array(np.random.rand(100, 8, 8))
 
 
@@ -40,8 +40,8 @@ class TestShowInputValidation:
             ({"start": 5, "end": 5}, "No frames to display"),
             ({"ncols": 0}, "ncols must be >= 1"),
             ({"ncols": -1}, "ncols must be >= 1"),
-            ({"max": 0}, "max must be >= 1"),
-            ({"max": -1}, "max must be >= 1"),
+            ({"max_indices": 0}, "max_indices must be >= 1"),
+            ({"max_indices": -1}, "max_indices must be >= 1"),
         ],
     )
     def test_raises_value_error(self, dataset_with_10_frames, kwargs, match):
@@ -50,16 +50,16 @@ class TestShowInputValidation:
 
 
 class TestShowFrameSelection:
-    """Test frame selection with start, end, step, max combinations."""
+    """Test frame selection with start, end, step, max_indices combinations."""
 
     @pytest.mark.parametrize(
         "kwargs,expected_indices",
         [
             ({}, list(range(20))),
-            ({"max": 5}, [0, 1, 2, 3, 4]),
-            ({"max": None}, list(range(100))),
+            ({"max_indices": 5}, [0, 1, 2, 3, 4]),
+            ({"max_indices": None}, list(range(100))),
             ({"start": 90}, list(range(90, 100))),
-            ({"start": 95, "max": 3}, [95, 96, 97]),
+            ({"start": 95, "max_indices": 3}, [95, 96, 97]),
         ],
     )
     def test_large_dataset(self, dataset_with_100_frames, kwargs, expected_indices):
@@ -70,7 +70,7 @@ class TestShowFrameSelection:
     @pytest.mark.parametrize(
         "kwargs,expected_indices",
         [
-            # Default shows all frames (< max)
+            # Default shows all frames (< max_indices)
             ({}, list(range(10))),
             # Start and end
             ({"start": 5}, [5, 6, 7, 8, 9]),
@@ -80,13 +80,13 @@ class TestShowFrameSelection:
             ({"step": 3}, [0, 3, 6, 9]),
             ({"start": 2, "end": 8, "step": 2}, [2, 4, 6]),
             # Negative start index
-            ({"start": -1, "max": 1}, [9]),
-            ({"start": -3, "max": 2}, [7, 8]),
+            ({"start": -1, "max_indices": 1}, [9]),
+            ({"start": -3, "max_indices": 2}, [7, 8]),
             # Negative step (reverse order)
             ({"start": 9, "step": -1}, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]),
             ({"start": 9, "end": 4, "step": -1}, [9, 8, 7, 6, 5]),
             ({"start": 9, "step": -2}, [9, 7, 5, 3, 1]),
-            ({"start": 9, "step": -1, "max": 3}, [9, 8, 7]),
+            ({"start": 9, "step": -1, "max_indices": 3}, [9, 8, 7]),
         ],
     )
     def test_small_dataset(self, dataset_with_10_frames, kwargs, expected_indices):

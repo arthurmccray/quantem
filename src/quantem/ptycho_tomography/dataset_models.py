@@ -50,9 +50,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     # PtychoTomography.forward_operator, never serialized non-None
     _last_window_dz_A: torch.Tensor | None = None
     _scan_center_px: torch.Tensor
-    _rot_axis_offset_A: torch.Tensor
-    _pose_z1_init: torch.Tensor
-    _pose_z3_init: torch.Tensor
     _pose_z1: nn.Parameter
     _pose_dtheta: nn.Parameter
     _pose_z3: nn.Parameter
@@ -134,11 +131,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
         # relative to this point (see PtychoTomoPatchData).
         self.register_buffer("_scan_center_px", torch.full((2,), torch.nan, dtype=real_dtype))
-        # Baseline pose the parameters reset to (default zeros). set_tilt_axis_pose() uses this
-        # to fix a dataset-wide tilt-AXIS convention (e.g. z1=-90, z3=+90 turns the ZXZ x-tilt
-        # into a tilt about y — the ASE-simulated AuNP series' convention, found 2026-07-13).
-        self.register_buffer("_pose_z1_init", torch.zeros(num_tilts, dtype=real_dtype))
-        self.register_buffer("_pose_z3_init", torch.zeros(num_tilts, dtype=real_dtype))
 
     @staticmethod
     def _tilt_array_3d(ds: PtychographyDatasetRaster) -> np.ndarray:
@@ -446,11 +438,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         positions = self.scan_positions_px[batch_indices]  # (B, 2) un-rounded px
         y_c = (positions[:, 0] - center[0]) * float(samp[0])
         x_c = (positions[:, 1] - center[1]) * float(samp[1])
-        self._ensure_rot_offset_buffer()
-        off = self._rot_axis_offset_A
-        if bool((off != 0).any()):
-            y_c = y_c - off[0]
-            x_c = x_c - off[1]
         r = rotations.to(device=y_c.device, dtype=y_c.dtype)
         r00 = r[:, 0, 0]
         assert bool((r00.abs() > 0.1).all()), (
@@ -480,68 +467,14 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         samp = self.obj_sampling
         rows_A = (rows - center[0]) * float(samp[0])
         cols_A = (cols - center[1]) * float(samp[1])
-        self._ensure_rot_offset_buffer()
-        off = self._rot_axis_offset_A
-        if bool((off != 0).any()):
-            rows_A = rows_A - off[0]
-            cols_A = cols_A - off[1]
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
-
-    def _ensure_rot_offset_buffer(self) -> None:
-        """Create the rotation-axis offset buffer when absent (cache-loaded objects bypass
-        ``__init__``)."""
-        if "_rot_axis_offset_A" not in self._buffers:
-            real_dtype = getattr(torch, config.get("dtype_real"))
-            self.register_buffer(
-                "_rot_axis_offset_A", torch.zeros(2, dtype=real_dtype, device=self.device)
-            )
-
-    def set_rotation_center_offset_A(self, drow_A: float, dcol_A: float) -> None:
-        """TEMPORARY (2026-07-15) — REMOVE once proper pose optimization lands.
-
-        Shift the beam-frame coordinate origin (== the tilt-axis position) by a known offset in
-        Å from the scan-grid center. Needed because abTEM ``GridScan`` construction leaves the
-        scan-pattern center short of the simulation cell center (the true rotation center) by up
-        to half a scan step per axis — a rotation-center error that produces arc/"banana" atom
-        artifacts growing with scan step (measured: 0.30/0.49/0.75/0.99 Å at 0.6/1.0/1.5/2.0 Å
-        steps). Pass the (row, col) offset FROM the scan center TO the true rotation center.
-        Survives ``reset()`` (dataset geometry, not a learned correction).
-        """
-        self._ensure_rot_offset_buffer()
-        with torch.no_grad():
-            self._rot_axis_offset_A[0] = float(drow_A)
-            self._rot_axis_offset_A[1] = float(dcol_A)
-
-    def _ensure_pose_init_buffers(self) -> None:
-        """Create the pose-baseline buffers when absent (objects deserialized from saves/caches
-        that predate them bypass ``__init__``)."""
-        if "_pose_z1_init" not in self._buffers:
-            self.register_buffer("_pose_z1_init", torch.zeros_like(self._pose_z1.data))
-        if "_pose_z3_init" not in self._buffers:
-            self.register_buffer("_pose_z3_init", torch.zeros_like(self._pose_z3.data))
-
-    def set_tilt_axis_pose(self, z1_deg: float, z3_deg: float) -> None:
-        """Fix the series-wide tilt-axis convention via constant z1/z3 Euler offsets.
-
-        ``rot_beam_to_spec(z1, tilt, z3)`` with constant ``z1=-90, z3=+90`` rotates about the
-        specimen y axis instead of x — matching tilt series simulated with ASE ``atoms.rotate``
-        (the AuNP datasets). The values survive ``reset()`` (they define the dataset geometry,
-        not a learned correction).
-        """
-        self._ensure_pose_init_buffers()
-        with torch.no_grad():
-            self._pose_z1_init.fill_(float(z1_deg))
-            self._pose_z3_init.fill_(float(z3_deg))
-            self._pose_z1.copy_(self._pose_z1_init)
-            self._pose_z3.copy_(self._pose_z3_init)
 
     def reset(self) -> None:
         super().reset()
-        self._ensure_pose_init_buffers()
         with torch.no_grad():
-            self._pose_z1.copy_(self._pose_z1_init)
+            self._pose_z1.zero_()
             self._pose_dtheta.zero_()
-            self._pose_z3.copy_(self._pose_z3_init)
+            self._pose_z3.zero_()
             self._pose_shifts.zero_()
 
 
