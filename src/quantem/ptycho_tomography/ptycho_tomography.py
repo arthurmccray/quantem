@@ -46,6 +46,11 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     # cached (key, ROI k² grid) for the slab-window probe pre-propagation (built lazily per
     # (roi_shape, sampling); plain attr, not module state)
     _window_k2_cache: "tuple[tuple[int, int, float, float], torch.Tensor] | None" = None
+    # pose-refinement state carried across save/from_file (the dataset itself is not saved):
+    # stashed by ``save`` like the base ``_dataset_metadata``, re-applied by ``from_file``
+    _pose_metadata: "dict[str, Any] | None" = None
+    # per-iteration learned-shift history (rank 0), appended by ``_record_iter``
+    _pose_history: "list[dict[str, Any]] | None" = None
 
     @classmethod
     def from_models(  # pyright: ignore[reportIncompatibleMethodOverride] -- narrowed model types
@@ -114,7 +119,78 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             raise TypeError(f"loaded object is not a PtychoTomography, got {type(pt)}")
         if dset is not None:
             pt.dset.implicit_object = pt.obj_model.is_implicit
+            if pt._pose_metadata is not None:
+                pt._apply_pose_metadata(pt._pose_metadata)
         return pt
+
+    # region --- pose refinement state (save / resume) ---
+    def _collect_pose_metadata(self) -> "dict[str, Any]":
+        dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        return {
+            "pose_shifts": dset.pose_shifts_A.cpu(),
+            "pose_shifts_init": dset.pose_shifts_init_A.cpu(),
+            "learn_pose_shifts": bool(dset.learn_pose_shifts),
+            "reference_tilt_idx": int(dset.reference_tilt_idx),
+        }
+
+    def _apply_pose_metadata(self, meta: "dict[str, Any]") -> None:
+        """Re-apply a saved pose state onto the (rebuilt) attached wrapper.
+
+        A tilt-count mismatch is an error, not a warning: a resumed run silently starting from
+        zero shifts is exactly the failure this state exists to prevent.
+        """
+        dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        shifts = torch.as_tensor(meta["pose_shifts"])
+        if tuple(shifts.shape) != (dset.num_tilts, 2):
+            raise ValueError(
+                f"saved pose shifts have shape {tuple(shifts.shape)} but the attached wrapper "
+                f"has {dset.num_tilts} tilts"
+            )
+        dset.reference_tilt_idx = int(meta["reference_tilt_idx"])
+        dset.set_pose_shift_init(meta["pose_shifts_init"])
+        with torch.no_grad():
+            dset._pose_shifts.copy_(shifts.to(dset._pose_shifts.device, dset._pose_shifts.dtype))
+        dset.set_learn_pose_shifts(bool(meta["learn_pose_shifts"]))
+
+    @property
+    def pose_history(self) -> "list[dict[str, Any]]":
+        """Per-iteration ``{iteration, loss, shifts_A (num_tilts, 2) Å, lr, pose_steps}`` records
+        (rank 0), recorded whenever shifts were being learned."""
+        return list(self._pose_history or [])
+
+    def _record_iter(self, iter_loss: float, autograd: bool) -> None:
+        super()._record_iter(iter_loss, autograd)
+        dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        if not getattr(dset, "learn_pose_shifts", False):
+            return
+        if self._pose_history is None:
+            self._pose_history = []
+        self._pose_history.append(
+            {
+                "iteration": int(self.num_iters),
+                "loss": float(iter_loss),
+                "shifts_A": dset.pose_shifts_A.cpu(),
+                "lr": float(dset.get_current_lr()),
+                "pose_steps": int(dset.pose_step_count),
+                "grad_rms": float(dset.pose_last_grad_stats[0]),
+                "grad_max": float(dset.pose_last_grad_stats[1]),
+            }
+        )
+
+    def _reset_iter_constraints(self) -> None:
+        """Epoch-boundary hook: take any pending accumulated pose step before the next epoch
+        starts (runs on every rank, so the ranks stay in step)."""
+        dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        flush = getattr(dset, "flush_pose_accum", None)
+        if flush is not None:
+            flush()
+        super()._reset_iter_constraints()
+
+    def reset_recon(self) -> None:
+        super().reset_recon()
+        self._pose_history = []
+
+    # endregion --- pose refinement state ---
 
     # region --- preprocessing ---
     def preprocess(  # pyright: ignore[reportIncompatibleMethodOverride] -- physical-units geometry
@@ -558,14 +634,22 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         attach it via ``from_file(path, dset=...)`` to visualize or continue training).
 
         Iteration snapshots (lightweight object state_dicts) round-trip like the base class's;
-        pass ``skip=("_snapshots",)`` to drop them for a leaner save.
+        pass ``skip=("_snapshots",)`` to drop them for a leaner save. The learned pose state
+        (shift table, baseline, learn flag, reference tilt) is stashed alongside the base
+        dataset metadata and re-applied by ``from_file(dset=...)``.
         """
-        return super().save(
-            path,
-            mode=mode,
-            store=store,
-            skip=skip,
-            compression_level=compression_level,
-            save_raw_data=save_raw_data,
-            verbose=verbose,
-        )
+        if not save_raw_data and self._dset is not None:
+            self._pose_metadata = self._collect_pose_metadata()
+        try:
+            return super().save(
+                path,
+                mode=mode,
+                store=store,
+                skip=skip,
+                compression_level=compression_level,
+                save_raw_data=save_raw_data,
+                verbose=verbose,
+            )
+        finally:
+            if not save_raw_data:
+                self._pose_metadata = None

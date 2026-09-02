@@ -8,6 +8,8 @@ intensities, then (a) the loss evaluated at the ground truth is near zero, and (
 object recovers the volume by gradient descent.
 """
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 import torch
@@ -538,3 +540,129 @@ class TestSlabWindow:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPoseShifts:
+    """Phase-1 pose refinement: per-tilt beam-frame shifts learned inline."""
+
+    @staticmethod
+    def _batch_loss(pt: PtychoTomography, idx: torch.Tensor) -> torch.Tensor:
+        targets = pt.dset.targets[idx].to(pt._single_device)
+        patch_data, _pos, frac, descan = pt.dset.forward(idx, pt.obj_padding_px)
+        probes = pt.probe_model.forward(frac)
+        patches = pt.obj_model.forward(patch_data)
+        _, overlap = pt.forward_operator(patches, probes, descan)
+        pred = pt.detector_model.forward(overlap)
+        return pt.error_estimate(pred, targets=targets, global_n=pt.dset.num_gpts)
+
+    def test_shift_sign_pin_object_query(self, inverse_crime_setup):
+        """A per-tilt shift (dy, dx) queries the object exactly where an unshifted query with
+        coords_yx_A displaced by -(dy, dx) would: the shift is SUBTRACTED before rotation."""
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        n_per = int(np.prod(SCAN_GPTS))
+        idx = torch.arange(0, 4)  # tilt 0 (-60 deg), not the reference
+        init = torch.zeros(len(TILTS), 2)
+        init[0] = torch.tensor([0.8, -0.5])
+        dset.set_pose_shift_init(init)
+        with torch.no_grad():
+            payload = cast("Any", dset.forward(idx, pt.obj_padding_px)[0])
+            assert payload.shifts_A is not None
+            shifted = obj.forward(payload)
+            dset.set_pose_shift_init(torch.zeros(len(TILTS), 2))
+            payload0 = cast("Any", dset.forward(idx, pt.obj_padding_px)[0])
+            assert payload0.shifts_A is None
+            payload0.coords_yx_A[..., 0] -= 0.8
+            payload0.coords_yx_A[..., 1] -= -0.5
+            manual = obj.forward(payload0)
+        assert torch.allclose(shifted, manual, atol=1e-6)
+        # the reference tilt is untouched by the (zeroed) reference row
+        ref = dset.reference_tilt_idx
+        assert dset.tilt_index_of(torch.tensor([ref * n_per])).item() == ref
+
+    def test_shift_gradient_matches_finite_difference(self, inverse_crime_setup):
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        pt.dset._set_targets("amplitude")
+        n_per = int(np.prod(SCAN_GPTS))
+        tilt = 3  # +30 deg
+        idx = torch.arange(tilt * n_per, (tilt + 1) * n_per)
+        base = torch.zeros(len(TILTS), 2)
+        base[tilt] = torch.tensor([0.6, -0.4])  # away from the GT minimum so the grad is nonzero
+        dset.set_pose_shift_init(base)
+        dset.set_learn_pose_shifts(True)
+        loss = self._batch_loss(pt, idx)
+        (g,) = torch.autograd.grad(loss, dset._pose_shifts)
+        analytic = g[tilt].detach().cpu()
+        assert torch.equal(g[[i for i in range(len(TILTS)) if i != tilt]].cpu(), torch.zeros(4, 2))
+        dset.set_learn_pose_shifts(False)
+        h = 0.02
+        fd = torch.zeros(2)
+        for c in range(2):
+            vals = []
+            for sgn in (+1.0, -1.0):
+                pert = base.clone()
+                pert[tilt, c] += sgn * h
+                dset.set_pose_shift_init(pert)
+                with torch.no_grad():
+                    vals.append(self._batch_loss(pt, idx).item())
+            fd[c] = (vals[0] - vals[1]) / (2 * h)
+        assert torch.all(torch.sign(fd) == torch.sign(analytic))
+        assert torch.allclose(analytic, fd, rtol=0.1, atol=float(1e-4 * fd.abs().max()))
+
+    def test_learned_shifts_survive_save_from_file(self, inverse_crime_setup, tmp_path):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        init = torch.zeros(len(TILTS), 2)
+        init[0] = torch.tensor([0.5, 0.25])
+        init[4] = torch.tensor([-0.3, 0.1])
+        dset.set_pose_shift_init(init)
+        dset.set_learn_pose_shifts(True)
+        dset.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)  # 180 positions / 64
+        pt.reconstruct(
+            num_iters=2,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"name": "adam", "lr": 0.05},
+            },
+            batch_size=64,
+        )
+        hist = pt.pose_history
+        assert [h["iteration"] for h in hist] == [1, 2]
+        assert hist[-1]["pose_steps"] == 2  # one accumulated step per epoch (flushed)
+        learned = dset.pose_shifts_A
+        assert torch.equal(learned[dset.reference_tilt_idx], torch.zeros(2))
+        assert not torch.allclose(learned, init)
+        path = tmp_path / "pose.zip"
+        pt.save(path, mode="o")
+        assert pt._pose_metadata is None  # transient stash cleared after save
+        wrapper2 = _make_wrapper(arrays)
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
+        d2 = loaded.dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        assert d2.learn_pose_shifts is True
+        assert d2.reference_tilt_idx == dset.reference_tilt_idx
+        assert torch.allclose(d2.pose_shifts_A, learned)
+        assert torch.allclose(d2.pose_shifts_init_A, init)
+        assert len(loaded.pose_history) == 2
+        assert torch.allclose(loaded.pose_history[-1]["shifts_A"], learned)
+        payload = cast("Any", d2.forward(torch.arange(3), loaded.obj_padding_px)[0])
+        assert payload.shifts_A is not None
+        # a tilt-count mismatch is an error, never a silent zero start
+        with pytest.raises(ValueError, match="tilts"):
+            loaded._apply_pose_metadata(
+                {**loaded._collect_pose_metadata(), "pose_shifts": torch.zeros(2, 2)}
+            )

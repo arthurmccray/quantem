@@ -116,6 +116,29 @@ def test_matches_tomography_transform_batch_rays():
     assert torch.allclose(ours_zyx.flip(-1), tomo, atol=1e-5)
 
 
+def test_shift_sign_matches_tomography_transform_batch_rays():
+    """Pose shifts are subtracted from the beam-frame lateral coordinates BEFORE rotation, with
+    the same sign as the tomography module. Ours are ``(dy, dx)`` in Å; tomography's are
+    ``(x, y)`` in pixels normalized by ``sampling_rate * 2 / (N - 1)`` (== 1 here)."""
+    torch.manual_seed(1)
+    batch, n = 4, 7
+    rays_xyz = torch.randn(batch, n, 3)
+    z1 = torch.tensor([0.0, 10.0, -25.0, 5.0])
+    x = torch.tensor([0.0, 35.0, -70.0, 90.0])
+    z3 = torch.tensor([0.0, -5.0, 15.0, 30.0])
+    shifts_yx = torch.tensor([[0.0, 0.0], [0.7, -0.3], [-1.2, 0.4], [0.5, 0.5]])  # (dy, dx)
+    N = 100
+    tomo = TomographyINRDataset.transform_batch_rays(
+        rays_xyz, z1=z1, x=x, z3=z3, shifts=shifts_yx.flip(-1), N=N, sampling_rate=(N - 1) / 2
+    )
+    R = rot_beam_to_spec(z1, x, z3)
+    rays_zyx = rays_xyz.flip(-1).clone()
+    rays_zyx[..., 1] -= shifts_yx[:, None, 0]  # y_b - dy  (object_models.py forward)
+    rays_zyx[..., 2] -= shifts_yx[:, None, 1]  # x_b - dx
+    ours_zyx = torch.einsum("bij,bnj->bni", R, rays_zyx)
+    assert torch.allclose(ours_zyx.flip(-1), tomo, atol=1e-5)
+
+
 def test_batched_broadcast_and_grad():
     tilts = torch.tensor([-70.0, -35.0, 0.0, 35.0, 70.0], requires_grad=True)
     R = rot_beam_to_spec(0.0, tilts, 0.0)
@@ -144,6 +167,13 @@ def test_patch_data_fields():
     )
     assert pd.shifts_A is None
     assert pd.coords_yx_A.shape == (2, 4, 4, 2)
+    pd2 = PtychoTomoPatchData(
+        coords_yx_A=torch.zeros(2, 4, 4, 2),
+        rotations=torch.eye(3).expand(2, 3, 3),
+        tilt_indices=torch.zeros(2, dtype=torch.long),
+        shifts_A=torch.tensor([[0.5, -0.5], [1.0, 2.0]]),
+    )
+    assert pd2.shifts_A is not None and pd2.shifts_A.shape == (2, 2)
 
 
 if __name__ == "__main__":

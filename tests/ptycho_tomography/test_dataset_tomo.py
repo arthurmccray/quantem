@@ -10,6 +10,7 @@ import torch
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import load as autoserialize_load
+from quantem.core.ml.optimizer_mixin import OptimizerParams
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
 from quantem.ptycho_tomography.geometry import rot_beam_to_spec
@@ -37,6 +38,16 @@ def _build_wrapper(preprocess: bool = True, free: bool = True) -> PtychoTomoData
     if preprocess:
         wrapper.preprocess(obj_padding_px=(8, 8), free_per_tilt_arrays=free)
     return wrapper
+
+
+def _set_grad(w: PtychoTomoDatasetRaster, g: torch.Tensor) -> None:
+    w._pose_shifts.grad = g  # pyright: ignore[reportAttributeAccessIssue] -- test-only fake gradient
+
+
+def _pose_wrapper() -> PtychoTomoDatasetRaster:
+    w = _build_wrapper()
+    w.implicit_object = True
+    return w
 
 
 class TestConstruction:
@@ -234,8 +245,12 @@ class TestStateAndSerialization:
         w.to("cpu")
         assert w.targets.device.type == "cpu"
 
-    def test_get_optimization_parameters_empty_v1(self):
+    def test_get_optimization_parameters_empty_unless_learning_shifts(self):
         w = _build_wrapper()
+        assert w.get_optimization_parameters() == {}
+        w.set_learn_pose_shifts(True)
+        assert list(w.get_optimization_parameters()) == ["pose_shifts"]
+        w.set_learn_pose_shifts(False)
         assert w.get_optimization_parameters() == {}
 
     def test_autoserialize_roundtrip(self, tmp_path):
@@ -254,7 +269,213 @@ class TestStateAndSerialization:
         # forward still works after reload
         payload, *_ = loaded.forward(torch.tensor([0, 25]), (8, 8))
         assert payload.rotations.shape == (2, 3, 3)
+        assert payload.shifts_A is None  # nothing active on a fresh wrapper
+
+    def test_autoserialize_roundtrip_carries_pose_state(self, tmp_path):
+        w = _build_wrapper()
+        w.implicit_object = True
+        init = torch.tensor([[0.5, -0.25], [0.0, 0.0], [1.0, 2.0]])
+        w.set_pose_shift_init(init)
+        w.set_learn_pose_shifts(True)
+        w.set_pose_accum(steps_per_iter=2, batches_per_epoch=10)
+        path = tmp_path / "tomo_dset_pose.zip"
+        w.save(path, mode="o")
+        loaded = autoserialize_load(path)
+        assert loaded.learn_pose_shifts is True
+        assert loaded.reference_tilt_idx == 1
+        assert loaded.pose_accum_steps == 5
+        assert torch.allclose(loaded.pose_shifts_A, init)
+        assert torch.allclose(loaded.pose_shifts_init_A, init)
+        payload, *_ = loaded.forward(torch.tensor([0, 25]), (8, 8))
+        assert payload.shifts_A is not None
+        assert torch.allclose(payload.shifts_A, init[[0, 1]])
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+REF = 1  # TILTS = [-35, 0, 35] -> argmin |tilt|
+N_PER = int(np.prod(GPTS))
+
+
+class TestPoseShiftPlumbing:
+    def test_shifts_none_when_inactive(self):
+        w = _pose_wrapper()
+        assert w.reference_tilt_idx == REF
+        assert not w.learn_pose_shifts
+        payload, *_ = w.forward(torch.tensor([0, N_PER, 2 * N_PER]), (8, 8))
+        assert payload.shifts_A is None
+
+    def test_forward_gathers_per_tilt_shift(self):
+        w = _pose_wrapper()
+        init = torch.tensor([[1.0, 2.0], [0.0, 0.0], [3.0, -4.0]])
+        w.set_pose_shift_init(init)
+        idx = torch.tensor([0, 3, N_PER, 2 * N_PER + 1, 2 * N_PER])
+        payload, *_ = w.forward(idx, (8, 8))
+        assert payload.shifts_A is not None and payload.shifts_A.shape == (5, 2)
+        assert torch.allclose(payload.shifts_A, init[w.tilt_index_of(idx)])
+        # a live (frozen) table keeps applying: it is the value, not the flag, that matters
+        assert not w.learn_pose_shifts
+
+    def test_init_validates_shape_and_zeroes_reference_row(self):
+        w = _pose_wrapper()
+        with pytest.raises(ValueError, match="shape"):
+            w.set_pose_shift_init(np.zeros((2, 2)))
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_pose_shift_init([[1.0, 1.0], [0.7, -0.7], [1.0, 1.0]])
+        assert torch.equal(w.pose_shifts_A[REF], torch.zeros(2))
+        assert torch.equal(w.pose_shifts_init_A[REF], torch.zeros(2))
+        with pytest.raises(ValueError, match="out of range"):
+            w.reference_tilt_idx = 3
+
+    def test_window_dz_sees_the_shift(self):
+        w = _pose_wrapper()
+        w.set_slab_window(True)
+        idx = torch.arange(2 * N_PER, 3 * N_PER)  # the +35 deg tilt
+        shift = torch.tensor([[0.0, 0.0], [0.0, 0.0], [1.3, -0.4]])
+        rot = w.rotations()[w.tilt_index_of(idx)]
+        dz0 = w._window_dz_A(idx, rot)
+        w.set_pose_shift_init(shift)
+        payload, *_ = w.forward(idx, (8, 8))
+        dz1 = payload.window_dz_A
+        assert dz1 is not None
+        # dz = -tan(tilt) * (y_c - dy): the dx component is along the tilt axis and inert
+        center = w._scan_center_px
+        samp = w.obj_sampling
+        y_c = (w.scan_positions_px[idx, 0] - center[0]) * float(samp[0])
+        t = torch.deg2rad(torch.tensor(35.0))
+        expected = -torch.tan(t) * (y_c - 1.3)
+        assert torch.allclose(dz1, expected.to(dz1.dtype), atol=1e-5)
+        assert not torch.allclose(dz0, dz1)
+
+
+class TestPoseShiftOptimizer:
+    @staticmethod
+    def _learning(lr=0.5, opt="adam"):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        spec = OptimizerParams.Adam(lr=lr) if opt == "adam" else OptimizerParams.SGD(lr=lr)
+        w.set_optimizer(spec)
+        return w
+
+    def test_groups_follow_flag_and_angles_stay_frozen(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        assert w._pose_shifts.requires_grad
+        w.set_optimizer(OptimizerParams.Adam(lr=0.1))
+        assert w.has_optimizer()
+        assert list(w.get_optimization_parameters()) == ["pose_shifts"]
+        for p in (w._pose_z1, w._pose_dtheta, w._pose_z3):
+            assert not p.requires_grad
+        w.set_learn_pose_shifts(False)
+        assert not w._pose_shifts.requires_grad
+        assert not w.has_optimizer()
+
+    def test_single_spec_fans_out_and_pplr_passes_through(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.optimizer_params = OptimizerParams.Adam(lr=0.3)
+        assert list(w.optimizer_params) == ["pose_shifts"]
+        w.optimizer_params = {"pose_shifts": {"name": "adam", "lr": 0.7}}
+        w.set_optimizer()
+        assert w.optimizer is not None
+        assert w.optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+    def test_nothing_learnable_warns_and_removes(self):
+        w = _pose_wrapper()
+        with pytest.warns(UserWarning, match="nothing is learnable"):
+            w.set_optimizer(OptimizerParams.Adam(lr=0.1))
+        assert not w.has_optimizer()
+
+    def test_reference_tilt_pinned_across_a_step(self):
+        w = self._learning(lr=0.5)
+        _set_grad(w, torch.ones_like(w._pose_shifts))
+        w.step_optimizer()
+        shifts = w.pose_shifts_A
+        assert torch.equal(shifts[REF], torch.zeros(2))
+        others = shifts[[0, 2]]
+        # Adam's first step is exactly -lr * sign(g) per component
+        assert torch.allclose(others, torch.full_like(others, -0.5), atol=1e-6)
+        assert w.pose_step_count == 1
+
+    def test_reference_pinned_to_nonzero_baseline_after_reset(self):
+        w = self._learning(lr=0.5)
+        init = torch.tensor([[0.2, 0.1], [0.0, 0.0], [-0.3, 0.4]])
+        w.set_pose_shift_init(init)
+        _set_grad(w, torch.ones_like(w._pose_shifts))
+        w.step_optimizer()
+        assert not torch.allclose(w.pose_shifts_A, init)
+        w.reset()
+        assert torch.allclose(w.pose_shifts_A, init)
+        assert w.pose_step_count == 0
+        assert w.learn_pose_shifts  # flag survives reset
+
+    def test_accumulation_equals_one_step_on_the_mean_gradient(self):
+        torch.manual_seed(0)
+        grads = [torch.randn(len(TILTS), 2) for _ in range(3)]
+        w_acc = self._learning(lr=0.1, opt="sgd")
+        w_acc.set_pose_accum(steps_per_iter=2, batches_per_epoch=6)  # M = 3
+        assert w_acc.pose_accum_steps == 3
+        for g in grads[:2]:
+            _set_grad(w_acc, g.clone())
+            w_acc.step_optimizer()
+            assert torch.equal(w_acc.pose_shifts_A, torch.zeros(len(TILTS), 2))  # no step yet
+        _set_grad(w_acc, grads[2].clone())
+        w_acc.step_optimizer()
+        assert w_acc.pose_step_count == 1
+        w_one = self._learning(lr=0.1, opt="sgd")
+        _set_grad(w_one, torch.stack(grads).mean(0))
+        w_one.step_optimizer()
+        assert torch.allclose(w_acc.pose_shifts_A, w_one.pose_shifts_A, atol=1e-7)
+        assert torch.equal(w_acc.pose_shifts_A[REF], torch.zeros(2))
+
+    def test_flush_takes_the_residual_step_and_warns_when_short(self):
+        w = self._learning(lr=0.1, opt="sgd")
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=10)  # M = 10
+        w.flush_pose_accum()  # nothing pending: no-op, no warning
+        assert w.pose_step_count == 0
+        for _ in range(2):
+            _set_grad(w, torch.ones_like(w._pose_shifts))
+            w.step_optimizer()
+        with pytest.warns(UserWarning, match="does not match"):
+            w.flush_pose_accum()
+        assert w.pose_step_count == 1
+        assert torch.allclose(w.pose_shifts_A[0], torch.full((2,), -0.1))
+
+    def test_set_pose_accum_requires_batches_per_epoch(self):
+        w = _pose_wrapper()
+        with pytest.raises(ValueError, match="batches_per_epoch"):
+            w.set_pose_accum(steps_per_iter=1)
+        w.set_pose_accum(steps_per_iter=0)
+        assert w.pose_accum_steps == 1
+        w.set_pose_accum(steps_per_iter=4, batches_per_epoch=542)
+        assert w.pose_accum_steps == 136  # ceil, so the epoch-end flush takes the last step
+
+    def test_lr_hold_then_decay_to_floor(self):
+        w = self._learning(lr=1.0)
+        w.set_pose_lr_schedule(hold_steps=2, decay=0.5, floor=0.2)
+        seen = []
+        for _ in range(6):
+            _set_grad(w, torch.ones_like(w._pose_shifts))
+            w.step_optimizer()
+            seen.append(w.get_current_lr())
+        assert seen == pytest.approx([1.0, 1.0, 0.5, 0.25, 0.2, 0.2])
+        with pytest.raises(ValueError):
+            w.set_pose_lr_schedule(decay=1.5)
+
+    def test_lr_warmup_ramps_then_holds_then_decays(self):
+        w = self._learning(lr=1.0)
+        w.set_pose_lr_schedule(hold_steps=1, decay=0.5, floor=0.1, warmup_steps=4)
+        seen, moved = [], []
+        for _ in range(8):
+            before = w.pose_shifts_A[0].clone()
+            _set_grad(w, torch.ones_like(w._pose_shifts))
+            w.step_optimizer()
+            seen.append(w.get_current_lr())
+            moved.append(float((w.pose_shifts_A[0] - before).abs().max()))
+        # LR used AT each step: 0.25, 0.5, 0.75, 1.0 (ramp), 1.0 (hold), then x0.5 -> floor
+        assert moved[:4] == pytest.approx([0.25, 0.5, 0.75, 1.0], abs=1e-5)
+        assert seen[4:] == pytest.approx([1.0, 0.5, 0.25, 0.125])
+        w.reset()
+        assert w._pose_lr_base is None  # a reset re-arms the warm-up

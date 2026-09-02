@@ -123,8 +123,12 @@ class PtychoTomoPatchData:
         ``(B,)`` long tensor mapping each batch element to its tilt (diagnostics / per-tilt
         extensions).
     shifts_A:
-        Optional ``(B, 2)`` beam-frame alignment shifts in Å, subtracted before rotation
-        (per-tilt pose refinement; unused/None in v1).
+        Optional ``(B, 2)`` per-position beam-frame ``(dy, dx)`` pose shifts in Å (the per-tilt
+        table ``PtychoTomoDatasetRaster._pose_shifts`` gathered per batch element), SUBTRACTED
+        from ``coords_yx_A`` before rotation — a specimen physically displaced by ``+d`` in the
+        beam frame is recovered as ``shift = +d``. The same subtraction is applied to the beam
+        centre used for ``window_dz_A``. ``None`` whenever no tilt carries a shift and none is
+        being learned (the pre-pose path, bit-identical).
     window_dz_A:
         Optional ``(B,)`` per-batch-element slab-window offset along the beam in Å (plan-view
         slab-window mode, 2026-07-16): the multislice slab stack for element ``b`` is displaced
