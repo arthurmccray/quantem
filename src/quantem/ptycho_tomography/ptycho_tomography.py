@@ -131,6 +131,12 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             "pose_shifts_init": dset.pose_shifts_init_A.cpu(),
             "learn_pose_shifts": bool(dset.learn_pose_shifts),
             "reference_tilt_idx": int(dset.reference_tilt_idx),
+            # phase 2: tilt-axis angles (deg); phase-1 zips lack these keys and load as zeros
+            "pose_z1_deg": dset.pose_z1_deg.cpu(),
+            "pose_z3_deg": dset.pose_z3_deg.cpu(),
+            "pose_z1_init_deg": dset.pose_z1_init_deg.cpu(),
+            "pose_z3_init_deg": dset.pose_z3_init_deg.cpu(),
+            "learn_pose_angles": bool(dset.learn_pose_angles),
         }
 
     def _apply_pose_metadata(self, meta: "dict[str, Any]") -> None:
@@ -150,32 +156,53 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         dset.set_pose_shift_init(meta["pose_shifts_init"])
         with torch.no_grad():
             dset._pose_shifts.copy_(shifts.to(dset._pose_shifts.device, dset._pose_shifts.dtype))
+        if "pose_z1_deg" in meta:
+            z1 = torch.as_tensor(meta["pose_z1_deg"])
+            z3 = torch.as_tensor(meta["pose_z3_deg"])
+            if tuple(z1.shape) != (dset.num_tilts,) or tuple(z3.shape) != (dset.num_tilts,):
+                raise ValueError(
+                    f"saved pose angles have shapes {tuple(z1.shape)} / {tuple(z3.shape)} but "
+                    f"the attached wrapper has {dset.num_tilts} tilts"
+                )
+            dset.set_pose_angle_init(meta["pose_z1_init_deg"], meta["pose_z3_init_deg"])
+            with torch.no_grad():
+                dset._pose_z1.copy_(z1.to(dset._pose_z1.device, dset._pose_z1.dtype))
+                dset._pose_z3.copy_(z3.to(dset._pose_z3.device, dset._pose_z3.dtype))
         dset.set_learn_pose_shifts(bool(meta["learn_pose_shifts"]))
+        dset.set_learn_pose_angles(bool(meta.get("learn_pose_angles", False)))
 
     @property
     def pose_history(self) -> "list[dict[str, Any]]":
-        """Per-iteration ``{iteration, loss, shifts_A (num_tilts, 2) Å, lr, pose_steps}`` records
-        (rank 0), recorded whenever shifts were being learned."""
+        """Per-iteration ``{iteration, loss, shifts_A (num_tilts, 2) Å, lr, pose_steps, grad_rms,
+        grad_max}`` records (rank 0), recorded whenever a pose slot was being learned; when the
+        angles are learned each record also carries ``z1_deg, z3_deg (num_tilts,), lr_angles,
+        angle_grad_rms, angle_grad_max``."""
         return list(self._pose_history or [])
 
     def _record_iter(self, iter_loss: float, autograd: bool) -> None:
         super()._record_iter(iter_loss, autograd)
         dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
-        if not getattr(dset, "learn_pose_shifts", False):
+        learn_angles = bool(getattr(dset, "learn_pose_angles", False))
+        if not getattr(dset, "learn_pose_shifts", False) and not learn_angles:
             return
         if self._pose_history is None:
             self._pose_history = []
-        self._pose_history.append(
-            {
-                "iteration": int(self.num_iters),
-                "loss": float(iter_loss),
-                "shifts_A": dset.pose_shifts_A.cpu(),
-                "lr": float(dset.get_current_lr()),
-                "pose_steps": int(dset.pose_step_count),
-                "grad_rms": float(dset.pose_last_grad_stats[0]),
-                "grad_max": float(dset.pose_last_grad_stats[1]),
-            }
-        )
+        record: dict[str, Any] = {
+            "iteration": int(self.num_iters),
+            "loss": float(iter_loss),
+            "shifts_A": dset.pose_shifts_A.cpu(),
+            "lr": float(dset.get_current_lr()),
+            "pose_steps": int(dset.pose_step_count),
+            "grad_rms": float(dset.pose_last_grad_stats[0]),
+            "grad_max": float(dset.pose_last_grad_stats[1]),
+        }
+        if learn_angles:
+            record["z1_deg"] = dset.pose_z1_deg.cpu()
+            record["z3_deg"] = dset.pose_z3_deg.cpu()
+            record["lr_angles"] = float(dset.pose_group_lr("pose_angles"))
+            record["angle_grad_rms"] = float(dset.pose_last_angle_grad_stats[0])
+            record["angle_grad_max"] = float(dset.pose_last_angle_grad_stats[1])
+        self._pose_history.append(record)
 
     def _reset_iter_constraints(self) -> None:
         """Epoch-boundary hook: take any pending accumulated pose step before the next epoch

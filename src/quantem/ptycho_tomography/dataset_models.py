@@ -42,10 +42,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     parameters/targets are flat-indexed. ``_tilt_offsets`` maps flat indices to tilts.
 
     Scope: identical scan geometry across tilts, known tilt angles, no descan / scan-position
-    learning. Pose refinement: the per-tilt beam-frame shift ``_pose_shifts`` is learnable
-    (``set_learn_pose_shifts``, gauge-fixed by pinning the reference tilt — see the pose
-    refinement region); ``_pose_z1`` / ``_pose_dtheta`` / ``_pose_z3`` exist but stay frozen. Per-tilt CoM rotation is
-    forced to zero — solving it per tilt would scramble the cross-tilt geometry.
+    learning. Pose refinement: the per-tilt beam-frame shift ``_pose_shifts`` (phase 1) and the
+    per-tilt tilt-axis Euler angles ``_pose_z1`` / ``_pose_z3`` (phase 2) are learnable
+    (``set_learn_pose_shifts`` / ``set_learn_pose_angles``, each gauge-fixed by pinning the
+    reference tilt — see the pose refinement region); ``_pose_dtheta`` (the tilt-angle offset)
+    exists but stays frozen. Per-tilt CoM rotation is forced to zero — solving it per tilt would
+    scramble the cross-tilt geometry.
     """
 
     # registered buffer / parameter types (mirrors the base's _patch_indices declaration)
@@ -62,6 +64,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _pose_shifts: nn.Parameter
     _pose_shifts_init: torch.Tensor
     _pose_shifts_accum: torch.Tensor
+    _pose_z1_init: torch.Tensor
+    _pose_z3_init: torch.Tensor
+    _pose_z1_accum: torch.Tensor
+    _pose_z3_accum: torch.Tensor
 
     def __init__(
         self,
@@ -142,7 +148,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # accumulates the (rank-averaged) gradient over M batches for one pose step.
         self.register_buffer("_pose_shifts_init", torch.zeros(num_tilts, 2, dtype=real_dtype))
         self.register_buffer("_pose_shifts_accum", torch.zeros(num_tilts, 2, dtype=real_dtype))
+        # Phase 2: the same baseline / accumulator pair for the tilt-axis angles z1 and z3 (deg).
+        # The reference tilt's angle rows are the rotation gauge (a global object rotation
+        # would change the reference matrix), pinned exactly like the shift row.
+        self.register_buffer("_pose_z1_init", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_z3_init", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_z1_accum", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_pose_z3_accum", torch.zeros(num_tilts, dtype=real_dtype))
         self._learn_pose_shifts: bool = False
+        self._learn_pose_angles: bool = False
         self._pose_shifts_active: bool = False  # gather shifts_A in forward (learning or nonzero)
         self._reference_tilt_idx: int = int(np.argmin(np.abs(angles)))
         self._pose_steps_per_iter: int = 0  # 0 = per-batch steps (M = 1)
@@ -152,12 +166,16 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_lr_hold: int = 0
         self._pose_lr_decay: float = 1.0
         self._pose_lr_floor: float = 0.0
+        self._pose_angle_lr_floor: float = 0.0  # deg/step floor for the ``pose_angles`` group
         self._pose_lr_warmup: int = 0
-        self._pose_lr_base: float | None = None  # LR at the first pose step (warm-up target)
+        # LR of every pose group at the first pose step (warm-up target), keyed by group name
+        self._pose_lr_base: dict[str, float] | None = None
         # diagnostics of the last pose step: rms / max |grad| over the non-reference rows (the
         # gradient that Adam saw, i.e. after accumulation), for the per-iteration history
         self._pose_last_grad_rms: float = 0.0
         self._pose_last_grad_max: float = 0.0
+        self._pose_last_angle_grad_rms: float = 0.0
+        self._pose_last_angle_grad_max: float = 0.0
         # Beam-frame coordinate origin in scan-grid pixels (set at preprocess): the center of
         # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
         # relative to this point (see PtychoTomoPatchData).
@@ -239,12 +257,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     # endregion --- tilt geometry ---
 
-    # region --- pose refinement (phase 1: per-tilt beam-frame shifts) ---
+    # region --- pose refinement (phase 1: per-tilt beam-frame shifts; phase 2: z1 / z3) ---
     # Convention: ``_pose_shifts[t] = (dy, dx)`` in Å, beam frame, SUBTRACTED from the patch
     # coordinates before rotation (object_models.ObjectPtychoTomoBase.forward); a specimen
-    # physically displaced by +d in the beam frame is recovered as shift = +d. Gauge: the
-    # reference tilt's row is pinned to its baseline (gradient masked after the DDP all-reduce,
-    # value re-copied after every optimizer step).
+    # physically displaced by +d in the beam frame is recovered as shift = +d. Angles:
+    # ``rotations() = rot_beam_to_spec(_pose_z1, tilt + _pose_dtheta, _pose_z3)`` (degrees,
+    # geometry.py) -- the beam->specimen matrix the object is queried with; a series whose tilt
+    # axis is rotated in-plane by +phi is recovered as z1 = +phi, z3 = -phi. Gauge: the
+    # reference tilt's rows (shift and both angles) are pinned to their baselines (gradient
+    # masked after the DDP all-reduce, value re-copied after every optimizer step).
     @property
     def learn_pose_shifts(self) -> bool:
         return self._learn_pose_shifts
@@ -252,17 +273,85 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def set_learn_pose_shifts(self, enabled: bool) -> None:
         """Make the per-tilt shifts learnable (adds the ``pose_shifts`` optimizer group).
 
-        The three angle slots are re-frozen here unconditionally: phase 1 learns shifts only.
-        Disabling with an optimizer attached removes it (a learned table stays applied).
+        ``_pose_dtheta`` is re-frozen here unconditionally (never learned); the z1 / z3 slots are
+        owned by ``set_learn_pose_angles``. Disabling with an optimizer attached removes it when
+        nothing else is learned, otherwise the dataset optimizer is rebuilt without the group
+        (a learned table stays applied either way).
         """
         enabled = bool(enabled)
+        changed = enabled != self._learn_pose_shifts
         self._learn_pose_shifts = enabled
         self._pose_shifts.requires_grad_(enabled)
-        for p in (self._pose_z1, self._pose_dtheta, self._pose_z3):
-            p.requires_grad_(False)
+        self._pose_dtheta.requires_grad_(False)
         self._refresh_pose_shifts_active()
-        if not enabled and self.has_optimizer():
+        self._sync_pose_optimizer(changed)
+
+    @property
+    def learn_pose_angles(self) -> bool:
+        return getattr(self, "_learn_pose_angles", False)
+
+    def set_learn_pose_angles(self, enabled: bool) -> None:
+        """Make the per-tilt tilt-axis angles z1 and z3 learnable (one ``pose_angles`` optimizer
+        group, LR in deg/step). ``_pose_dtheta`` stays frozen. The angle path needs no forward
+        change: ``rotations()`` already feeds both parameters into ``rot_beam_to_spec``, and the
+        autograd graph through it is only built while ``requires_grad`` is set (the no-pose path
+        stays bit-identical)."""
+        self._ensure_pose_angle_state()
+        enabled = bool(enabled)
+        changed = enabled != self._learn_pose_angles
+        self._learn_pose_angles = enabled
+        self._pose_z1.requires_grad_(enabled)
+        self._pose_z3.requires_grad_(enabled)
+        self._pose_dtheta.requires_grad_(False)
+        self._sync_pose_optimizer(changed)
+
+    def _sync_pose_optimizer(self, changed: bool) -> None:
+        """Keep an attached dataset optimizer consistent with the learn flags.
+
+        No optimizer / no change: nothing. Nothing learnable any more: remove it (phase-1
+        behaviour). Otherwise rebuild it from the stored per-group specs so the torch param
+        groups match ``get_optimization_parameters()`` again (the LR helpers index the two by
+        position); a newly enabled group with no stored spec cannot be built -- warn, remove,
+        and let the caller ``set_optimizer`` with a spec for it.
+        """
+        if not changed or not self.has_optimizer():
+            return
+        learnable = list(self.get_optimization_parameters())
+        if not learnable:
             self.remove_optimizer()
+            return
+        specs = {k: v for k, v in self._optimizer_params.items() if k in learnable}
+        if set(specs) != set(learnable):
+            warnings.warn(
+                f"{type(self).__name__}: pose group(s) {sorted(set(learnable) - set(specs))} "
+                "have no optimizer spec; the dataset optimizer was removed -- call "
+                "set_optimizer(...) with a spec for every learnable group",
+                stacklevel=3,
+            )
+            self.remove_optimizer()
+            return
+        self._pose_lr_base = None
+        self.set_optimizer(specs)
+
+    def _has_pose_angle_state(self) -> bool:
+        return "_pose_z1_init" in self._buffers
+
+    def _ensure_pose_angle_state(self) -> None:
+        """Materialise the phase-2 angle buffers on a wrapper deserialized from a phase-1 cache
+        (zeros = the phase-1 state: angles frozen at zero)."""
+        if self._has_pose_angle_state():
+            return
+        ref = self._pose_z1.detach()
+        for name in ("_pose_z1_init", "_pose_z3_init", "_pose_z1_accum", "_pose_z3_accum"):
+            self.register_buffer(name, torch.zeros_like(ref))
+        self._learn_pose_angles = False
+
+    def _pose_angle_slots(self) -> "tuple[tuple[nn.Parameter, torch.Tensor, torch.Tensor], ...]":
+        """``((param, init, accum), ...)`` for z1 and z3, in the ``pose_angles`` group order."""
+        return (
+            (self._pose_z1, self._pose_z1_init, self._pose_z1_accum),
+            (self._pose_z3, self._pose_z3_init, self._pose_z3_accum),
+        )
 
     def _refresh_pose_shifts_active(self) -> None:
         # one device sync per call (never per forward): the gather is only skipped when nothing
@@ -287,6 +376,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 f"reference tilt {idx} has a nonzero shift baseline "
                 f"{self._pose_shifts_init[idx].tolist()} Å; it is pinned there (gauge) and will "
                 "not be learned",
+                stacklevel=2,
+            )
+        if self._has_pose_angle_state() and bool(
+            (self._pose_z1_init[idx] != 0).item() or (self._pose_z3_init[idx] != 0).item()
+        ):
+            warnings.warn(
+                f"reference tilt {idx} has a nonzero angle baseline (z1, z3) = "
+                f"({float(self._pose_z1_init[idx])}, {float(self._pose_z3_init[idx])}) deg; it "
+                "is pinned there (gauge) and will not be learned",
                 stacklevel=2,
             )
 
@@ -318,6 +416,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts_init.copy_(t)
             self._pose_shifts.copy_(t)
             self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
         self._pose_accum_count = 0
         self._refresh_pose_shifts_active()
 
@@ -329,6 +428,72 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     @property
     def pose_shifts_init_A(self) -> torch.Tensor:
         return self._pose_shifts_init.detach().clone()
+
+    def _zero_pose_angle_accum(self) -> None:
+        if self._has_pose_angle_state():
+            self._pose_z1_accum.zero_()
+            self._pose_z3_accum.zero_()
+
+    def set_pose_angle_init(
+        self,
+        z1_deg: "np.ndarray | torch.Tensor | list[Any]",
+        z3_deg: "np.ndarray | torch.Tensor | list[Any]",
+    ) -> None:
+        """Set the per-tilt tilt-axis angle baselines ``(num_tilts,)`` each, in degrees, and
+        start the live parameters there (the angle twin of ``set_pose_shift_init``: the
+        "start here" knob and the deliberate-perturbation knob). The reference tilt's entries
+        are forced to zero (gauge: at the 0 deg tilt only z1 + z3 is even defined).
+        ``reset()`` returns to this baseline."""
+        self._ensure_pose_angle_state()
+        vals = []
+        for name, v in (("z1_deg", z1_deg), ("z3_deg", z3_deg)):
+            t = torch.as_tensor(
+                np.asarray(v, dtype=float), dtype=self._pose_z1.dtype, device=self._pose_z1.device
+            )
+            if t.shape != (self.num_tilts,):
+                raise ValueError(
+                    f"{name} must have shape ({self.num_tilts},), got {tuple(t.shape)}"
+                )
+            vals.append(t)
+        z1, z3 = vals
+        ref = self._reference_tilt_idx
+        if bool((z1[ref] != 0).item() or (z3[ref] != 0).item()):
+            warnings.warn(
+                f"reference tilt {ref} angle init (z1, z3) = ({float(z1[ref])}, "
+                f"{float(z3[ref])}) deg ignored (gauge: zeroed)",
+                stacklevel=2,
+            )
+            z1, z3 = z1.clone(), z3.clone()
+            z1[ref] = 0.0
+            z3[ref] = 0.0
+        with torch.no_grad():
+            self._pose_z1_init.copy_(z1)
+            self._pose_z3_init.copy_(z3)
+            self._pose_z1.copy_(z1)
+            self._pose_z3.copy_(z3)
+            self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
+        self._pose_accum_count = 0
+
+    @property
+    def pose_z1_deg(self) -> torch.Tensor:
+        """Detached copy of the live per-tilt z1 table, ``(num_tilts,)`` degrees."""
+        return self._pose_z1.detach().clone()
+
+    @property
+    def pose_z3_deg(self) -> torch.Tensor:
+        """Detached copy of the live per-tilt z3 table, ``(num_tilts,)`` degrees."""
+        return self._pose_z3.detach().clone()
+
+    @property
+    def pose_z1_init_deg(self) -> torch.Tensor:
+        self._ensure_pose_angle_state()
+        return self._pose_z1_init.detach().clone()
+
+    @property
+    def pose_z3_init_deg(self) -> torch.Tensor:
+        self._ensure_pose_angle_state()
+        return self._pose_z3_init.detach().clone()
 
     def set_pose_accum(self, steps_per_iter: int, batches_per_epoch: int | None = None) -> None:
         """Accumulate the shift gradient over ``M`` batches per pose step.
@@ -359,6 +524,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_accum_count = 0
         with torch.no_grad():
             self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
 
     @property
     def pose_accum_steps(self) -> int:
@@ -376,19 +542,28 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         the loss). Adam's step is ~lr only while this is large against its ``eps`` (1e-8)."""
         return self._pose_last_grad_rms, self._pose_last_grad_max
 
+    @property
+    def pose_last_angle_grad_stats(self) -> tuple[float, float]:
+        """``(rms, max)`` of the z1 / z3 gradient used by the most recent pose step (deg⁻¹ units
+        of the loss), over the non-reference rows of both angles."""
+        return self._pose_last_angle_grad_rms, self._pose_last_angle_grad_max
+
     def set_pose_lr_schedule(
         self,
         hold_steps: int = 0,
         decay: float = 1.0,
         floor: float = 0.0,
         warmup_steps: int = 0,
+        angle_floor: float = 0.0,
     ) -> None:
         """Per-pose-step LR schedule: ramp linearly from ``lr / warmup_steps`` to the optimizer's
         LR over the first ``warmup_steps`` steps (so the first Adam steps cannot outrun a small
         gradient — the unfreeze kick of 2026-08-27), hold ``hold_steps`` steps, then multiply by
         ``decay`` after every step down to ``floor``. Dataset-owned because the model schedulers
         step per epoch and Adam's step is ~lr regardless of the gradient, so the LR is a travel
-        budget in Å."""
+        budget in Å. The schedule is shared by every pose group (one pose step steps them all);
+        each group ramps from and decays toward its own LR, with ``floor`` for ``pose_shifts``
+        (Å/step) and ``angle_floor`` for ``pose_angles`` (deg/step)."""
         if not 0.0 < float(decay) <= 1.0:
             raise ValueError("decay must be in (0, 1]")
         if int(warmup_steps) < 0:
@@ -396,28 +571,51 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_lr_hold = int(hold_steps)
         self._pose_lr_decay = float(decay)
         self._pose_lr_floor = float(floor)
+        self._pose_angle_lr_floor = float(angle_floor)
         self._pose_lr_warmup = int(warmup_steps)
         self._pose_lr_base = None
 
+    def _pose_param_groups(self) -> "list[tuple[str, dict[str, Any]]]":
+        """``(group name, torch param group)`` pairs. ``set_optimizer`` builds the torch groups in
+        ``get_optimization_parameters()`` order and ``reconnect_optimizer_to_parameters`` keeps
+        it, so the two line up by position."""
+        if self._optimizer is None:
+            return []
+        names = list(self.get_optimization_parameters())
+        groups = list(self._optimizer.param_groups)
+        if len(names) != len(groups):
+            raise RuntimeError(
+                f"dataset optimizer has {len(groups)} param groups but "
+                f"get_optimization_parameters() names {names}"
+            )
+        return list(zip(names, groups))
+
+    def pose_group_lr(self, key: str) -> float:
+        """Current LR of one pose optimizer group (``0.0`` if absent)."""
+        for name, pg in self._pose_param_groups():
+            if name == key:
+                return float(pg["lr"])
+        return 0.0
+
     def _pose_lr_before_step(self) -> None:
-        """Warm-up: LR for pose step k (1-based) = base * min(1, k / warmup)."""
+        """Warm-up: LR for pose step k (1-based) = base * min(1, k / warmup), per group."""
         if self._optimizer is None or self._pose_lr_warmup <= 0:
             return
         if self._pose_lr_base is None:
-            self._pose_lr_base = float(self._optimizer.param_groups[0]["lr"])
+            self._pose_lr_base = {name: float(pg["lr"]) for name, pg in self._pose_param_groups()}
         k = self._pose_step_count + 1
         if k <= self._pose_lr_warmup:
-            lr = self._pose_lr_base * k / float(self._pose_lr_warmup)
-            for pg in self._optimizer.param_groups:
-                pg["lr"] = lr
+            for name, pg in self._pose_param_groups():
+                pg["lr"] = self._pose_lr_base[name] * k / float(self._pose_lr_warmup)
 
     def _pose_lr_step(self) -> None:
         if self._optimizer is None or self._pose_lr_decay >= 1.0:
             return
         if self._pose_step_count <= self._pose_lr_hold + self._pose_lr_warmup:
             return
-        for pg in self._optimizer.param_groups:
-            pg["lr"] = max(self._pose_lr_floor, float(pg["lr"]) * self._pose_lr_decay)
+        for name, pg in self._pose_param_groups():
+            floor = self._pose_angle_lr_floor if name == "pose_angles" else self._pose_lr_floor
+            pg["lr"] = max(floor, float(pg["lr"]) * self._pose_lr_decay)
 
     def step_optimizer(self) -> None:
         """Optimizer step with optional gradient accumulation and the reference-tilt gauge.
@@ -427,13 +625,19 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         """
         if self._optimizer is None:
             return
-        if not self._learn_pose_shifts or self._pose_accum_steps <= 1:
+        learning = self._learn_pose_shifts or self.learn_pose_angles
+        if not learning or self._pose_accum_steps <= 1:
             self._pose_step(mean_of=None)
             return
         g = self._pose_shifts.grad
         if g is not None:
             with torch.no_grad():
                 self._pose_shifts_accum.add_(g)
+        if self.learn_pose_angles:
+            with torch.no_grad():
+                for p, _init, acc in self._pose_angle_slots():
+                    if p.grad is not None:
+                        acc.add_(p.grad)
         self._pose_accum_count += 1
         if self._pose_accum_count >= self._pose_accum_steps:
             self._pose_step(mean_of=self._pose_accum_count)
@@ -441,8 +645,13 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def _pose_step(self, mean_of: int | None) -> None:
         if self._optimizer is None:
             return
+        angles = self.learn_pose_angles
+        learning = self._learn_pose_shifts or angles
         if mean_of is not None:
             self._pose_shifts.grad = self._pose_shifts_accum / float(max(1, mean_of))
+            if angles:
+                for p, _init, acc in self._pose_angle_slots():
+                    p.grad = acc / float(max(1, mean_of))
         ref = self._reference_tilt_idx
         if self._learn_pose_shifts and self._pose_shifts.grad is not None:
             self._pose_shifts.grad[ref] = 0.0  # gauge: after the all-reduce, before the step
@@ -450,17 +659,36 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             n = max(1, int(g.shape[0]) - 1)
             self._pose_last_grad_rms = float((g.square().sum() / (2 * n)).sqrt().item())
             self._pose_last_grad_max = float(g.abs().max().item())
-        if self._learn_pose_shifts:
+        if angles:
+            gs = []
+            for p, _init, _acc in self._pose_angle_slots():
+                if p.grad is not None:
+                    p.grad[ref] = 0.0  # same gauge mask for the angle rows
+                    gs.append(p.grad.detach())
+            if gs:
+                ga = torch.stack(gs)
+                n = max(1, int(ga.shape[1]) - 1)
+                self._pose_last_angle_grad_rms = float(
+                    (ga.square().sum() / (ga.shape[0] * n)).sqrt().item()
+                )
+                self._pose_last_angle_grad_max = float(ga.abs().max().item())
+        if learning:
             self._pose_lr_before_step()
         self._optimizer.step()
         if self._learn_pose_shifts:
             with torch.no_grad():
                 self._pose_shifts[ref] = self._pose_shifts_init[ref]  # re-pin (decay/momentum)
+        if angles:
+            with torch.no_grad():
+                for p, init, _acc in self._pose_angle_slots():
+                    p[ref] = init[ref]  # re-pin the reference angle rows
+        if learning:
             self._pose_step_count += 1
             self._pose_lr_step()
         if mean_of is not None:
             with torch.no_grad():
                 self._pose_shifts_accum.zero_()
+                self._zero_pose_angle_accum()
             self._pose_accum_count = 0
 
     def flush_pose_accum(self) -> None:
@@ -483,16 +711,21 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """Learnable dataset groups: the base descan / scan-position groups plus ``pose_shifts``
-        when shifts are being learned. This dict is also the DDP surface (broadcast + all-reduce
-        iterate it), so adding the group here is the whole multi-GPU integration."""
+        (shifts) and ``pose_angles`` (z1, z3) when learned. This dict is also the DDP surface
+        (broadcast + all-reduce iterate it), so adding a group here is the whole multi-GPU
+        integration."""
         groups = super().get_optimization_parameters()
         if self._learn_pose_shifts:
             groups["pose_shifts"] = [self._pose_shifts]
+        if self.learn_pose_angles:
+            groups["pose_angles"] = [self._pose_z1, self._pose_z3]
         return groups
 
     def _normalize_optimizer_params(self, params):
-        """Fan a single optimizer spec out to every learnable group (incl. ``pose_shifts``);
-        an explicit PPLR dict passes through and is key-checked by ``set_optimizer``."""
+        """Fan a single optimizer spec out to every learnable group (incl. ``pose_shifts`` and
+        ``pose_angles`` -- note a single spec then shares one LR between Å/step and deg/step;
+        use the PPLR dict form for independent LRs); an explicit PPLR dict passes through and is
+        key-checked by ``set_optimizer``."""
         norm = OptimizerMixin._normalize_optimizer_params(self, params)
         if set(norm) == {self.DEFAULT_OPTIMIZER_KEY}:
             spec = norm[self.DEFAULT_OPTIMIZER_KEY]
@@ -502,14 +735,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                     ("descan", self.learn_descan),
                     ("scan_positions", self.learn_scan_positions),
                     ("pose_shifts", getattr(self, "_learn_pose_shifts", False)),
+                    ("pose_angles", getattr(self, "_learn_pose_angles", False)),
                 )
                 if on
             ]
             if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
                 warnings.warn(
                     f"{type(self).__name__}: an optimizer was requested but nothing is learnable "
-                    "(learn_descan, learn_scan_positions and learn_pose_shifts are all False); "
-                    "the optimizer will be removed.",
+                    "(learn_descan, learn_scan_positions, learn_pose_shifts and "
+                    "learn_pose_angles are all False); the optimizer will be removed.",
                     stacklevel=2,
                 )
             return {key: replace(spec) for key in learnable} if learnable else {}
@@ -794,16 +1028,19 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
     def reset(self) -> None:
-        """Restore positions/descan, zero the (frozen) angle slots and return the shifts to
-        their baseline (``set_pose_shift_init``, zeros by default). The learn flag, reference
-        tilt, accumulation and LR-schedule settings survive, like ``set_slab_window``."""
+        """Restore positions/descan, zero the (frozen) ``_pose_dtheta`` and return the shifts
+        and the z1 / z3 angles to their baselines (``set_pose_shift_init`` /
+        ``set_pose_angle_init``, zeros by default). The learn flags, reference tilt, accumulation
+        and LR-schedule settings survive, like ``set_slab_window``."""
         super().reset()
+        self._ensure_pose_angle_state()
         with torch.no_grad():
-            self._pose_z1.zero_()
+            self._pose_z1.copy_(self._pose_z1_init)
             self._pose_dtheta.zero_()
-            self._pose_z3.zero_()
+            self._pose_z3.copy_(self._pose_z3_init)
             self._pose_shifts.copy_(self._pose_shifts_init)
             self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
         self._pose_accum_count = 0
         self._pose_step_count = 0
         self._pose_lr_base = None

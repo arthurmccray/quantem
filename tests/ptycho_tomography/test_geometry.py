@@ -178,3 +178,94 @@ def test_patch_data_fields():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------- phase 2: tilt-axis angles
+def test_known_point_pins_for_z1_and_z3():
+    """Hand-computed images under the pinned composition Rz(-z1) Rx(x) Rz(-z3), components
+    (z, y, x). _rz(t): y' = c y + s x, x' = -s y + c x. With z1 = 90 the matrix is _rz(-90):
+    (0, 0, 1) -> (0, -1, 0) and (0, 1, 0) -> (0, 0, 1); z3 = 90 alone gives the same map (the
+    two angles coincide at x = 0); with x = 90 between them they differ."""
+    ey = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float64)
+    ex = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    R = rot_beam_to_spec(90.0, 0.0, 0.0, dtype=torch.float64)[0]
+    assert torch.allclose(R @ ex, torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64), atol=1e-12)
+    assert torch.allclose(R @ ey, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64), atol=1e-12)
+    R3 = rot_beam_to_spec(0.0, 0.0, 90.0, dtype=torch.float64)[0]
+    assert torch.allclose(R3, R, atol=1e-12)
+    # z1 = 90 after a 90 deg tilt: Rz(-90) Rx(90); ex is on the tilt axis so Rx leaves it,
+    # then Rz(-90) sends it to -ey. ey -> Rx(90): (z,y,x) = (1, 0, 0) -> Rz(-90) keeps z.
+    R13 = rot_beam_to_spec(90.0, 90.0, 0.0, dtype=torch.float64)[0]
+    assert torch.allclose(
+        R13 @ ex, torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64), atol=1e-12
+    )
+    assert torch.allclose(R13 @ ey, torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64), atol=1e-12)
+    # z3 = 90 before a 90 deg tilt: Rx(90) Rz(-90); ex -> Rz(-90): -ey -> Rx(90): (z,y,x)
+    # (0,-1,0) -> (-1, 0, 0)
+    R31 = rot_beam_to_spec(0.0, 90.0, 90.0, dtype=torch.float64)[0]
+    assert torch.allclose(
+        R31 @ ex, torch.tensor([-1.0, 0.0, 0.0], dtype=torch.float64), atol=1e-12
+    )
+    assert not torch.allclose(R13, R31)
+    # a constant z1 is a global rotation of the specimen frame about the beam axis
+    Rc = rot_beam_to_spec(7.0, 35.0, 0.0, dtype=torch.float64)[0]
+    assert torch.allclose(
+        Rc,
+        rot_beam_to_spec(7.0, 0.0, 0.0, dtype=torch.float64)[0]
+        @ rot_beam_to_spec(0.0, 35.0, 0.0, dtype=torch.float64)[0],
+        atol=1e-12,
+    )
+
+
+def test_euler_round_trip_both_branches():
+    from quantem.ptycho_tomography.geometry import euler_from_rot_beam_to_spec
+
+    g = torch.Generator().manual_seed(3)
+    n = 200
+    z1 = (torch.rand(n, generator=g, dtype=torch.float64) * 2 - 1) * 170.0
+    z3 = (torch.rand(n, generator=g, dtype=torch.float64) * 2 - 1) * 170.0
+    mag = 5.0 + torch.rand(n, generator=g, dtype=torch.float64) * 80.0
+    sign = torch.where(torch.rand(n, generator=g) < 0.5, -1.0, 1.0).to(torch.float64)
+    x = mag * sign
+    R = rot_beam_to_spec(z1, x, z3, dtype=torch.float64)
+    eul, gimbal = euler_from_rot_beam_to_spec(R, x)  # branch chosen by the nominal tilt
+    assert not gimbal.any()
+    assert torch.allclose(eul[:, 0], z1, atol=1e-9)
+    assert torch.allclose(eul[:, 1], x, atol=1e-9)
+    assert torch.allclose(eul[:, 2], z3, atol=1e-9)
+    # the nominal tilt only has to be on the right side: a coarse nominal still picks the branch
+    eul2, _ = euler_from_rot_beam_to_spec(R, torch.sign(x) * 30.0)
+    assert torch.allclose(eul2, eul, atol=1e-9)
+    # and the matrix rebuilt from the triplet is the input matrix on either branch
+    R2 = rot_beam_to_spec(eul[:, 0], eul[:, 1], eul[:, 2], dtype=torch.float64)
+    assert torch.allclose(R2, R, atol=1e-12)
+
+
+def test_euler_gimbal_and_matrix_gauge_identity():
+    """At x = 0 only z1 + z3 is defined (gimbal flag); and with the reference tilt at 0 deg the
+    matrix gauge R_ref^T R_t reads (z1_t - (z1_ref + z3_ref), x_t, z3_t): the only surviving
+    gauge is a constant offset of z1, which is why a scorer must gauge-fix BOTH tables."""
+    from quantem.ptycho_tomography.geometry import euler_from_rot_beam_to_spec
+
+    R0 = rot_beam_to_spec(4.0, 0.0, -1.5, dtype=torch.float64)
+    eul, gimbal = euler_from_rot_beam_to_spec(R0, 0.0)
+    assert bool(gimbal[0])
+    assert eul[0, 0].item() == pytest.approx(2.5, abs=1e-9)  # z1 + z3
+    assert eul[0, 2].item() == pytest.approx(0.0)
+    z1r, z3r = 3.0, -1.0  # reference tilt (0 deg) learned with a nonzero (gauge) triplet
+    R_ref = rot_beam_to_spec(z1r, 0.0, z3r, dtype=torch.float64)[0]
+    z1t, xt, z3t = 2.5, -40.0, -2.5
+    R_t = rot_beam_to_spec(z1t, xt, z3t, dtype=torch.float64)[0]
+    rel, gim = euler_from_rot_beam_to_spec((R_ref.T @ R_t)[None], xt)
+    assert not bool(gim[0])
+    assert rel[0].tolist() == pytest.approx([z1t - (z1r + z3r), xt, z3t], abs=1e-9)
+
+
+def test_angle_grads_flow_through_rot_beam_to_spec():
+    z1 = torch.zeros(3, requires_grad=True)
+    z3 = torch.zeros(3, requires_grad=True)
+    R = rot_beam_to_spec(z1, torch.tensor([-35.0, 0.0, 35.0]), z3)
+    (R * torch.arange(27.0).view(3, 3, 3)).sum().backward()
+    assert z1.grad is not None and z3.grad is not None
+    assert torch.isfinite(z1.grad).all() and torch.isfinite(z3.grad).all()
+    assert (z1.grad != 0).any() and (z3.grad != 0).any()

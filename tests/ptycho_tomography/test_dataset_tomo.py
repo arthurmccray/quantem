@@ -479,3 +479,238 @@ class TestPoseShiftOptimizer:
         assert seen[4:] == pytest.approx([1.0, 0.5, 0.25, 0.125])
         w.reset()
         assert w._pose_lr_base is None  # a reset re-arms the warm-up
+
+
+# ---------------------------------------------------------------- phase 2: tilt-axis angles
+def _set_angle_grad(w: PtychoTomoDatasetRaster, g1: torch.Tensor, g3: torch.Tensor) -> None:
+    w._pose_z1.grad = g1  # pyright: ignore[reportAttributeAccessIssue] -- test-only fake gradient
+    w._pose_z3.grad = g3  # pyright: ignore[reportAttributeAccessIssue] -- test-only fake gradient
+
+
+class TestPoseAngles:
+    @staticmethod
+    def _learning(lr=0.5, opt="adam", shifts=False):
+        w = _pose_wrapper()
+        if shifts:
+            w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        spec = OptimizerParams.Adam(lr=lr) if opt == "adam" else OptimizerParams.SGD(lr=lr)
+        w.set_optimizer(spec)
+        return w
+
+    def test_rotations_follow_the_angle_init(self):
+        w = _pose_wrapper()
+        z1 = torch.tensor([10.0, 0.0, -25.0])
+        z3 = torch.tensor([-5.0, 0.0, 15.0])
+        w.set_pose_angle_init(z1, z3)
+        assert torch.allclose(w.pose_z1_deg, z1) and torch.allclose(w.pose_z3_deg, z3)
+        R = w.rotations()
+        expected = rot_beam_to_spec(z1, torch.tensor(TILTS), z3)
+        assert torch.allclose(R, expected, atol=1e-6)
+        payload, *_ = w.forward(torch.tensor([0, N_PER, 2 * N_PER]), (8, 8))
+        assert torch.allclose(payload.rotations, expected, atol=1e-6)
+        assert payload.shifts_A is None  # angles alone never touch the shift path
+        # a constant z1 is a global rotation of the specimen frame about the beam axis
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_pose_angle_init(torch.full((3,), 7.0), torch.zeros(3))
+        Rz = rot_beam_to_spec(7.0, 0.0, 0.0)[0]
+        R0 = rot_beam_to_spec(0.0, torch.tensor(TILTS), 0.0)
+        for t in (0, 2):
+            assert torch.allclose(w.rotations()[t], Rz @ R0[t], atol=1e-6)
+        assert torch.allclose(w.rotations()[REF], R0[REF], atol=1e-6)  # reference row zeroed
+
+    def test_angle_init_validates_shape_and_zeroes_reference(self):
+        w = _pose_wrapper()
+        with pytest.raises(ValueError, match="shape"):
+            w.set_pose_angle_init(np.zeros(2), np.zeros(3))
+        with pytest.raises(ValueError, match="shape"):
+            w.set_pose_angle_init(np.zeros(3), np.zeros((3, 1)))
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_pose_angle_init([1.0, 0.5, 1.0], [-1.0, 0.0, -1.0])
+        assert w.pose_z1_deg[REF].item() == 0.0 and w.pose_z1_init_deg[REF].item() == 0.0
+        assert w.pose_z3_deg[REF].item() == 0.0 and w.pose_z3_init_deg[REF].item() == 0.0
+        assert w.pose_z1_deg[0].item() == pytest.approx(1.0)
+
+    def test_groups_follow_flags_independently(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        assert w._pose_z1.requires_grad and w._pose_z3.requires_grad
+        assert not w._pose_dtheta.requires_grad
+        w.set_optimizer(OptimizerParams.Adam(lr=0.1))
+        assert list(w.get_optimization_parameters()) == ["pose_shifts", "pose_angles"]
+        assert len(w.optimizer.param_groups) == 2  # pyright: ignore[reportOptionalMemberAccess]
+        w.set_learn_pose_shifts(False)  # angles still learned: optimizer rebuilt, not removed
+        assert w.has_optimizer()
+        assert list(w.get_optimization_parameters()) == ["pose_angles"]
+        assert len(w.optimizer.param_groups) == 1  # pyright: ignore[reportOptionalMemberAccess]
+        assert w._pose_z1.requires_grad and not w._pose_shifts.requires_grad
+        w.set_learn_pose_angles(False)
+        assert not w.has_optimizer()
+        assert not w._pose_z1.requires_grad and not w._pose_z3.requires_grad
+        # toggling the shift flag never re-freezes the angles
+        w.set_learn_pose_angles(True)
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_shifts(False)
+        assert w._pose_z1.requires_grad
+
+    def test_single_spec_fans_out_to_both_and_pplr_sets_independent_lrs(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        w.optimizer_params = OptimizerParams.Adam(lr=0.3)
+        assert list(w.optimizer_params) == ["pose_shifts", "pose_angles"]
+        w.set_optimizer(
+            {
+                "pose_shifts": {"name": "adam", "lr": 0.7},
+                "pose_angles": {"name": "adam", "lr": 0.05},
+            }
+        )
+        assert w.pose_group_lr("pose_shifts") == pytest.approx(0.7)
+        assert w.pose_group_lr("pose_angles") == pytest.approx(0.05)
+        assert w.get_current_lr() == pytest.approx(0.7)  # param_groups[0] stays the shifts
+
+    def test_enabling_a_group_without_a_spec_warns_and_removes(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_optimizer({"pose_shifts": {"name": "adam", "lr": 0.7}})
+        with pytest.warns(UserWarning, match="no optimizer spec"):
+            w.set_learn_pose_angles(True)
+        assert not w.has_optimizer()
+        assert w.learn_pose_angles and w._pose_z1.requires_grad
+
+    def test_reference_rows_pinned_across_a_step(self):
+        w = self._learning(lr=0.5)
+        _set_angle_grad(w, torch.ones(3), -torch.ones(3))
+        w.step_optimizer()
+        assert w.pose_z1_deg[REF].item() == 0.0 and w.pose_z3_deg[REF].item() == 0.0
+        assert torch.allclose(w.pose_z1_deg[[0, 2]], torch.full((2,), -0.5), atol=1e-6)
+        assert torch.allclose(w.pose_z3_deg[[0, 2]], torch.full((2,), 0.5), atol=1e-6)
+        assert w.pose_step_count == 1
+        assert torch.equal(w.pose_shifts_A, torch.zeros(3, 2))
+        rms, mx = w.pose_last_angle_grad_stats
+        assert rms == pytest.approx(1.0) and mx == pytest.approx(1.0)
+
+    def test_accumulation_equals_one_step_on_the_mean_gradient(self):
+        torch.manual_seed(1)
+        g1s = [torch.randn(3) for _ in range(3)]
+        g3s = [torch.randn(3) for _ in range(3)]
+        w_acc = self._learning(lr=0.1, opt="sgd")
+        w_acc.set_pose_accum(steps_per_iter=2, batches_per_epoch=6)  # M = 3
+        for g1, g3 in zip(g1s[:2], g3s[:2]):
+            _set_angle_grad(w_acc, g1.clone(), g3.clone())
+            w_acc.step_optimizer()
+            assert torch.equal(w_acc.pose_z1_deg, torch.zeros(3))
+        _set_angle_grad(w_acc, g1s[2].clone(), g3s[2].clone())
+        w_acc.step_optimizer()
+        assert w_acc.pose_step_count == 1
+        w_one = self._learning(lr=0.1, opt="sgd")
+        _set_angle_grad(w_one, torch.stack(g1s).mean(0), torch.stack(g3s).mean(0))
+        w_one.step_optimizer()
+        assert torch.allclose(w_acc.pose_z1_deg, w_one.pose_z1_deg, atol=1e-7)
+        assert torch.allclose(w_acc.pose_z3_deg, w_one.pose_z3_deg, atol=1e-7)
+        assert w_acc.pose_z1_deg[REF].item() == 0.0 and w_acc.pose_z3_deg[REF].item() == 0.0
+        # the residual flush steps the angles too
+        w = self._learning(lr=0.1, opt="sgd")
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=10)
+        for _ in range(2):
+            _set_angle_grad(w, torch.ones(3), torch.ones(3))
+            w.step_optimizer()
+        with pytest.warns(UserWarning, match="does not match"):
+            w.flush_pose_accum()
+        assert w.pose_z1_deg[0].item() == pytest.approx(-0.1)
+
+    def test_reset_returns_angles_to_init(self):
+        w = self._learning(lr=0.5)
+        z1 = torch.tensor([1.0, 0.0, -2.0])
+        z3 = torch.tensor([-1.0, 0.0, 2.0])
+        w.set_pose_angle_init(z1, z3)
+        _set_angle_grad(w, torch.ones(3), torch.ones(3))
+        w.step_optimizer()
+        assert not torch.allclose(w.pose_z1_deg, z1)
+        w.reset()
+        assert torch.allclose(w.pose_z1_deg, z1) and torch.allclose(w.pose_z3_deg, z3)
+        assert torch.equal(w._pose_dtheta, torch.zeros(3))
+        assert w.pose_step_count == 0 and w.learn_pose_angles
+
+    def test_independent_lrs_warmup_and_floors_per_group(self):
+        w = self._learning(shifts=True)
+        w.set_optimizer(
+            {
+                "pose_shifts": {"name": "adam", "lr": 1.0},
+                "pose_angles": {"name": "adam", "lr": 0.2},
+            }
+        )
+        w.set_pose_lr_schedule(
+            hold_steps=1, decay=0.5, floor=0.3, warmup_steps=4, angle_floor=0.02
+        )
+        moved_s, moved_a, lr_a = [], [], []
+        for _ in range(8):
+            s0, a0 = w.pose_shifts_A[0].clone(), w.pose_z1_deg[0].clone()
+            _set_grad(w, torch.ones(3, 2))
+            _set_angle_grad(w, torch.ones(3), torch.ones(3))
+            w.step_optimizer()
+            moved_s.append(float((w.pose_shifts_A[0] - s0).abs().max()))
+            moved_a.append(float((w.pose_z1_deg[0] - a0).abs()))
+            lr_a.append(w.pose_group_lr("pose_angles"))
+        assert moved_s[:4] == pytest.approx([0.25, 0.5, 0.75, 1.0], abs=1e-5)
+        assert moved_a[:4] == pytest.approx([0.05, 0.1, 0.15, 0.2], abs=1e-5)
+        assert lr_a[4:] == pytest.approx([0.2, 0.1, 0.05, 0.025])
+        assert w.pose_group_lr("pose_shifts") == pytest.approx(0.3)  # shift floor, separately
+        for _ in range(2):
+            _set_grad(w, torch.ones(3, 2))
+            _set_angle_grad(w, torch.ones(3), torch.ones(3))
+            w.step_optimizer()
+        assert w.pose_group_lr("pose_angles") == pytest.approx(0.02)  # angle floor
+
+    def test_shifts_only_schedule_unchanged_with_angle_code_present(self):
+        """The phase-1 warm-up/hold/decay numbers, re-asserted with the angle flag explicitly
+        off: the angle machinery must be a no-op on the certified shift path."""
+        w = _pose_wrapper()
+        w.set_learn_pose_angles(False)
+        w.set_learn_pose_shifts(True)
+        w.set_optimizer(OptimizerParams.Adam(lr=1.0))
+        w.set_pose_lr_schedule(hold_steps=1, decay=0.5, floor=0.1, warmup_steps=4)
+        seen, moved = [], []
+        for _ in range(8):
+            before = w.pose_shifts_A[0].clone()
+            _set_grad(w, torch.ones_like(w._pose_shifts))
+            w.step_optimizer()
+            seen.append(w.get_current_lr())
+            moved.append(float((w.pose_shifts_A[0] - before).abs().max()))
+        assert moved[:4] == pytest.approx([0.25, 0.5, 0.75, 1.0], abs=1e-5)
+        assert seen[4:] == pytest.approx([1.0, 0.5, 0.25, 0.125])
+        assert torch.equal(w.pose_z1_deg, torch.zeros(3)) and torch.equal(
+            w.pose_z3_deg, torch.zeros(3)
+        )
+        assert not w._pose_z1.requires_grad
+
+    def test_autoserialize_roundtrip_carries_angles(self, tmp_path):
+        w = _pose_wrapper()
+        w.set_pose_angle_init([1.0, 0.0, -1.0], [-2.0, 0.0, 2.0])
+        w.set_learn_pose_angles(True)
+        path = tmp_path / "tomo_angles.zip"
+        w.save(path, mode="o")
+        w2 = autoserialize_load(path)
+        assert isinstance(w2, PtychoTomoDatasetRaster)
+        assert w2.learn_pose_angles
+        assert torch.allclose(w2.pose_z1_deg, torch.tensor([1.0, 0.0, -1.0]))
+        assert torch.allclose(w2.pose_z3_init_deg, torch.tensor([-2.0, 0.0, 2.0]))
+
+    def test_phase1_wrapper_without_angle_buffers_still_works(self):
+        """A wrapper deserialized from a phase-1 cache has no angle buffers: every angle entry
+        point materialises them (zeros) instead of failing."""
+        w = _pose_wrapper()
+        for name in ("_pose_z1_init", "_pose_z3_init", "_pose_z1_accum", "_pose_z3_accum"):
+            del w._buffers[name]
+        del w._learn_pose_angles
+        assert not w.learn_pose_angles
+        w.set_learn_pose_shifts(True)
+        w.set_optimizer(OptimizerParams.SGD(lr=0.1))
+        _set_grad(w, torch.ones(3, 2))
+        w.step_optimizer()  # shift-only path never touches the missing buffers
+        w.reset()
+        assert torch.equal(w.pose_z1_init_deg, torch.zeros(3))
+        with pytest.warns(UserWarning, match="no optimizer spec"):
+            w.set_learn_pose_angles(True)
+        assert list(w.get_optimization_parameters()) == ["pose_shifts", "pose_angles"]

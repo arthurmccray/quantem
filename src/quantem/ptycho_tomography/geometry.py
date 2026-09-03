@@ -79,6 +79,46 @@ def rot_beam_to_spec(
     return _rz(-z1) @ _rx(x) @ _rz(-z3)
 
 
+def euler_from_rot_beam_to_spec(
+    R: torch.Tensor, nominal_x_deg: torch.Tensor | float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Invert ``rot_beam_to_spec``: ``(T, 3)`` Euler triplets ``(z1, x, z3)`` in degrees from
+    ``(T, 3, 3)`` beam→specimen matrices, plus a ``(T,)`` bool gimbal flag.
+
+    Derivation (components ``(z, y, x)``, ``a = -z1``, ``b = -z3``):
+    ``R = Rz(a) Rx(x) Rz(b)`` has ``R[0] = (cos x, sin x cos b, sin x sin b)`` and
+    ``R[:, 0] = (cos x, -cos a sin x, sin a sin x)``, so ``x = atan2(hypot(R01, R02), R00)``,
+    ``z3 = atan2(-R02, R01)`` and ``z1 = atan2(-R20, -R10)``. The triplet is two-valued —
+    ``(z1 + 180, -x, z3 + 180)`` gives the same matrix — and the branch whose ``x`` is nearest
+    ``nominal_x_deg`` is returned (a negative tilt must read as a negative x, not as a 180°
+    in-plane flip). At ``sin x ≈ 0`` (the reference tilt) z1 and z3 are not separately
+    defined — only their sum — so the sum is returned in z1 with z3 = 0 and the flag set;
+    callers scoring angles must gauge-fix the MATRIX (``R_refᵀ R_t``) and never subtract
+    triplets across that singularity.
+    """
+    Rm = torch.atleast_3d(R)
+    nominal = torch.atleast_1d(torch.as_tensor(nominal_x_deg, dtype=Rm.dtype, device=Rm.device))
+    nominal = torch.broadcast_to(nominal, Rm.shape[:1])
+    rad2deg = 180.0 / torch.pi
+    x_p = torch.atan2(torch.hypot(Rm[:, 0, 1], Rm[:, 0, 2]), Rm[:, 0, 0]) * rad2deg
+    z1_p = torch.atan2(-Rm[:, 2, 0], -Rm[:, 1, 0]) * rad2deg
+    z3_p = torch.atan2(-Rm[:, 0, 2], Rm[:, 0, 1]) * rad2deg
+
+    def wrap(a: torch.Tensor) -> torch.Tensor:
+        return torch.remainder(a + 180.0, 360.0) - 180.0
+
+    alt = torch.stack([wrap(z1_p + 180.0), -x_p, wrap(z3_p + 180.0)], dim=-1)
+    pri = torch.stack([wrap(z1_p), x_p, wrap(z3_p)], dim=-1)
+    take_alt = (alt[:, 1] - nominal).abs() < (pri[:, 1] - nominal).abs()
+    out = torch.where(take_alt[:, None], alt, pri)
+    gimbal = torch.sin(x_p / rad2deg).abs() < 1e-9
+    if bool(gimbal.any()):
+        s = wrap(torch.atan2(Rm[:, 2, 1], Rm[:, 1, 1]) * rad2deg)  # z1 + z3 at sin x = 0
+        gim = torch.stack([s, x_p, torch.zeros_like(s)], dim=-1)
+        out = torch.where(gimbal[:, None], gim, out)
+    return out, gimbal
+
+
 def slab_z_centers(
     num_slices: int,
     total_thickness: float,

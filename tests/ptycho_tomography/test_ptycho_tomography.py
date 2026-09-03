@@ -666,3 +666,138 @@ class TestPoseShifts:
             loaded._apply_pose_metadata(
                 {**loaded._collect_pose_metadata(), "pose_shifts": torch.zeros(2, 2)}
             )
+
+
+class TestPoseAngles:
+    """Phase-2 pose refinement: per-tilt tilt-axis Euler angles z1 / z3 learned inline."""
+
+    def _fd_check(self, inverse_crime_setup, which: str):
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        pt.dset._set_targets("amplitude")
+        n_per = int(np.prod(SCAN_GPTS))
+        tilt = 3  # +30 deg
+        idx = torch.arange(tilt * n_per, (tilt + 1) * n_per)
+        z1 = torch.zeros(len(TILTS))
+        z3 = torch.zeros(len(TILTS))
+        (z1 if which == "z1" else z3)[tilt] = 2.0  # the data were made at 0: truth is 0 deg
+        dset.set_pose_angle_init(z1, z3)
+        dset.set_learn_pose_angles(True)
+        param = dset._pose_z1 if which == "z1" else dset._pose_z3
+        loss = TestPoseShifts._batch_loss(pt, idx)
+        (g,) = torch.autograd.grad(loss, param)
+        analytic = float(g[tilt].detach().cpu())
+        others = [i for i in range(len(TILTS)) if i != tilt]
+        assert torch.equal(g[others].cpu(), torch.zeros(len(others)))
+        # sign: the model sits at +2 deg from the truth, so the loss must rise with the angle
+        assert analytic > 0
+        dset.set_learn_pose_angles(False)
+        h = 0.2
+        vals = []
+        for sgn in (+1.0, -1.0):
+            p1, p3 = z1.clone(), z3.clone()
+            (p1 if which == "z1" else p3)[tilt] += sgn * h
+            dset.set_pose_angle_init(p1, p3)
+            with torch.no_grad():
+                vals.append(TestPoseShifts._batch_loss(pt, idx).item())
+        fd = (vals[0] - vals[1]) / (2 * h)
+        assert np.sign(fd) == np.sign(analytic)
+        assert analytic == pytest.approx(fd, rel=0.1)
+
+    def test_z1_gradient_sign_and_finite_difference(self, inverse_crime_setup):
+        self._fd_check(inverse_crime_setup, "z1")
+
+    def test_z3_gradient_sign_and_finite_difference(self, inverse_crime_setup):
+        self._fd_check(inverse_crime_setup, "z3")
+
+    def test_learned_angles_survive_save_from_file(self, inverse_crime_setup, tmp_path):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        z1 = torch.zeros(len(TILTS))
+        z3 = torch.zeros(len(TILTS))
+        z1[0], z3[0], z1[4], z3[4] = 1.5, -1.5, -1.0, 1.0
+        dset.set_pose_angle_init(z1, z3)
+        dset.set_learn_pose_angles(True)
+        dset.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)
+        pt.reconstruct(
+            num_iters=2,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"pose_angles": {"name": "adam", "lr": 0.1}},
+            },
+            batch_size=64,
+        )
+        hist = pt.pose_history
+        assert [h["iteration"] for h in hist] == [1, 2]
+        assert hist[-1]["pose_steps"] == 2
+        assert hist[-1]["lr_angles"] == pytest.approx(0.1)
+        assert hist[-1]["angle_grad_max"] > 0
+        assert torch.equal(hist[-1]["shifts_A"], torch.zeros(len(TILTS), 2))  # shifts untouched
+        learned1, learned3 = dset.pose_z1_deg, dset.pose_z3_deg
+        ref = dset.reference_tilt_idx
+        assert learned1[ref].item() == 0.0 and learned3[ref].item() == 0.0
+        assert not torch.allclose(learned1, z1)
+        assert torch.allclose(hist[-1]["z1_deg"], learned1)
+        path = tmp_path / "pose_angles.zip"
+        pt.save(path, mode="o")
+        wrapper2 = _make_wrapper(arrays)
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
+        d2 = loaded.dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        assert d2.learn_pose_angles is True and d2.learn_pose_shifts is False
+        assert torch.allclose(d2.pose_z1_deg, learned1) and torch.allclose(
+            d2.pose_z3_deg, learned3
+        )
+        assert torch.allclose(d2.pose_z1_init_deg, z1) and torch.allclose(d2.pose_z3_init_deg, z3)
+        assert len(loaded.pose_history) == 2
+        with pytest.raises(ValueError, match="tilts"):
+            loaded._apply_pose_metadata(
+                {**loaded._collect_pose_metadata(), "pose_z1_deg": torch.zeros(2)}
+            )
+        # a phase-1-shaped metadata dict (no angle keys) still loads: angles stay zero, frozen
+        meta = loaded._collect_pose_metadata()
+        for k in (
+            "pose_z1_deg",
+            "pose_z3_deg",
+            "pose_z1_init_deg",
+            "pose_z3_init_deg",
+            "learn_pose_angles",
+        ):
+            meta.pop(k)
+        loaded._apply_pose_metadata(meta)
+        assert not d2.learn_pose_angles
+        assert torch.allclose(d2.pose_z1_deg, learned1)  # untouched, not zeroed
+
+    def test_shifts_only_history_schema_is_the_phase1_one(self, inverse_crime_setup):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        dset.set_learn_pose_shifts(True)
+        dset.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)
+        pt.reconstruct(
+            num_iters=1,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"name": "adam", "lr": 0.05},
+            },
+            batch_size=64,
+        )
+        assert set(pt.pose_history[-1]) == {
+            "iteration",
+            "loss",
+            "shifts_A",
+            "lr",
+            "pose_steps",
+            "grad_rms",
+            "grad_max",
+        }
+        assert torch.equal(dset.pose_z1_deg, torch.zeros(len(TILTS)))
