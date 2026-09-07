@@ -8,10 +8,14 @@ DataLoader protocol, multi-GPU samplers, and ``error_estimate`` then work unchan
 
 Per-tilt geometry (tilt angle + pose-correction slots) lives here, mirroring the tomography
 module's design. Phase 1 of pose refinement (2026-08) makes the per-tilt beam-frame SHIFTS a
-learned quantity (``set_learn_pose_shifts``); the angle slots stay frozen. ``forward`` returns a ``forward`` returns a :class:`PtychoTomoPatchData` payload carrying
-beam-frame patch coordinates, per-element beam->specimen rotation matrices and (when active)
-per-element beam-frame shifts, which the rotation-aware object models consume. Only implicit (coordinate-queried) object models are
-supported — there is no integer patch-index path through a rotated volume.
+learned quantity (``set_learn_pose_shifts``), phase 2 the tilt-axis angles z1 / z3
+(``set_learn_pose_angles``), and task 2 (2026-09) a per-dataset probe DEFOCUS offset
+(``set_learn_defocus``; it moves only the probe, through the reconstruction loop's probe
+pre-propagation, never the object query). ``forward`` returns a :class:`PtychoTomoPatchData`
+payload carrying beam-frame patch coordinates, per-element beam->specimen rotation matrices and
+(when active) per-element beam-frame shifts, which the rotation-aware object models consume.
+Only implicit (coordinate-queried) object models are supported — there is no integer
+patch-index path through a rotated volume.
 """
 
 import warnings
@@ -45,18 +49,21 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     learning. Pose refinement: the per-tilt beam-frame shift ``_pose_shifts`` (phase 1) and the
     per-tilt tilt-axis Euler angles ``_pose_z1`` / ``_pose_z3`` (phase 2) are learnable
     (``set_learn_pose_shifts`` / ``set_learn_pose_angles``, each gauge-fixed by pinning the
-    reference tilt — see the pose refinement region); ``_pose_dtheta`` (the tilt-angle offset)
-    exists but stays frozen. Per-tilt CoM rotation is forced to zero — solving it per tilt would
-    scramble the cross-tilt geometry.
+    reference tilt — see the pose refinement region), as is the per-dataset probe defocus
+    offset ``_defocus_offset_A`` (task 2, ``set_learn_defocus``, same gauge); ``_pose_dtheta``
+    (the tilt-angle offset) exists but stays frozen. Per-tilt CoM rotation is forced to zero —
+    solving it per tilt would scramble the cross-tilt geometry.
     """
 
     # registered buffer / parameter types (mirrors the base's _patch_indices declaration)
     _tilt_offsets: torch.Tensor
     _tilt_angles_deg: torch.Tensor
     _slab_window_flag: torch.Tensor
-    # transient per-batch stash (slab-window mode): consumed once by
-    # PtychoTomography.forward_operator, never serialized non-None
-    _last_window_dz_A: torch.Tensor | None = None
+    # transient per-batch stash: the offset (Å along the beam) the PROBE must be Fresnel
+    # pre-propagated by for each batch element -- the slab-window offset minus the per-dataset
+    # defocus offset. Consumed once by PtychoTomography.forward_operator, never serialized
+    # non-None. (The payload's ``window_dz_A``, which moves the OBJECT query, is separate.)
+    _last_probe_dz_A: torch.Tensor | None = None
     _scan_center_px: torch.Tensor
     _pose_z1: nn.Parameter
     _pose_dtheta: nn.Parameter
@@ -68,6 +75,14 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _pose_z3_init: torch.Tensor
     _pose_z1_accum: torch.Tensor
     _pose_z3_accum: torch.Tensor
+    _defocus_offset_A: nn.Parameter
+    _defocus_offset_init_A: torch.Tensor
+    _defocus_offset_accum: torch.Tensor
+    # class-level defaults so a wrapper deserialized from a pre-defocus cache (which bypasses
+    # ``__init__``) reads them in ``forward`` without any per-call guard; the parameter and
+    # buffers themselves are materialised lazily by ``_ensure_defocus_state``
+    _learn_defocus: bool = False
+    _defocus_active: bool = False
 
     def __init__(
         self,
@@ -155,9 +170,24 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self.register_buffer("_pose_z3_init", torch.zeros(num_tilts, dtype=real_dtype))
         self.register_buffer("_pose_z1_accum", torch.zeros(num_tilts, dtype=real_dtype))
         self.register_buffer("_pose_z3_accum", torch.zeros(num_tilts, dtype=real_dtype))
+        # Task 2: per-DATASET probe defocus offset (Å) with the same baseline / accumulator pair.
+        # One row per entry of ``tilt_datasets``, indexed by ``tilt_index_of`` like every pose
+        # row -- never keyed by the tilt-angle value, so a defocus series (several datasets
+        # sharing one angle) reuses it unchanged; the reference row is the reference DATASET.
+        # ``effective defocus of dataset t = probe-model defocus + _defocus_offset_A[t]``; the
+        # forward realises it by pre-propagating the probe by ``-offset`` (see ``forward``).
+        # A defocus error common to every dataset is the learned probe's business, so the
+        # reference row is pinned (gauge) exactly like the shift and angle rows.
+        self._defocus_offset_A = nn.Parameter(
+            torch.zeros(num_tilts, dtype=real_dtype), requires_grad=False
+        )
+        self.register_buffer("_defocus_offset_init_A", torch.zeros(num_tilts, dtype=real_dtype))
+        self.register_buffer("_defocus_offset_accum", torch.zeros(num_tilts, dtype=real_dtype))
         self._learn_pose_shifts: bool = False
         self._learn_pose_angles: bool = False
+        self._learn_defocus: bool = False
         self._pose_shifts_active: bool = False  # gather shifts_A in forward (learning or nonzero)
+        self._defocus_active: bool = False  # gather the defocus offset in forward (same rule)
         self._reference_tilt_idx: int = int(np.argmin(np.abs(angles)))
         self._pose_steps_per_iter: int = 0  # 0 = per-batch steps (M = 1)
         self._pose_accum_steps: int = 1  # M: batches accumulated per pose step
@@ -167,6 +197,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_lr_decay: float = 1.0
         self._pose_lr_floor: float = 0.0
         self._pose_angle_lr_floor: float = 0.0  # deg/step floor for the ``pose_angles`` group
+        self._pose_defocus_lr_floor: float = 0.0  # Å/step floor for the ``pose_defocus`` group
         self._pose_lr_warmup: int = 0
         # LR of every pose group at the first pose step (warm-up target), keyed by group name
         self._pose_lr_base: dict[str, float] | None = None
@@ -176,6 +207,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_last_grad_max: float = 0.0
         self._pose_last_angle_grad_rms: float = 0.0
         self._pose_last_angle_grad_max: float = 0.0
+        self._pose_last_defocus_grad_rms: float = 0.0
+        self._pose_last_defocus_grad_max: float = 0.0
         # Beam-frame coordinate origin in scan-grid pixels (set at preprocess): the center of
         # the scan grid, anchored to the specimen-box center. Coordinates are emitted in Å
         # relative to this point (see PtychoTomoPatchData).
@@ -263,9 +296,14 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     # physically displaced by +d in the beam frame is recovered as shift = +d. Angles:
     # ``rotations() = rot_beam_to_spec(_pose_z1, tilt + _pose_dtheta, _pose_z3)`` (degrees,
     # geometry.py) -- the beam->specimen matrix the object is queried with; a series whose tilt
-    # axis is rotated in-plane by +phi is recovered as z1 = +phi, z3 = -phi. Gauge: the
-    # reference tilt's rows (shift and both angles) are pinned to their baselines (gradient
-    # masked after the DDP all-reduce, value re-copied after every optimizer step).
+    # axis is rotated in-plane by +phi is recovered as z1 = +phi, z3 = -phi. Defocus:
+    # ``_defocus_offset_A[t]`` (Å) is ADDED to the probe model's defocus for dataset t, realised
+    # by propagating the probe by ``-offset`` (the probe is ``A(k) exp(+i pi lambda k^2 f)``,
+    # C10 = -f, and propagation by dz multiplies by ``exp(-i pi lambda k^2 dz)``, so propagating
+    # by dz LOWERS the defocus by dz -- pinned by test_ptycho_tomography.py::TestPoseDefocus);
+    # data taken with the probe at f + d are recovered as offset = +d. Gauge: the reference
+    # tilt's rows (shift, both angles, defocus) are pinned to their baselines (gradient masked
+    # after the DDP all-reduce, value re-copied after every optimizer step).
     @property
     def learn_pose_shifts(self) -> bool:
         return self._learn_pose_shifts
@@ -303,6 +341,23 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_z1.requires_grad_(enabled)
         self._pose_z3.requires_grad_(enabled)
         self._pose_dtheta.requires_grad_(False)
+        self._sync_pose_optimizer(changed)
+
+    @property
+    def learn_defocus(self) -> bool:
+        return self._learn_defocus
+
+    def set_learn_defocus(self, enabled: bool) -> None:
+        """Make the per-dataset probe defocus offset learnable (one ``pose_defocus`` optimizer
+        group, LR in Å/step). The forward gathers the offset only while it is learned or
+        nonzero (``_defocus_active``, refreshed here with one device sync -- never per
+        forward), so the no-defocus path stays bit-identical."""
+        self._ensure_defocus_state()
+        enabled = bool(enabled)
+        changed = enabled != self._learn_defocus
+        self._learn_defocus = enabled
+        self._defocus_offset_A.requires_grad_(enabled)
+        self._refresh_defocus_active()
         self._sync_pose_optimizer(changed)
 
     def _sync_pose_optimizer(self, changed: bool) -> None:
@@ -353,12 +408,39 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             (self._pose_z3, self._pose_z3_init, self._pose_z3_accum),
         )
 
+    def _has_defocus_state(self) -> bool:
+        return "_defocus_offset_A" in self._parameters
+
+    def _ensure_defocus_state(self) -> None:
+        """Materialise the task-2 defocus parameter and buffers on a wrapper deserialized from
+        a phase-1/2 cache (zeros = that state: no defocus offset, frozen). Called by every
+        defocus entry point and by ``reset()``."""
+        if self._has_defocus_state():
+            return
+        ref = self._pose_z1.detach()
+        self._defocus_offset_A = nn.Parameter(torch.zeros_like(ref), requires_grad=False)
+        self.register_buffer("_defocus_offset_init_A", torch.zeros_like(ref))
+        self.register_buffer("_defocus_offset_accum", torch.zeros_like(ref))
+        self._learn_defocus = False
+        self._defocus_active = False
+
     def _refresh_pose_shifts_active(self) -> None:
         # one device sync per call (never per forward): the gather is only skipped when nothing
         # could change the payload, which keeps the no-pose path bit-identical
         self._pose_shifts_active = self._learn_pose_shifts or bool(
             (self._pose_shifts.detach() != 0).any().item()
         )
+
+    def _refresh_defocus_active(self) -> None:
+        # same rule as the shifts: the probe pre-propagation is only skipped when nothing could
+        # change it (keeps the no-defocus path bit-identical and FFT-free)
+        self._defocus_active = self._learn_defocus or bool(
+            (self._defocus_offset_A.detach() != 0).any().item()
+        )
+
+    def _zero_defocus_accum(self) -> None:
+        if self._has_defocus_state():
+            self._defocus_offset_accum.zero_()
 
     @property
     def reference_tilt_idx(self) -> int:
@@ -385,6 +467,13 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 f"reference tilt {idx} has a nonzero angle baseline (z1, z3) = "
                 f"({float(self._pose_z1_init[idx])}, {float(self._pose_z3_init[idx])}) deg; it "
                 "is pinned there (gauge) and will not be learned",
+                stacklevel=2,
+            )
+        if self._has_defocus_state() and bool((self._defocus_offset_init_A[idx] != 0).item()):
+            warnings.warn(
+                f"reference tilt {idx} has a nonzero defocus baseline "
+                f"{float(self._defocus_offset_init_A[idx])} Å; it is pinned there (gauge) and "
+                "will not be learned",
                 stacklevel=2,
             )
 
@@ -417,6 +506,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts.copy_(t)
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
         self._pose_accum_count = 0
         self._refresh_pose_shifts_active()
 
@@ -473,7 +563,52 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_z3.copy_(z3)
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
         self._pose_accum_count = 0
+
+    def set_defocus_init(self, offsets_A: "float | np.ndarray | torch.Tensor | list[Any]") -> None:
+        """Set the per-dataset defocus-offset baseline ``(num_tilts,)`` in Å (a scalar
+        broadcasts to every dataset) and start the live parameter there -- the defocus twin of
+        ``set_pose_shift_init``: the "start here" knob and the deliberate-perturbation knob.
+        The reference dataset's entry is forced to zero (gauge: a common offset belongs to the
+        probe). ``reset()`` returns to this baseline."""
+        self._ensure_defocus_state()
+        p = self._defocus_offset_A
+        t = torch.as_tensor(np.asarray(offsets_A, dtype=float), dtype=p.dtype, device=p.device)
+        if t.ndim == 0:
+            t = t.expand(self.num_tilts).clone()
+        if t.shape != (self.num_tilts,):
+            raise ValueError(
+                f"offsets_A must be a scalar or have shape ({self.num_tilts},), got "
+                f"{tuple(t.shape)}"
+            )
+        ref = self._reference_tilt_idx
+        if bool((t[ref] != 0).item()):
+            warnings.warn(
+                f"reference tilt {ref} defocus init {float(t[ref])} Å ignored (gauge: zeroed)",
+                stacklevel=2,
+            )
+            t = t.clone()
+            t[ref] = 0.0
+        with torch.no_grad():
+            self._defocus_offset_init_A.copy_(t)
+            p.copy_(t)
+            self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
+        self._pose_accum_count = 0
+        self._refresh_defocus_active()
+
+    @property
+    def defocus_offset_A(self) -> torch.Tensor:
+        """Detached copy of the live per-dataset defocus-offset table, ``(num_tilts,)`` Å."""
+        self._ensure_defocus_state()
+        return self._defocus_offset_A.detach().clone()
+
+    @property
+    def defocus_offset_init_A(self) -> torch.Tensor:
+        self._ensure_defocus_state()
+        return self._defocus_offset_init_A.detach().clone()
 
     @property
     def pose_z1_deg(self) -> torch.Tensor:
@@ -525,6 +660,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         with torch.no_grad():
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
 
     @property
     def pose_accum_steps(self) -> int:
@@ -548,6 +684,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         of the loss), over the non-reference rows of both angles."""
         return self._pose_last_angle_grad_rms, self._pose_last_angle_grad_max
 
+    @property
+    def pose_last_defocus_grad_stats(self) -> tuple[float, float]:
+        """``(rms, max)`` of the defocus-offset gradient used by the most recent pose step
+        (Å⁻¹ units of the loss), over the non-reference rows."""
+        return self._pose_last_defocus_grad_rms, self._pose_last_defocus_grad_max
+
     def set_pose_lr_schedule(
         self,
         hold_steps: int = 0,
@@ -555,6 +697,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         floor: float = 0.0,
         warmup_steps: int = 0,
         angle_floor: float = 0.0,
+        defocus_floor: float = 0.0,
     ) -> None:
         """Per-pose-step LR schedule: ramp linearly from ``lr / warmup_steps`` to the optimizer's
         LR over the first ``warmup_steps`` steps (so the first Adam steps cannot outrun a small
@@ -563,7 +706,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         step per epoch and Adam's step is ~lr regardless of the gradient, so the LR is a travel
         budget in Å. The schedule is shared by every pose group (one pose step steps them all);
         each group ramps from and decays toward its own LR, with ``floor`` for ``pose_shifts``
-        (Å/step) and ``angle_floor`` for ``pose_angles`` (deg/step)."""
+        (Å/step), ``angle_floor`` for ``pose_angles`` (deg/step) and ``defocus_floor`` for
+        ``pose_defocus`` (Å/step)."""
         if not 0.0 < float(decay) <= 1.0:
             raise ValueError("decay must be in (0, 1]")
         if int(warmup_steps) < 0:
@@ -572,6 +716,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._pose_lr_decay = float(decay)
         self._pose_lr_floor = float(floor)
         self._pose_angle_lr_floor = float(angle_floor)
+        self._pose_defocus_lr_floor = float(defocus_floor)
         self._pose_lr_warmup = int(warmup_steps)
         self._pose_lr_base = None
 
@@ -613,8 +758,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             return
         if self._pose_step_count <= self._pose_lr_hold + self._pose_lr_warmup:
             return
+        floors = {
+            "pose_angles": self._pose_angle_lr_floor,
+            "pose_defocus": getattr(self, "_pose_defocus_lr_floor", 0.0),
+        }
         for name, pg in self._pose_param_groups():
-            floor = self._pose_angle_lr_floor if name == "pose_angles" else self._pose_lr_floor
+            floor = floors.get(name, self._pose_lr_floor)
             pg["lr"] = max(floor, float(pg["lr"]) * self._pose_lr_decay)
 
     def step_optimizer(self) -> None:
@@ -625,7 +774,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         """
         if self._optimizer is None:
             return
-        learning = self._learn_pose_shifts or self.learn_pose_angles
+        learning = self._learn_pose_shifts or self.learn_pose_angles or self.learn_defocus
         if not learning or self._pose_accum_steps <= 1:
             self._pose_step(mean_of=None)
             return
@@ -638,6 +787,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 for p, _init, acc in self._pose_angle_slots():
                     if p.grad is not None:
                         acc.add_(p.grad)
+        if self.learn_defocus and self._defocus_offset_A.grad is not None:
+            with torch.no_grad():
+                self._defocus_offset_accum.add_(self._defocus_offset_A.grad)
         self._pose_accum_count += 1
         if self._pose_accum_count >= self._pose_accum_steps:
             self._pose_step(mean_of=self._pose_accum_count)
@@ -646,12 +798,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         if self._optimizer is None:
             return
         angles = self.learn_pose_angles
-        learning = self._learn_pose_shifts or angles
+        defocus = self.learn_defocus
+        learning = self._learn_pose_shifts or angles or defocus
         if mean_of is not None:
             self._pose_shifts.grad = self._pose_shifts_accum / float(max(1, mean_of))
             if angles:
                 for p, _init, acc in self._pose_angle_slots():
                     p.grad = acc / float(max(1, mean_of))
+            if defocus:
+                self._defocus_offset_A.grad = self._defocus_offset_accum / float(max(1, mean_of))
         ref = self._reference_tilt_idx
         if self._learn_pose_shifts and self._pose_shifts.grad is not None:
             self._pose_shifts.grad[ref] = 0.0  # gauge: after the all-reduce, before the step
@@ -672,6 +827,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                     (ga.square().sum() / (ga.shape[0] * n)).sqrt().item()
                 )
                 self._pose_last_angle_grad_max = float(ga.abs().max().item())
+        if defocus and self._defocus_offset_A.grad is not None:
+            self._defocus_offset_A.grad[ref] = 0.0  # same gauge mask for the defocus row
+            gd = self._defocus_offset_A.grad.detach()
+            n = max(1, int(gd.shape[0]) - 1)
+            self._pose_last_defocus_grad_rms = float((gd.square().sum() / n).sqrt().item())
+            self._pose_last_defocus_grad_max = float(gd.abs().max().item())
         if learning:
             self._pose_lr_before_step()
         self._optimizer.step()
@@ -682,6 +843,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             with torch.no_grad():
                 for p, init, _acc in self._pose_angle_slots():
                     p[ref] = init[ref]  # re-pin the reference angle rows
+        if defocus:
+            with torch.no_grad():
+                self._defocus_offset_A[ref] = self._defocus_offset_init_A[ref]  # re-pin
         if learning:
             self._pose_step_count += 1
             self._pose_lr_step()
@@ -689,6 +853,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             with torch.no_grad():
                 self._pose_shifts_accum.zero_()
                 self._zero_pose_angle_accum()
+                self._zero_defocus_accum()
             self._pose_accum_count = 0
 
     def flush_pose_accum(self) -> None:
@@ -711,21 +876,23 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """Learnable dataset groups: the base descan / scan-position groups plus ``pose_shifts``
-        (shifts) and ``pose_angles`` (z1, z3) when learned. This dict is also the DDP surface
-        (broadcast + all-reduce iterate it), so adding a group here is the whole multi-GPU
-        integration."""
+        (shifts), ``pose_angles`` (z1, z3) and ``pose_defocus`` (per-dataset defocus offset)
+        when learned. This dict is also the DDP surface (broadcast + all-reduce iterate it), so
+        adding a group here is the whole multi-GPU integration."""
         groups = super().get_optimization_parameters()
         if self._learn_pose_shifts:
             groups["pose_shifts"] = [self._pose_shifts]
         if self.learn_pose_angles:
             groups["pose_angles"] = [self._pose_z1, self._pose_z3]
+        if self.learn_defocus:
+            groups["pose_defocus"] = [self._defocus_offset_A]
         return groups
 
     def _normalize_optimizer_params(self, params):
-        """Fan a single optimizer spec out to every learnable group (incl. ``pose_shifts`` and
-        ``pose_angles`` -- note a single spec then shares one LR between Å/step and deg/step;
-        use the PPLR dict form for independent LRs); an explicit PPLR dict passes through and is
-        key-checked by ``set_optimizer``."""
+        """Fan a single optimizer spec out to every learnable group (incl. ``pose_shifts``,
+        ``pose_angles`` and ``pose_defocus`` -- note a single spec then shares one LR between
+        Å/step and deg/step; use the PPLR dict form for independent LRs); an explicit PPLR dict
+        passes through and is key-checked by ``set_optimizer``."""
         norm = OptimizerMixin._normalize_optimizer_params(self, params)
         if set(norm) == {self.DEFAULT_OPTIMIZER_KEY}:
             spec = norm[self.DEFAULT_OPTIMIZER_KEY]
@@ -736,14 +903,15 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                     ("scan_positions", self.learn_scan_positions),
                     ("pose_shifts", getattr(self, "_learn_pose_shifts", False)),
                     ("pose_angles", getattr(self, "_learn_pose_angles", False)),
+                    ("pose_defocus", self.learn_defocus),
                 )
                 if on
             ]
             if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
                 warnings.warn(
                     f"{type(self).__name__}: an optimizer was requested but nothing is learnable "
-                    "(learn_descan, learn_scan_positions, learn_pose_shifts and "
-                    "learn_pose_angles are all False); the optimizer will be removed.",
+                    "(learn_descan, learn_scan_positions, learn_pose_shifts, learn_pose_angles "
+                    "and learn_defocus are all False); the optimizer will be removed.",
                     stacklevel=2,
                 )
             return {key: replace(spec) for key in learnable} if learnable else {}
@@ -924,7 +1092,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         coordinates, as for any implicit object) and ``descan_shifts=None`` (frozen in v1; the
         targets are descan-centered). The first element is the opaque object-query payload the
         reconstruction loop forwards to the (rotation-aware) object model; it carries the
-        per-position beam-frame pose shift (``shifts_A``) whenever one is active.
+        per-position beam-frame pose shift (``shifts_A``) whenever one is active. The per-batch
+        probe z-offset (slab-window offset minus the per-dataset defocus offset) is stashed in
+        ``_last_probe_dz_A`` for ``PtychoTomography.forward_operator``, which consumes it once;
+        the defocus never enters the payload (it moves the probe, not the object query).
         """
         if not self._implicit_object:
             raise RuntimeError(
@@ -941,9 +1112,21 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # pre-pose path) unless shifts are being learned or a nonzero table is loaded
         shifts_A = self._pose_shifts[tilt_idx] if self._pose_shifts_active else None
         window_dz = self._window_dz_A(bidx, rotations, shifts_A) if self.slab_window else None
+        # per-tilt -> per-position gather of the defocus offset (Å); None unless it is being
+        # learned or a nonzero table is loaded. Propagating the probe by dz LOWERS its defocus
+        # by dz (see the region comment), so an extra defocus of +offset is propagation by
+        # -offset. The slab-window offset follows the shifted specimen and also moves the
+        # object query (payload.window_dz_A); the defocus moves ONLY the probe.
+        offset = self._defocus_offset_A[tilt_idx] if self._defocus_active else None
+        if offset is None:
+            probe_dz = window_dz  # today's path: the very same tensor (or None)
+        elif window_dz is None:
+            probe_dz = -offset
+        else:
+            probe_dz = window_dz - offset
         # transient per-batch stash for the reconstruction loop's probe pre-propagation
         # (PtychoTomography.forward_operator consumes it exactly once and clears it)
-        self._last_window_dz_A = window_dz
+        self._last_probe_dz_A = probe_dz
         payload = PtychoTomoPatchData(
             coords_yx_A=coords_A,
             rotations=rotations,
@@ -1028,23 +1211,28 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
     def reset(self) -> None:
-        """Restore positions/descan, zero the (frozen) ``_pose_dtheta`` and return the shifts
-        and the z1 / z3 angles to their baselines (``set_pose_shift_init`` /
-        ``set_pose_angle_init``, zeros by default). The learn flags, reference tilt, accumulation
-        and LR-schedule settings survive, like ``set_slab_window``."""
+        """Restore positions/descan, zero the (frozen) ``_pose_dtheta`` and return the shifts,
+        the z1 / z3 angles and the defocus offsets to their baselines (``set_pose_shift_init`` /
+        ``set_pose_angle_init`` / ``set_defocus_init``, zeros by default). The learn flags,
+        reference tilt, accumulation and LR-schedule settings survive, like
+        ``set_slab_window``."""
         super().reset()
         self._ensure_pose_angle_state()
+        self._ensure_defocus_state()
         with torch.no_grad():
             self._pose_z1.copy_(self._pose_z1_init)
             self._pose_dtheta.zero_()
             self._pose_z3.copy_(self._pose_z3_init)
             self._pose_shifts.copy_(self._pose_shifts_init)
+            self._defocus_offset_A.copy_(self._defocus_offset_init_A)
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
         self._pose_accum_count = 0
         self._pose_step_count = 0
         self._pose_lr_base = None
         self._refresh_pose_shifts_active()
+        self._refresh_defocus_active()
 
 
 PtychoTomoDatasetType = PtychoTomoDatasetRaster

@@ -137,6 +137,10 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             "pose_z1_init_deg": dset.pose_z1_init_deg.cpu(),
             "pose_z3_init_deg": dset.pose_z3_init_deg.cpu(),
             "learn_pose_angles": bool(dset.learn_pose_angles),
+            # task 2: per-dataset defocus offset (Å); pre-defocus zips lack these keys
+            "defocus_offset_A": dset.defocus_offset_A.cpu(),
+            "defocus_offset_init_A": dset.defocus_offset_init_A.cpu(),
+            "learn_defocus": bool(dset.learn_defocus),
         }
 
     def _apply_pose_metadata(self, meta: "dict[str, Any]") -> None:
@@ -168,22 +172,41 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             with torch.no_grad():
                 dset._pose_z1.copy_(z1.to(dset._pose_z1.device, dset._pose_z1.dtype))
                 dset._pose_z3.copy_(z3.to(dset._pose_z3.device, dset._pose_z3.dtype))
+        if "defocus_offset_A" in meta:
+            df = torch.as_tensor(meta["defocus_offset_A"])
+            if tuple(df.shape) != (dset.num_tilts,):
+                raise ValueError(
+                    f"saved defocus offsets have shape {tuple(df.shape)} but the attached "
+                    f"wrapper has {dset.num_tilts} tilts"
+                )
+            dset.set_defocus_init(meta["defocus_offset_init_A"])
+            with torch.no_grad():
+                p = dset._defocus_offset_A
+                p.copy_(df.to(p.device, p.dtype))
         dset.set_learn_pose_shifts(bool(meta["learn_pose_shifts"]))
         dset.set_learn_pose_angles(bool(meta.get("learn_pose_angles", False)))
+        # last: the flag call refreshes the "gather in forward" switch from the live table
+        dset.set_learn_defocus(bool(meta.get("learn_defocus", False)))
 
     @property
     def pose_history(self) -> "list[dict[str, Any]]":
         """Per-iteration ``{iteration, loss, shifts_A (num_tilts, 2) Å, lr, pose_steps, grad_rms,
         grad_max}`` records (rank 0), recorded whenever a pose slot was being learned; when the
         angles are learned each record also carries ``z1_deg, z3_deg (num_tilts,), lr_angles,
-        angle_grad_rms, angle_grad_max``."""
+        angle_grad_rms, angle_grad_max``, and when the defocus is learned ``defocus_A
+        (num_tilts,), lr_defocus, defocus_grad_rms, defocus_grad_max``."""
         return list(self._pose_history or [])
 
     def _record_iter(self, iter_loss: float, autograd: bool) -> None:
         super()._record_iter(iter_loss, autograd)
         dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         learn_angles = bool(getattr(dset, "learn_pose_angles", False))
-        if not getattr(dset, "learn_pose_shifts", False) and not learn_angles:
+        learn_defocus = bool(getattr(dset, "learn_defocus", False))
+        if (
+            not getattr(dset, "learn_pose_shifts", False)
+            and not learn_angles
+            and not learn_defocus
+        ):
             return
         if self._pose_history is None:
             self._pose_history = []
@@ -202,6 +225,11 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             record["lr_angles"] = float(dset.pose_group_lr("pose_angles"))
             record["angle_grad_rms"] = float(dset.pose_last_angle_grad_stats[0])
             record["angle_grad_max"] = float(dset.pose_last_angle_grad_stats[1])
+        if learn_defocus:
+            record["defocus_A"] = dset.defocus_offset_A.cpu()
+            record["lr_defocus"] = float(dset.pose_group_lr("pose_defocus"))
+            record["defocus_grad_rms"] = float(dset.pose_last_defocus_grad_stats[0])
+            record["defocus_grad_max"] = float(dset.pose_last_defocus_grad_stats[1])
         self._pose_history.append(record)
 
     def _reset_iter_constraints(self) -> None:
@@ -443,19 +471,23 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Base forward operator plus the slab-window probe pre-propagation (2026-07-16).
+        """Base forward operator plus the probe z-offset pre-propagation (2026-07-16 / 2026-09).
 
-        In slab-window mode the dataset stashes the per-batch window offset ``dz`` (Å along the
-        beam) during ``dset.forward``; the physical probe is fixed in the lab, so the probe
-        entering a window displaced by ``dz`` is the probe Fresnel-propagated by ``dz`` — the
-        same ``exp(-iπ λ dz k²)`` factor as the inter-slice propagators, per batch element.
-        The stash is consumed exactly once per batch step (train and validation both rebuild it
-        via ``dset.forward``); nothing changes when the mode is off.
+        The dataset stashes ``_last_probe_dz_A`` (Å along the beam, per batch element) during
+        ``dset.forward``: the slab-window offset minus the per-dataset learned defocus offset.
+        The physical probe is fixed in the lab, so the probe entering a window displaced by
+        ``dz`` is the probe Fresnel-propagated by ``dz`` — the same ``exp(-iπ λ dz k²)`` factor
+        as the inter-slice propagators — and propagating by ``dz`` lowers the probe's defocus
+        by ``dz``, so a defocus offset of ``+δ`` is propagation by ``-δ`` (sign pinned by
+        ``TestPoseDefocus``). The slab-window part also moves the object query through the
+        payload's ``window_dz_A``; the defocus part moves only the probe. The stash is consumed
+        exactly once per batch step (train and validation both rebuild it via ``dset.forward``);
+        it is ``None``, and nothing here runs, when neither mode is active.
         """
-        dz = getattr(self.dset, "_last_window_dz_A", None)
+        dz = getattr(self.dset, "_last_probe_dz_A", None)
         if dz is not None:
             # consume-once: no staleness, clean serialization
-            cast(PtychoTomoDatasetRaster, self.dset)._last_window_dz_A = None  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+            cast(PtychoTomoDatasetRaster, self.dset)._last_probe_dz_A = None  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
             shifted_input_probes = self._pre_propagate_probes(shifted_input_probes, dz)
         return super().forward_operator(obj_patches, shifted_input_probes, descan)
 
@@ -662,8 +694,9 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
         Iteration snapshots (lightweight object state_dicts) round-trip like the base class's;
         pass ``skip=("_snapshots",)`` to drop them for a leaner save. The learned pose state
-        (shift table, baseline, learn flag, reference tilt) is stashed alongside the base
-        dataset metadata and re-applied by ``from_file(dset=...)``.
+        (shift, angle and defocus-offset tables with their baselines and learn flags, and the
+        reference tilt) is stashed alongside the base dataset metadata and re-applied by
+        ``from_file(dset=...)``.
         """
         if not save_raw_data and self._dset is not None:
             self._pose_metadata = self._collect_pose_metadata()

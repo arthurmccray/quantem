@@ -19,6 +19,7 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.probe_models import ProbePixelated
+from quantem.diffractive_imaging.ptychography import Ptychography
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
 from quantem.ptycho_tomography.object_models import ObjectVoxelTomo
 from quantem.ptycho_tomography.ptycho_tomography import PtychoTomography
@@ -42,13 +43,13 @@ NUM_SLICES = 6
 NUM_Z_VOX = 6
 
 
-def _probe_array() -> np.ndarray:
+def _probe_array(c10: float = C10) -> np.ndarray:
     sampling = 1 / Q_MAX / 2
     reciprocal_sampling = 2 * Q_MAX / N
     qx = qy = np.fft.fftfreq(N, sampling)
     q = np.sqrt(qx[:, None] ** 2 + qy[None, :] ** 2)
     aperture = np.sqrt(np.clip((Q_PROBE - q) / reciprocal_sampling + 0.5, 0, 1))
-    chi = q**2 * electron_wavelength_angstrom(PROBE_ENERGY) * np.pi * C10
+    chi = q**2 * electron_wavelength_angstrom(PROBE_ENERGY) * np.pi * c10
     probe_fourier = aperture * np.exp(-1j * chi)
     probe_fourier /= np.sqrt(np.sum(np.abs(probe_fourier) ** 2))
     return (np.fft.ifft2(probe_fourier) * N).astype(np.complex64)
@@ -71,22 +72,22 @@ def _make_wrapper(arrays_per_tilt: list[np.ndarray]) -> PtychoTomoDatasetRaster:
     return PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
 
 
-def _make_probe() -> ProbePixelated:
+def _make_probe(c10: float = C10) -> ProbePixelated:
     return ProbePixelated.from_array(
         num_probes=1,
-        probe_params={"energy": PROBE_ENERGY, "C10": C10, "semiangle_cutoff": _semiangle_mrad()},
-        probe_array=_probe_array(),
+        probe_params={"energy": PROBE_ENERGY, "C10": c10, "semiangle_cutoff": _semiangle_mrad()},
+        probe_array=_probe_array(c10),
     )
 
 
-def _make_ptycho(wrapper: PtychoTomoDatasetRaster) -> PtychoTomography:
+def _make_ptycho(wrapper: PtychoTomoDatasetRaster, c10: float = C10) -> PtychoTomography:
     obj = ObjectVoxelTomo.from_uniform(
         thickness_A=THICKNESS_A, num_slices=NUM_SLICES, num_z_voxels=NUM_Z_VOX, rng=0
     )
     pt = PtychoTomography.from_models(
         dset=wrapper,
         obj_model=obj,
-        probe_model=_make_probe(),
+        probe_model=_make_probe(c10),
         detector_model=DetectorPixelated(),
         rng=0,
         verbose=False,
@@ -475,7 +476,9 @@ class TestSlabWindow:
         expected = -torch.tan(torch.deg2rad(tilts)) * y_c
         assert torch.allclose(dz, expected.to(dz.dtype), atol=1e-5)
         # the transient probe stash was set by forward and matches the payload
-        assert dset._last_window_dz_A is dz
+        assert (
+            dset._last_probe_dz_A is dz
+        )  # with no defocus offset the probe stash IS the window offset
 
     def test_pre_propagate_probes_roundtrip_and_slab_consistency(self, inverse_crime_setup):
         arrays, _gt = inverse_crime_setup
@@ -801,3 +804,245 @@ class TestPoseAngles:
             "grad_max",
         }
         assert torch.equal(dset.pose_z1_deg, torch.zeros(len(TILTS)))
+
+
+class TestPoseDefocus:
+    """Task 2: per-dataset probe defocus offset -- sign pinned against the code, wiring, gradient,
+    bit-identical no-defocus path, save / resume."""
+
+    DZ = 200.0  # Å; the fixture aperture is ~4.9 mrad (depth of field ~800 Å), so hundreds of Å
+    DELTA = 300.0
+
+    @staticmethod
+    def _params_probe(pt: PtychoTomography, defocus: float) -> torch.Tensor:
+        """The runner's probe path: ``ProbePixelated.from_params({"defocus": f})`` ->
+        ``set_initial_probe`` -> ``real_space_probe`` (C10 = -defocus inside)."""
+        recip = 2 * Q_MAX / N
+        pm = ProbePixelated.from_params(
+            {"energy": PROBE_ENERGY, "semiangle_cutoff": _semiangle_mrad(), "defocus": defocus},
+            device=str(pt._single_device),
+        )
+        pm.set_initial_probe((N, N), np.array([recip, recip]), 1.0)
+        assert pm.probe_params["aberration_coefs"]["C10"] == pytest.approx(-defocus)
+        return pm.probe.detach()  # (1, H, W)
+
+    def test_pre_propagate_lowers_defocus_by_dz(self, inverse_crime_setup):
+        """``_pre_propagate_probes(P(defocus=f), dz) == P(defocus=f - dz)``: propagating the
+        probe forward by dz LOWERS its defocus by dz. Checked on the runner's own probe
+        construction and on the fixture's hand-built ``A(k) exp(-i pi lambda k^2 C10)``."""
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        f, dz = 100.0, self.DZ
+        p_f = self._params_probe(pt, f)
+        p_lo = self._params_probe(pt, f - dz)
+        p_hi = self._params_probe(pt, f + dz)
+        out = pt._pre_propagate_probes(p_f[:, None], torch.tensor([dz]))[:, 0]
+        scale = float(p_f.abs().max())
+        err_lo = float((out - p_lo).abs().max()) / scale
+        err_hi = float((out - p_hi).abs().max()) / scale
+        assert err_lo < 1e-5, f"propagation by +dz must give P(f - dz): {err_lo:.2e}"
+        assert err_hi > 100 * err_lo, f"P(f + dz) must be far worse: {err_hi:.2e}"
+        # the fixture's hand-built probe (C10 = -f): P(C10) -> P(C10 + dz) under the same op
+        dev = p_f.device
+        c10 = 40.0
+        q_c = torch.as_tensor(_probe_array(c10), device=dev)[None, None]
+        q_lo = torch.as_tensor(_probe_array(c10 + dz), device=dev)[None]
+        out2 = pt._pre_propagate_probes(q_c, torch.tensor([dz]))[:, 0]
+        assert torch.allclose(out2, q_lo, atol=1e-5 * float(q_lo.abs().max()))
+
+    def test_offset_sign_probe_at_f_plus_delta_with_offset_minus_delta(self, inverse_crime_setup):
+        """The data were made with the probe at C10 (defocus f = -C10). A model whose probe sits
+        at f + delta reproduces them only when the dataset carries offset = -delta (effective
+        defocus = probe defocus + offset); +delta is orders of magnitude worse."""
+        arrays, gt = inverse_crime_setup
+        delta = self.DELTA
+        n_scan = int(np.prod(SCAN_GPTS))
+        tilt = 3  # +30 deg, not the reference
+        ref = torch.as_tensor(arrays[tilt]).reshape(n_scan, N, N)
+        errs = {}
+        for sign in (-1.0, +1.0):
+            pt = _make_ptycho(_make_wrapper(arrays), c10=C10 - delta)  # probe at f + delta
+            obj = pt.obj_model
+            assert isinstance(obj, ObjectVoxelTomo)
+            obj.set_volume(gt)
+            dset = pt.dset
+            assert isinstance(dset, PtychoTomoDatasetRaster)
+            table = torch.zeros(len(TILTS))
+            table[tilt] = sign * delta
+            dset.set_defocus_init(table)
+            preds = _forward_all(pt)[tilt * n_scan : (tilt + 1) * n_scan]
+            errs[sign] = float((preds - ref).norm() / ref.norm())
+        assert errs[-1.0] < 1e-5, f"offset -delta must reproduce the data: {errs[-1.0]:.2e}"
+        assert errs[+1.0] > 100 * errs[-1.0], f"offset +delta must be far worse: {errs}"
+
+    def test_one_tilt_offset_moves_only_that_tilt(self, inverse_crime_setup):
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        n_scan = int(np.prod(SCAN_GPTS))
+        base = _forward_all(pt)
+        table = torch.zeros(len(TILTS))
+        table[0] = 50.0
+        dset.set_defocus_init(table)
+        moved = _forward_all(pt)
+        # the other tilts pass through the (unitary) pre-propagation with dz = 0, i.e. an FFT
+        # round trip: unchanged up to float32 roundoff, while the offset tilt moves materially
+        scale = float(base.abs().max())
+        d_other = float((moved[n_scan:] - base[n_scan:]).abs().max()) / scale
+        d_tilt = float((moved[:n_scan] - base[:n_scan]).abs().max()) / scale
+        assert d_other < 1e-5, f"untouched tilts moved by {d_other:.2e} (roundoff only)"
+        assert d_tilt > 100 * d_other, f"offset tilt moved {d_tilt:.2e} vs others {d_other:.2e}"
+
+    def test_defocus_gradient_sign_and_finite_difference(self, inverse_crime_setup):
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        pt.dset._set_targets("amplitude")
+        n_per = int(np.prod(SCAN_GPTS))
+        tilt = 3  # +30 deg
+        idx = torch.arange(tilt * n_per, (tilt + 1) * n_per)
+        base = torch.zeros(len(TILTS))
+        base[tilt] = 100.0  # the data were made at offset 0: the model sits +100 Å away
+        dset.set_defocus_init(base)
+        dset.set_learn_defocus(True)
+        loss = TestPoseShifts._batch_loss(pt, idx)
+        (g,) = torch.autograd.grad(loss, dset._defocus_offset_A)
+        analytic = float(g[tilt].detach().cpu())
+        others = [i for i in range(len(TILTS)) if i != tilt]
+        assert torch.equal(g[others].cpu(), torch.zeros(len(others)))
+        assert analytic > 0  # the loss must rise with the offset away from the truth
+        dset.set_learn_defocus(False)
+        h = 10.0
+        vals = []
+        for sgn in (+1.0, -1.0):
+            pert = base.clone()
+            pert[tilt] += sgn * h
+            dset.set_defocus_init(pert)
+            with torch.no_grad():
+                vals.append(TestPoseShifts._batch_loss(pt, idx).item())
+        fd = (vals[0] - vals[1]) / (2 * h)
+        assert np.sign(fd) == np.sign(analytic)
+        assert analytic == pytest.approx(fd, rel=0.1)
+
+    def test_no_defocus_forward_is_bit_identical_to_the_base_operator(self, inverse_crime_setup):
+        """With the defocus code present but inactive, ``forward_operator`` is ``torch.equal``
+        to the base class's on the same inputs and the probe stash stays ``None`` -- also after
+        the learn flag has been switched on and off again with a zero table."""
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        idx = torch.arange(0, 40)  # spans two tilts
+        for toggle in (False, True):
+            if toggle:
+                dset.set_learn_defocus(True)
+                dset.set_learn_defocus(False)
+            with torch.no_grad():
+                patch_data, _pos, frac, descan = dset.forward(idx, pt.obj_padding_px)
+                assert dset._last_probe_dz_A is None
+                probes = pt.probe_model.forward(frac)
+                patches = pt.obj_model.forward(patch_data)
+                _, ov = pt.forward_operator(patches, probes, descan)
+                _, ov_base = Ptychography.forward_operator(pt, patches, probes, descan)
+            assert torch.equal(ov, ov_base)
+            assert dset._last_probe_dz_A is None
+
+    def test_learned_defocus_survives_save_from_file(self, inverse_crime_setup, tmp_path):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        init = torch.zeros(len(TILTS))
+        init[0], init[4] = 20.0, -15.0
+        dset.set_defocus_init(init)
+        dset.set_learn_defocus(True)
+        dset.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)
+        pt.reconstruct(
+            num_iters=2,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"pose_defocus": {"name": "adam", "lr": 5.0}},
+            },
+            batch_size=64,
+        )
+        hist = pt.pose_history
+        assert [h["iteration"] for h in hist] == [1, 2]
+        assert hist[-1]["pose_steps"] == 2
+        assert hist[-1]["lr_defocus"] == pytest.approx(5.0)
+        assert hist[-1]["defocus_grad_max"] > 0
+        assert torch.equal(hist[-1]["shifts_A"], torch.zeros(len(TILTS), 2))  # shifts untouched
+        assert "z1_deg" not in hist[-1]
+        learned = dset.defocus_offset_A
+        ref = dset.reference_tilt_idx
+        assert learned[ref].item() == 0.0
+        assert not torch.allclose(learned, init)
+        assert torch.allclose(hist[-1]["defocus_A"], learned)
+        path = tmp_path / "pose_defocus.zip"
+        pt.save(path, mode="o")
+        wrapper2 = _make_wrapper(arrays)
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
+        d2 = loaded.dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        assert d2.learn_defocus is True and d2._defocus_active
+        assert d2.learn_pose_shifts is False and d2.learn_pose_angles is False
+        assert torch.allclose(d2.defocus_offset_A, learned)
+        assert torch.allclose(d2.defocus_offset_init_A, init)
+        assert len(loaded.pose_history) == 2
+        d2.forward(torch.arange(3), loaded.obj_padding_px)
+        assert d2._last_probe_dz_A is not None
+        assert torch.allclose(d2._last_probe_dz_A.cpu(), -learned[[0, 0, 0]])
+        with pytest.raises(ValueError, match="tilts"):
+            loaded._apply_pose_metadata(
+                {**loaded._collect_pose_metadata(), "defocus_offset_A": torch.zeros(2)}
+            )
+        # a phase-1/2-shaped metadata dict (no defocus keys) still loads: flag off, table kept
+        meta = loaded._collect_pose_metadata()
+        for k in ("defocus_offset_A", "defocus_offset_init_A", "learn_defocus"):
+            meta.pop(k)
+        loaded._apply_pose_metadata(meta)
+        assert not d2.learn_defocus
+        assert torch.allclose(d2.defocus_offset_A, learned)  # untouched, not zeroed
+
+    def test_defocus_only_history_schema(self, inverse_crime_setup):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        dset.set_learn_defocus(True)
+        dset.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)
+        pt.reconstruct(
+            num_iters=1,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"name": "adam", "lr": 1.0},
+            },
+            batch_size=64,
+        )
+        rec = pt.pose_history[-1]
+        assert set(rec) == {
+            "iteration",
+            "loss",
+            "shifts_A",
+            "lr",
+            "pose_steps",
+            "grad_rms",
+            "grad_max",
+            "defocus_A",
+            "lr_defocus",
+            "defocus_grad_rms",
+            "defocus_grad_max",
+        }
+        assert torch.equal(rec["shifts_A"], torch.zeros(len(TILTS), 2))
+        assert rec["defocus_A"][dset.reference_tilt_idx].item() == 0.0

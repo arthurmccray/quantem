@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import load as autoserialize_load
 from quantem.core.ml.optimizer_mixin import OptimizerParams
@@ -714,3 +715,296 @@ class TestPoseAngles:
         with pytest.warns(UserWarning, match="no optimizer spec"):
             w.set_learn_pose_angles(True)
         assert list(w.get_optimization_parameters()) == ["pose_shifts", "pose_angles"]
+
+
+def _set_defocus_grad(w: PtychoTomoDatasetRaster, g: torch.Tensor) -> None:
+    w._defocus_offset_A.grad = g  # pyright: ignore[reportAttributeAccessIssue] -- test-only fake gradient
+
+
+class TestPoseDefocus:
+    """Task 2: per-dataset probe defocus offset learned inline (the twin of the angle slot)."""
+
+    @staticmethod
+    def _learning(lr=0.5, opt="adam", shifts=False, angles=False):
+        w = _pose_wrapper()
+        if shifts:
+            w.set_learn_pose_shifts(True)
+        if angles:
+            w.set_learn_pose_angles(True)
+        w.set_learn_defocus(True)
+        spec = OptimizerParams.Adam(lr=lr) if opt == "adam" else OptimizerParams.SGD(lr=lr)
+        w.set_optimizer(spec)
+        return w
+
+    def test_parameter_shape_dtype_and_frozen_at_construction(self):
+        w = _pose_wrapper()
+        p = w._defocus_offset_A
+        assert isinstance(p, torch.nn.Parameter)
+        assert p.shape == (len(TILTS),)  # one row per constituent dataset
+        assert p.dtype == getattr(torch, config.get("dtype_real"))
+        assert p.device == w._pose_shifts.device
+        assert not p.requires_grad and not w.learn_defocus
+        assert torch.equal(w.defocus_offset_A, torch.zeros(3))
+        assert torch.equal(w.defocus_offset_init_A, torch.zeros(3))
+        assert w.get_optimization_parameters() == {}
+        w.forward(torch.tensor([0, N_PER, 2 * N_PER]), (8, 8))
+        assert w._last_probe_dz_A is None  # nothing active: no probe pre-propagation
+
+    def test_init_broadcasts_validates_and_zeroes_reference(self):
+        w = _pose_wrapper()
+        with pytest.raises(ValueError, match="shape"):
+            w.set_defocus_init(np.zeros(2))
+        with pytest.raises(ValueError, match="shape"):
+            w.set_defocus_init(np.zeros((3, 1)))
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_defocus_init(5.0)  # a scalar broadcasts; the reference row is zeroed
+        assert torch.equal(w.defocus_offset_A, torch.tensor([5.0, 0.0, 5.0]))
+        assert torch.equal(w.defocus_offset_init_A, torch.tensor([5.0, 0.0, 5.0]))
+        with torch.no_grad():
+            w._defocus_offset_accum.fill_(1.0)
+            w._pose_shifts_accum.fill_(1.0)
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_defocus_init([1.0, 2.0, -3.0])
+        assert torch.equal(w.defocus_offset_A, torch.tensor([1.0, 0.0, -3.0]))
+        assert torch.equal(w._defocus_offset_accum, torch.zeros(3))
+        assert torch.equal(w._pose_shifts_accum, torch.zeros(3, 2))
+        assert w._defocus_active and not w.learn_defocus  # nonzero table applies even frozen
+        w.set_defocus_init(0.0)
+        assert not w._defocus_active
+        with pytest.warns(UserWarning, match="defocus baseline"):
+            w.set_defocus_init([0.0, 0.0, 4.0])
+            w.reference_tilt_idx = 2
+
+    def test_reset_returns_to_baseline_and_keeps_flag(self):
+        w = self._learning(lr=0.5)
+        init = torch.tensor([1.0, 0.0, -2.0])
+        w.set_defocus_init(init)
+        _set_defocus_grad(w, torch.ones(3))
+        w.step_optimizer()
+        assert not torch.allclose(w.defocus_offset_A, init)
+        w.reset()
+        assert torch.allclose(w.defocus_offset_A, init)
+        assert w.learn_defocus and w._defocus_offset_A.requires_grad and w._defocus_active
+        assert w.pose_step_count == 0
+        assert torch.equal(w.pose_shifts_A, torch.zeros(3, 2))
+        assert torch.equal(w.pose_z1_deg, torch.zeros(3))
+
+    def test_groups_follow_flags_and_keep_a_stable_order(self):
+        w = _pose_wrapper()
+        w.set_learn_defocus(True)
+        assert w._defocus_offset_A.requires_grad and w._defocus_active
+        assert list(w.get_optimization_parameters()) == ["pose_defocus"]
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        w.set_optimizer(OptimizerParams.Adam(lr=0.1))
+        assert list(w.get_optimization_parameters()) == [
+            "pose_shifts",
+            "pose_angles",
+            "pose_defocus",
+        ]
+        assert len(w.optimizer.param_groups) == 3  # pyright: ignore[reportOptionalMemberAccess]
+        w.set_learn_pose_shifts(False)  # rebuilt, not removed
+        assert w.has_optimizer()
+        assert list(w.get_optimization_parameters()) == ["pose_angles", "pose_defocus"]
+        assert len(w.optimizer.param_groups) == 2  # pyright: ignore[reportOptionalMemberAccess]
+        w.set_learn_pose_angles(False)
+        assert list(w.get_optimization_parameters()) == ["pose_defocus"]
+        assert w._defocus_offset_A.requires_grad and not w._pose_z1.requires_grad
+        w.set_learn_defocus(False)
+        assert not w.has_optimizer()
+        assert not w._defocus_offset_A.requires_grad and not w._defocus_active
+        assert not w._pose_dtheta.requires_grad
+
+    def test_single_spec_fans_out_to_all_three_and_pplr_sets_independent_lrs(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        w.set_learn_defocus(True)
+        w.optimizer_params = OptimizerParams.Adam(lr=0.3)
+        assert list(w.optimizer_params) == ["pose_shifts", "pose_angles", "pose_defocus"]
+        w.set_optimizer(
+            {
+                "pose_shifts": {"name": "adam", "lr": 0.7},
+                "pose_angles": {"name": "adam", "lr": 0.05},
+                "pose_defocus": {"name": "adam", "lr": 2.0},
+            }
+        )
+        assert w.pose_group_lr("pose_shifts") == pytest.approx(0.7)
+        assert w.pose_group_lr("pose_angles") == pytest.approx(0.05)
+        assert w.pose_group_lr("pose_defocus") == pytest.approx(2.0)
+        assert w.get_current_lr() == pytest.approx(0.7)
+
+    def test_enabling_defocus_without_a_spec_warns_and_removes(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_optimizer({"pose_shifts": {"name": "adam", "lr": 0.7}})
+        with pytest.warns(UserWarning, match="no optimizer spec"):
+            w.set_learn_defocus(True)
+        assert not w.has_optimizer()
+        assert w.learn_defocus and w._defocus_offset_A.requires_grad
+
+    def test_reference_row_pinned_across_a_step_and_grad_stats(self):
+        w = self._learning(lr=0.5)
+        _set_defocus_grad(w, torch.tensor([1.0, 1.0, -1.0]))
+        w.step_optimizer()
+        assert w.defocus_offset_A[REF].item() == 0.0
+        assert torch.allclose(w.defocus_offset_A[[0, 2]], torch.tensor([-0.5, 0.5]), atol=1e-6)
+        assert w.pose_step_count == 1
+        rms, mx = w.pose_last_defocus_grad_stats
+        assert rms == pytest.approx(1.0) and mx == pytest.approx(1.0)
+        assert torch.equal(w.pose_shifts_A, torch.zeros(3, 2))  # other slots untouched
+        assert torch.equal(w.pose_z1_deg, torch.zeros(3))
+
+    def test_accumulation_equals_one_step_on_the_mean_gradient(self):
+        torch.manual_seed(2)
+        gs = [torch.randn(3) for _ in range(3)]
+        w_acc = self._learning(lr=0.1, opt="sgd")
+        w_acc.set_pose_accum(steps_per_iter=2, batches_per_epoch=6)  # M = 3
+        for g in gs[:2]:
+            _set_defocus_grad(w_acc, g.clone())
+            w_acc.step_optimizer()
+            assert torch.equal(w_acc.defocus_offset_A, torch.zeros(3))  # not stepped yet
+        _set_defocus_grad(w_acc, gs[2].clone())
+        w_acc.step_optimizer()
+        assert w_acc.pose_step_count == 1
+        w_one = self._learning(lr=0.1, opt="sgd")
+        _set_defocus_grad(w_one, torch.stack(gs).mean(0))
+        w_one.step_optimizer()
+        assert torch.allclose(w_acc.defocus_offset_A, w_one.defocus_offset_A, atol=1e-7)
+        assert w_acc.defocus_offset_A[REF].item() == 0.0
+        assert torch.equal(w_acc._defocus_offset_accum, torch.zeros(3))
+        # the residual flush steps the defocus too
+        w = self._learning(lr=0.1, opt="sgd")
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=10)
+        for _ in range(2):
+            _set_defocus_grad(w, torch.ones(3))
+            w.step_optimizer()
+        with pytest.warns(UserWarning, match="does not match"):
+            w.flush_pose_accum()
+        assert w.defocus_offset_A[0].item() == pytest.approx(-0.1)
+
+    def test_independent_lr_floor_warmup_and_decay_for_the_defocus_group(self):
+        w = self._learning(shifts=True, angles=True)
+        w.set_optimizer(
+            {
+                "pose_shifts": {"name": "adam", "lr": 1.0},
+                "pose_angles": {"name": "adam", "lr": 0.2},
+                "pose_defocus": {"name": "adam", "lr": 0.4},
+            }
+        )
+        w.set_pose_lr_schedule(
+            hold_steps=1, decay=0.5, floor=0.3, warmup_steps=4, angle_floor=0.02, defocus_floor=0.1
+        )
+        moved_d, lr_d = [], []
+        for _ in range(8):
+            d0 = w.defocus_offset_A[0].clone()
+            _set_grad(w, torch.ones(3, 2))
+            _set_angle_grad(w, torch.ones(3), torch.ones(3))
+            _set_defocus_grad(w, torch.ones(3))
+            w.step_optimizer()
+            moved_d.append(float((w.defocus_offset_A[0] - d0).abs()))
+            lr_d.append(w.pose_group_lr("pose_defocus"))
+        assert moved_d[:4] == pytest.approx([0.1, 0.2, 0.3, 0.4], abs=1e-5)  # warm-up ramp
+        assert lr_d[4:] == pytest.approx([0.4, 0.2, 0.1, 0.1])  # hold, decay, defocus floor
+        assert w.pose_group_lr("pose_shifts") == pytest.approx(0.3)  # the other floors, separately
+        assert w.pose_group_lr("pose_angles") == pytest.approx(0.025)
+
+    def test_shift_and_angle_paths_unchanged_with_defocus_code_present(self):
+        """The certified shift / angle machinery must be a no-op on the defocus slot: the
+        phase-1 schedule numbers re-asserted with the defocus flag explicitly off."""
+        w = _pose_wrapper()
+        w.set_learn_defocus(False)
+        w.set_learn_pose_shifts(True)
+        w.set_learn_pose_angles(True)
+        w.set_optimizer(OptimizerParams.Adam(lr=1.0))
+        w.set_pose_lr_schedule(hold_steps=1, decay=0.5, floor=0.1, warmup_steps=4)
+        seen, moved = [], []
+        for _ in range(8):
+            before = w.pose_shifts_A[0].clone()
+            _set_grad(w, torch.ones_like(w._pose_shifts))
+            _set_angle_grad(w, torch.ones(3), torch.ones(3))
+            w.step_optimizer()
+            seen.append(w.get_current_lr())
+            moved.append(float((w.pose_shifts_A[0] - before).abs().max()))
+        assert moved[:4] == pytest.approx([0.25, 0.5, 0.75, 1.0], abs=1e-5)
+        assert seen[4:] == pytest.approx([1.0, 0.5, 0.25, 0.125])
+        assert torch.equal(w.defocus_offset_A, torch.zeros(3))
+        assert not w._defocus_offset_A.requires_grad and not w._defocus_active
+        assert list(w.get_optimization_parameters()) == ["pose_shifts", "pose_angles"]
+        w.forward(torch.tensor([0, N_PER, 2 * N_PER]), (8, 8))
+        assert w._last_probe_dz_A is None
+
+    def test_autoserialize_roundtrip_carries_defocus(self, tmp_path):
+        w = _pose_wrapper()
+        w.set_defocus_init([1.0, 0.0, -2.0])
+        w.set_learn_defocus(True)
+        path = tmp_path / "tomo_defocus.zip"
+        w.save(path, mode="o")
+        w2 = autoserialize_load(path)
+        assert isinstance(w2, PtychoTomoDatasetRaster)
+        assert w2.learn_defocus and w2._defocus_active
+        assert torch.allclose(w2.defocus_offset_A, torch.tensor([1.0, 0.0, -2.0]))
+        assert torch.allclose(w2.defocus_offset_init_A, torch.tensor([1.0, 0.0, -2.0]))
+        idx = torch.tensor([0, N_PER, 2 * N_PER + 3])
+        w2.forward(idx, (8, 8))
+        assert w2._last_probe_dz_A is not None
+        assert torch.allclose(w2._last_probe_dz_A, torch.tensor([-1.0, 0.0, 2.0]))
+
+    def test_pre_defocus_wrapper_materialises_zeros(self):
+        """A wrapper deserialized from a phase-1/2 cache has no defocus parameter, buffers or
+        flags: the shift / angle path never touches them and every defocus entry point
+        materialises zeros instead of failing."""
+        w = _pose_wrapper()
+        del w._parameters["_defocus_offset_A"]
+        for name in ("_defocus_offset_init_A", "_defocus_offset_accum"):
+            del w._buffers[name]
+        del w._learn_defocus
+        del w._defocus_active
+        assert not w.learn_defocus and not w._defocus_active  # class-level defaults
+        w.forward(torch.tensor([0, N_PER]), (8, 8))
+        assert w._last_probe_dz_A is None
+        w.set_learn_pose_shifts(True)
+        w.set_optimizer(OptimizerParams.SGD(lr=0.1))
+        _set_grad(w, torch.ones(3, 2))
+        w.step_optimizer()  # shift-only path never touches the missing state
+        assert not w._has_defocus_state()
+        w.reset()
+        assert w._has_defocus_state()
+        assert torch.equal(w.defocus_offset_A, torch.zeros(3))
+        assert torch.equal(w.defocus_offset_init_A, torch.zeros(3))
+        with pytest.warns(UserWarning, match="no optimizer spec"):
+            w.set_learn_defocus(True)
+        assert list(w.get_optimization_parameters()) == ["pose_shifts", "pose_defocus"]
+
+    def test_forward_stash_is_the_probe_offset_and_never_the_object_query(self):
+        w = _pose_wrapper()
+        idx = torch.tensor([0, 3, N_PER, 2 * N_PER + 1, 2 * N_PER])
+        table = torch.tensor([1.5, 0.0, -4.0])
+        w.set_defocus_init(table)
+        payload, *_ = w.forward(idx, (8, 8))
+        dz = w._last_probe_dz_A
+        assert dz is not None and dz.shape == (5,)
+        # no slab window: the probe is propagated by MINUS the offset (offset = +d raises the
+        # effective defocus by d; propagation lowers it), gathered per position
+        assert torch.allclose(dz, -table[w.tilt_index_of(idx)])
+        assert payload.window_dz_A is None and payload.shifts_A is None
+        # a live (frozen) table keeps applying: the value, not the flag, decides
+        assert not w.learn_defocus
+        # learning with a zero table is still "active" (the gather must build the graph)
+        w.set_defocus_init(0.0)
+        w.set_learn_defocus(True)
+        w.forward(idx, (8, 8))
+        assert w._last_probe_dz_A is not None and torch.equal(w._last_probe_dz_A, torch.zeros(5))
+        w.set_learn_defocus(False)
+        # slab window on: the stash is window_dz - offset while the payload's window offset
+        # (the object query) does not see the defocus at all
+        w.set_slab_window(True)
+        w.set_defocus_init(table)
+        idx = torch.arange(2 * N_PER, 3 * N_PER)  # the +35 deg tilt
+        rot = w.rotations()[w.tilt_index_of(idx)]
+        window = w._window_dz_A(idx, rot)
+        payload, *_ = w.forward(idx, (8, 8))
+        assert payload.window_dz_A is not None
+        assert torch.allclose(payload.window_dz_A, window)
+        assert w._last_probe_dz_A is not None
+        assert torch.allclose(w._last_probe_dz_A, window + 4.0)
