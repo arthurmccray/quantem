@@ -13,7 +13,6 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import torch
-
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
@@ -466,7 +465,7 @@ class TestSlabWindow:
         assert isinstance(dset, PtychoTomoDatasetRaster)
         idx = torch.arange(dset.num_gpts)
         payload, _pos, _frac, _descan = dset.forward(idx, pt.obj_padding_px)
-        dz = payload.window_dz_A
+        dz = getattr(payload, "window_dz_A")
         assert dz is not None and dz.shape == (dset.num_gpts,)
         # expected: window center on the specimen mid-plane => dz = -tan(tilt) * y_scan_A
         center = dset._scan_center_px
