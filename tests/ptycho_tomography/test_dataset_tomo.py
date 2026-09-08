@@ -4,6 +4,8 @@ Uses small random Dataset4dstem stacks (the wrapper's mechanics don't need physi
 the physically meaningful end-to-end checks live in test_ptycho_tomography.py.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import torch
@@ -750,30 +752,40 @@ class TestPoseDefocus:
         w.forward(torch.tensor([0, N_PER, 2 * N_PER]), (8, 8))
         assert w._last_probe_dz_A is None  # nothing active: no probe pre-propagation
 
-    def test_init_broadcasts_validates_and_zeroes_reference(self):
+    def test_init_broadcasts_validates_and_keeps_reference(self):
+        """No gauge on the defocus slot (2026-09-07): the reference row's init is kept, not
+        zeroed, and moving the reference does not warn about a nonzero defocus baseline."""
         w = _pose_wrapper()
         with pytest.raises(ValueError, match="shape"):
             w.set_defocus_init(np.zeros(2))
         with pytest.raises(ValueError, match="shape"):
             w.set_defocus_init(np.zeros((3, 1)))
-        with pytest.warns(UserWarning, match="gauge"):
-            w.set_defocus_init(5.0)  # a scalar broadcasts; the reference row is zeroed
-        assert torch.equal(w.defocus_offset_A, torch.tensor([5.0, 0.0, 5.0]))
-        assert torch.equal(w.defocus_offset_init_A, torch.tensor([5.0, 0.0, 5.0]))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            w.set_defocus_init(5.0)  # a scalar broadcasts to EVERY row, the reference included
+        assert torch.equal(w.defocus_offset_A, torch.tensor([5.0, 5.0, 5.0]))
+        assert torch.equal(w.defocus_offset_init_A, torch.tensor([5.0, 5.0, 5.0]))
         with torch.no_grad():
             w._defocus_offset_accum.fill_(1.0)
             w._pose_shifts_accum.fill_(1.0)
-        with pytest.warns(UserWarning, match="gauge"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             w.set_defocus_init([1.0, 2.0, -3.0])
-        assert torch.equal(w.defocus_offset_A, torch.tensor([1.0, 0.0, -3.0]))
+        assert torch.equal(w.defocus_offset_A, torch.tensor([1.0, 2.0, -3.0]))
         assert torch.equal(w._defocus_offset_accum, torch.zeros(3))
         assert torch.equal(w._pose_shifts_accum, torch.zeros(3, 2))
         assert w._defocus_active and not w.learn_defocus  # nonzero table applies even frozen
         w.set_defocus_init(0.0)
         assert not w._defocus_active
-        with pytest.warns(UserWarning, match="defocus baseline"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             w.set_defocus_init([0.0, 0.0, 4.0])
-            w.reference_tilt_idx = 2
+            w.reference_tilt_idx = 2  # no "defocus baseline" warning: nothing is pinned
+        assert torch.equal(w.defocus_offset_A, torch.tensor([0.0, 0.0, 4.0]))
+        # the shift gauge is untouched by the defocus rule: its reference row is still zeroed
+        with pytest.warns(UserWarning, match="gauge"):
+            w.set_pose_shift_init(np.ones((3, 2)))
+        assert torch.equal(w.pose_shifts_A[2], torch.zeros(2))
 
     def test_reset_returns_to_baseline_and_keeps_flag(self):
         w = self._learning(lr=0.5)
@@ -843,15 +855,24 @@ class TestPoseDefocus:
         assert not w.has_optimizer()
         assert w.learn_defocus and w._defocus_offset_A.requires_grad
 
-    def test_reference_row_pinned_across_a_step_and_grad_stats(self):
+    def test_reference_row_moves_like_any_other_across_a_step_and_grad_stats(self):
+        """The reference row is NOT pinned for the defocus slot: it steps with the others,
+        and the gradient stats are taken over all rows."""
         w = self._learning(lr=0.5)
         _set_defocus_grad(w, torch.tensor([1.0, 1.0, -1.0]))
         w.step_optimizer()
-        assert w.defocus_offset_A[REF].item() == 0.0
-        assert torch.allclose(w.defocus_offset_A[[0, 2]], torch.tensor([-0.5, 0.5]), atol=1e-6)
+        assert torch.allclose(w.defocus_offset_A, torch.tensor([-0.5, -0.5, 0.5]), atol=1e-6)
         assert w.pose_step_count == 1
         rms, mx = w.pose_last_defocus_grad_stats
         assert rms == pytest.approx(1.0) and mx == pytest.approx(1.0)
+        # a nonzero reference init is kept and the row keeps moving from there
+        w2 = self._learning(lr=0.5)
+        w2.set_defocus_init([0.0, 3.0, 0.0])
+        _set_defocus_grad(w2, torch.tensor([0.0, 1.0, 0.0]))
+        w2.step_optimizer()
+        assert w2.defocus_offset_A[REF].item() == pytest.approx(2.5, abs=1e-6)
+        w2.reset()
+        assert w2.defocus_offset_A[REF].item() == 3.0
         assert torch.equal(w.pose_shifts_A, torch.zeros(3, 2))  # other slots untouched
         assert torch.equal(w.pose_z1_deg, torch.zeros(3))
 
@@ -871,7 +892,7 @@ class TestPoseDefocus:
         _set_defocus_grad(w_one, torch.stack(gs).mean(0))
         w_one.step_optimizer()
         assert torch.allclose(w_acc.defocus_offset_A, w_one.defocus_offset_A, atol=1e-7)
-        assert w_acc.defocus_offset_A[REF].item() == 0.0
+        assert w_acc.defocus_offset_A[REF].item() != 0.0  # the reference row steps too
         assert torch.equal(w_acc._defocus_offset_accum, torch.zeros(3))
         # the residual flush steps the defocus too
         w = self._learning(lr=0.1, opt="sgd")

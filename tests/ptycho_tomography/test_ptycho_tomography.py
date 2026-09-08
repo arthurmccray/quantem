@@ -984,7 +984,7 @@ class TestPoseDefocus:
         assert "z1_deg" not in hist[-1]
         learned = dset.defocus_offset_A
         ref = dset.reference_tilt_idx
-        assert learned[ref].item() == 0.0
+        assert learned[ref].item() != 0.0  # no gauge pin: the reference row is learned too
         assert not torch.allclose(learned, init)
         assert torch.allclose(hist[-1]["defocus_A"], learned)
         path = tmp_path / "pose_defocus.zip"
@@ -1044,4 +1044,4 @@ class TestPoseDefocus:
             "defocus_grad_max",
         }
         assert torch.equal(rec["shifts_A"], torch.zeros(len(TILTS), 2))
-        assert rec["defocus_A"][dset.reference_tilt_idx].item() == 0.0
+        assert rec["defocus_A"][dset.reference_tilt_idx].item() != 0.0  # reference learned too

@@ -11,7 +11,8 @@ module's design. Phase 1 of pose refinement (2026-08) makes the per-tilt beam-fr
 learned quantity (``set_learn_pose_shifts``), phase 2 the tilt-axis angles z1 / z3
 (``set_learn_pose_angles``), and task 2 (2026-09) a per-dataset probe DEFOCUS offset
 (``set_learn_defocus``; it moves only the probe, through the reconstruction loop's probe
-pre-propagation, never the object query). ``forward`` returns a :class:`PtychoTomoPatchData`
+pre-propagation, never the object query; unlike the shifts and the angles it has NO pinned
+reference row -- every dataset's offset is learned, decision 2026-09-07). ``forward`` returns a :class:`PtychoTomoPatchData`
 payload carrying beam-frame patch coordinates, per-element beam->specimen rotation matrices and
 (when active) per-element beam-frame shifts, which the rotation-aware object models consume.
 Only implicit (coordinate-queried) object models are supported — there is no integer
@@ -50,7 +51,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     per-tilt tilt-axis Euler angles ``_pose_z1`` / ``_pose_z3`` (phase 2) are learnable
     (``set_learn_pose_shifts`` / ``set_learn_pose_angles``, each gauge-fixed by pinning the
     reference tilt — see the pose refinement region), as is the per-dataset probe defocus
-    offset ``_defocus_offset_A`` (task 2, ``set_learn_defocus``, same gauge); ``_pose_dtheta``
+    offset ``_defocus_offset_A`` (task 2, ``set_learn_defocus``; NOT gauge-fixed: the
+    pixelated probe keeps its own focus, so every row, the reference's included, is learned
+    absolutely); ``_pose_dtheta``
     (the tilt-angle offset) exists but stays frozen. Per-tilt CoM rotation is forced to zero —
     solving it per tilt would scramble the cross-tilt geometry.
     """
@@ -176,8 +179,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # sharing one angle) reuses it unchanged; the reference row is the reference DATASET.
         # ``effective defocus of dataset t = probe-model defocus + _defocus_offset_A[t]``; the
         # forward realises it by pre-propagating the probe by ``-offset`` (see ``forward``).
-        # A defocus error common to every dataset is the learned probe's business, so the
-        # reference row is pinned (gauge) exactly like the shift and angle rows.
+        # No gauge pin on this slot (decision 2026-09-07 after task 2 D5): the pixelated probe
+        # keeps its nominal focus, so a defocus offset is absolute, not relative to the
+        # reference dataset -- pinning the reference row only denies that dataset its
+        # correction. Every row is learned; ``reference_tilt_idx`` does not touch it.
         self._defocus_offset_A = nn.Parameter(
             torch.zeros(num_tilts, dtype=real_dtype), requires_grad=False
         )
@@ -185,9 +190,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self.register_buffer("_defocus_offset_accum", torch.zeros(num_tilts, dtype=real_dtype))
         self._learn_pose_shifts: bool = False
         self._learn_pose_angles: bool = False
-        self._learn_defocus: bool = False
+        self._learn_defocus = False  # (annotated once, at class level)
         self._pose_shifts_active: bool = False  # gather shifts_A in forward (learning or nonzero)
-        self._defocus_active: bool = False  # gather the defocus offset in forward (same rule)
+        self._defocus_active = False  # gather the defocus offset in forward (same rule)
         self._reference_tilt_idx: int = int(np.argmin(np.abs(angles)))
         self._pose_steps_per_iter: int = 0  # 0 = per-batch steps (M = 1)
         self._pose_accum_steps: int = 1  # M: batches accumulated per pose step
@@ -302,8 +307,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     # C10 = -f, and propagation by dz multiplies by ``exp(-i pi lambda k^2 dz)``, so propagating
     # by dz LOWERS the defocus by dz -- pinned by test_ptycho_tomography.py::TestPoseDefocus);
     # data taken with the probe at f + d are recovered as offset = +d. Gauge: the reference
-    # tilt's rows (shift, both angles, defocus) are pinned to their baselines (gradient masked
-    # after the DDP all-reduce, value re-copied after every optimizer step).
+    # tilt's shift and angle rows are pinned to their baselines (gradient masked after the DDP
+    # all-reduce, value re-copied after every optimizer step); the defocus row is NOT pinned.
     @property
     def learn_pose_shifts(self) -> bool:
         return self._learn_pose_shifts
@@ -469,13 +474,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 "is pinned there (gauge) and will not be learned",
                 stacklevel=2,
             )
-        if self._has_defocus_state() and bool((self._defocus_offset_init_A[idx] != 0).item()):
-            warnings.warn(
-                f"reference tilt {idx} has a nonzero defocus baseline "
-                f"{float(self._defocus_offset_init_A[idx])} Å; it is pinned there (gauge) and "
-                "will not be learned",
-                stacklevel=2,
-            )
 
     def set_pose_shift_init(self, shifts_A: "np.ndarray | torch.Tensor | list[Any]") -> None:
         """Set the per-tilt shift baseline ``(num_tilts, 2)`` in Å and start the live table there.
@@ -570,8 +568,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         """Set the per-dataset defocus-offset baseline ``(num_tilts,)`` in Å (a scalar
         broadcasts to every dataset) and start the live parameter there -- the defocus twin of
         ``set_pose_shift_init``: the "start here" knob and the deliberate-perturbation knob.
-        The reference dataset's entry is forced to zero (gauge: a common offset belongs to the
-        probe). ``reset()`` returns to this baseline."""
+        Every entry is kept, the reference dataset's included (there is no gauge on this slot).
+        ``reset()`` returns to this baseline."""
         self._ensure_defocus_state()
         p = self._defocus_offset_A
         t = torch.as_tensor(np.asarray(offsets_A, dtype=float), dtype=p.dtype, device=p.device)
@@ -582,14 +580,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 f"offsets_A must be a scalar or have shape ({self.num_tilts},), got "
                 f"{tuple(t.shape)}"
             )
-        ref = self._reference_tilt_idx
-        if bool((t[ref] != 0).item()):
-            warnings.warn(
-                f"reference tilt {ref} defocus init {float(t[ref])} Å ignored (gauge: zeroed)",
-                stacklevel=2,
-            )
-            t = t.clone()
-            t[ref] = 0.0
         with torch.no_grad():
             self._defocus_offset_init_A.copy_(t)
             p.copy_(t)
@@ -828,9 +818,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 )
                 self._pose_last_angle_grad_max = float(ga.abs().max().item())
         if defocus and self._defocus_offset_A.grad is not None:
-            self._defocus_offset_A.grad[ref] = 0.0  # same gauge mask for the defocus row
+            # no gauge mask: the defocus row is learned on every dataset (stats over all rows)
             gd = self._defocus_offset_A.grad.detach()
-            n = max(1, int(gd.shape[0]) - 1)
+            n = max(1, int(gd.shape[0]))
             self._pose_last_defocus_grad_rms = float((gd.square().sum() / n).sqrt().item())
             self._pose_last_defocus_grad_max = float(gd.abs().max().item())
         if learning:
@@ -843,9 +833,6 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             with torch.no_grad():
                 for p, init, _acc in self._pose_angle_slots():
                     p[ref] = init[ref]  # re-pin the reference angle rows
-        if defocus:
-            with torch.no_grad():
-                self._defocus_offset_A[ref] = self._defocus_offset_init_A[ref]  # re-pin
         if learning:
             self._pose_step_count += 1
             self._pose_lr_step()
