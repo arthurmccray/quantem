@@ -9,6 +9,7 @@ import warnings
 import numpy as np
 import pytest
 import torch
+
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.io.serialize import load as autoserialize_load
@@ -70,7 +71,9 @@ class TestConstruction:
         with pytest.raises(ValueError, match="tilt angles"):
             PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, [0.0, 35.0])
 
-    def test_geometry_mismatch_raises(self):
+    def test_scan_grid_mismatch_is_allowed_detector_mismatch_raises(self):
+        # 2026-09-09: per-tilt scan grids are allowed (plan-view step 02); the detector
+        # geometry (roi_shape / detector_sampling) must still be shared by every tilt
         d0 = _make_dset4d(0)
         rng = np.random.default_rng(1)
         d1 = Dataset4dstem.from_array(
@@ -78,8 +81,15 @@ class TestConstruction:
             sampling=(STEP, STEP, Q_SAMP, Q_SAMP),
             units=("A", "A", "A^-1", "A^-1"),
         )
-        with pytest.raises(ValueError, match="geometry"):
-            PtychoTomoDatasetRaster.from_dataset4dstem_list([d0, d1], [0.0, 35.0])
+        w = PtychoTomoDatasetRaster.from_dataset4dstem_list([d0, d1], [0.0, 35.0], verbose=0)
+        assert w.num_gpts == 4 * 5 + 3 * 5
+        d2 = Dataset4dstem.from_array(
+            array=rng.uniform(size=(3, 5, ROI, ROI)).astype(np.float32),
+            sampling=(STEP, STEP, 2 * Q_SAMP, 2 * Q_SAMP),
+            units=("A", "A", "A^-1", "A^-1"),
+        )
+        with pytest.raises(ValueError, match="detector geometry"):
+            PtychoTomoDatasetRaster.from_dataset4dstem_list([d0, d2], [0.0, 35.0])
 
     def test_tilt_index_of_boundaries(self):
         w = _build_wrapper(preprocess=False)
@@ -151,6 +161,107 @@ class TestPreprocess:
         assert torch.allclose(pos[:n], pos[n : 2 * n])
         assert torch.allclose(pos[:n], pos[2 * n :])
 
+    def test_scan_center_is_the_position_centre(self):
+        # 2026-09-09: the pivot is the exact midpoint of the reference tilt's positions, not
+        # the (object grid - 1)/2 point, which sat up to half an object pixel short of it
+        w = _build_wrapper()
+        n = int(np.prod(GPTS))
+        i0 = n * w.ref_tilt_index
+        block = w.scan_positions_px.detach()[i0 : i0 + n]
+        expected = (block.min(dim=0).values + block.max(dim=0).values) / 2.0
+        assert torch.allclose(w._scan_center_px.cpu(), expected.to(w._scan_center_px.dtype))
+        assert w.scan_center_mode == "positions"
+        assert w.ref_tilt_index == 1  # tilts (-35, 0, 35): the 0 deg dataset
+
+    def test_scan_center_legacy_grid_mode(self):
+        dsets = [_make_dset4d(seed=i) for i in range(len(TILTS))]
+        w = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
+        w.set_scan_center_mode("grid")
+        w.preprocess(obj_padding_px=(8, 8))
+        full2d = w._obj_shape_full_2d((8, 8))
+        expected = torch.tensor([(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0])
+        assert torch.allclose(w._scan_center_px.cpu(), expected.to(w._scan_center_px.dtype))
+        with pytest.raises(ValueError, match="scan_center_mode"):
+            w.set_scan_center_mode("bogus")
+
+
+class TestUnequalScanGrids:
+    """Per-tilt scan grids (2026-09-09): the scan across the layers widens with tilt."""
+
+    GRIDS = [(7, 5), (4, 5), (9, 5)]  # rows = across the layers; tilt 0 (index 1) narrowest
+
+    def _make(self, i: int, gpts: tuple[int, int], step_rows: float = STEP) -> Dataset4dstem:
+        rng = np.random.default_rng(i)
+        arr = rng.uniform(0.5, 1.0, size=(*gpts, ROI, ROI)).astype(np.float32)
+        return Dataset4dstem.from_array(
+            array=arr, sampling=(step_rows, STEP, Q_SAMP, Q_SAMP), units=("A", "A", "A^-1", "A^-1")
+        )
+
+    def _wrap(self, steps=(STEP, STEP, STEP)) -> PtychoTomoDatasetRaster:
+        dsets = [self._make(i, g, st) for i, (g, st) in enumerate(zip(self.GRIDS, steps))]
+        w = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
+        w.preprocess(obj_padding_px=(8, 8))
+        return w
+
+    def test_accepts_unequal_grids_and_counts(self):
+        w = self._wrap()
+        counts = [int(np.prod(g)) for g in self.GRIDS]
+        assert w.num_gpts == sum(counts)
+        assert [tuple(int(v) for v in g) for g in w.gpts_per_tilt] == self.GRIDS
+        assert tuple(int(v) for v in w.gpts) == self.GRIDS[1]  # reference tilt = 0 deg
+        assert torch.equal(w._tilt_offsets.cpu(), torch.tensor([0, 35, 55, 100]))
+
+    def test_every_block_is_centred_on_the_pivot(self):
+        w = self._wrap()
+        pos = w.scan_positions_px.detach().cpu()
+        off = w._tilt_offsets.cpu().tolist()
+        centres = []
+        for t in range(3):
+            b = pos[off[t] : off[t + 1]]
+            centres.append((b.min(dim=0).values + b.max(dim=0).values) / 2.0)
+        for c in centres:
+            assert torch.allclose(c, centres[1], atol=1e-5)
+        assert torch.allclose(w._scan_center_px.cpu(), centres[1].to(w._scan_center_px.dtype))
+        # the wide tilt's rows extend symmetrically past the reference tilt's rows
+        wide = pos[off[2] : off[3]]
+        ref = pos[off[1] : off[2]]
+        extra = (self.GRIDS[2][0] - self.GRIDS[1][0]) / 2 * STEP / float(w.obj_sampling[0])
+        assert abs(float(wide[:, 0].min() - ref[:, 0].min()) + extra) < 1e-4
+        assert abs(float(wide[:, 0].max() - ref[:, 0].max()) - extra) < 1e-4
+
+    def test_anisotropic_step_on_a_tilt(self):
+        # variant (b): 30 positions across at a coarser step on the tilted datasets
+        w = self._wrap(steps=(2.0 * STEP, STEP, 2.0 * STEP))
+        pos = w.scan_positions_px.detach().cpu()
+        off = w._tilt_offsets.cpu().tolist()
+        b2 = pos[off[2] : off[3]]
+        ext_rows = float(b2[:, 0].max() - b2[:, 0].min()) * float(w.obj_sampling[0])
+        assert abs(ext_rows - (self.GRIDS[2][0] - 1) * 2.0 * STEP) < 1e-4
+        c2 = (b2.min(dim=0).values + b2.max(dim=0).values) / 2.0
+        assert torch.allclose(c2, w._scan_center_px.cpu().to(c2.dtype), atol=1e-5)
+
+    def test_detector_mismatch_still_refused(self):
+        dsets = [self._make(i, g) for i, g in enumerate(self.GRIDS)]
+        bad = Dataset4dstem.from_array(
+            array=dsets[2].array,
+            sampling=(STEP, STEP, 2 * Q_SAMP, 2 * Q_SAMP),
+            units=("A", "A", "A^-1", "A^-1"),
+        )
+        with pytest.raises(ValueError, match="detector geometry"):
+            PtychoTomoDatasetRaster.from_dataset4dstem_list(
+                [dsets[0], dsets[1], bad], TILTS, verbose=0
+            )
+
+    def test_beam_frame_coords_of_the_wide_tilt(self):
+        w = self._wrap()
+        w.implicit_object = True
+        off = w._tilt_offsets.cpu().tolist()
+        idx = torch.arange(off[2], off[3])
+        payload, *_ = w.forward(idx, (8, 8))
+        rows_A = payload.coords_yx_A[:, 0, 0, 0].cpu()  # centre pixel row coordinate, A
+        half = (self.GRIDS[2][0] - 1) / 2 * STEP
+        assert abs(float(rows_A.min()) + half) < 1e-4 and abs(float(rows_A.max()) - half) < 1e-4
+
 
 class TestForward:
     def test_requires_implicit_object(self):
@@ -189,13 +300,19 @@ class TestForward:
             plot_rotation=False,
             plot_com=False,
         )
-        w = _build_wrapper()
+        # the base _scan_coords is normalized about the padded-grid centre, so the identity
+        # below holds for the LEGACY "grid" pivot; the default "positions" pivot (2026-09-09)
+        # differs from it by the sub-pixel gap between the grid centre and the scan centre
+        dsets = [_make_dset4d(seed=i, scale=1.0 + 0.5 * i) for i in range(len(TILTS))]
+        w = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
+        w.set_scan_center_mode("grid")
+        w.preprocess(obj_padding_px=(8, 8))
         w.implicit_object = True
         local = torch.tensor([0, 3, 7])
         coords_single = single._scan_coords(local, (8, 8))
         payload, *_ = w.forward(local, (8, 8))  # tilt-0 block: flat == local indices
-        # the wrapper now emits physical Å (origin at the padded-grid center) while the base
-        # _scan_coords stays normalized over the padded grid; they relate by
+        # the wrapper emits physical Å (origin at the padded-grid center in grid mode) while
+        # the base _scan_coords stays normalized over the padded grid; they relate by
         # coords_A = coords_norm * h with h = (full2d - 1) / 2 * sampling per axis
         full2d = single._obj_shape_full_2d((8, 8))
         samp = single.obj_sampling
@@ -206,6 +323,15 @@ class TestForward:
             ]
         )
         assert torch.allclose(payload.coords_yx_A, coords_single * h, atol=1e-5)
+        # default mode: same coordinates shifted by (grid centre - position centre), a constant
+        w2 = _build_wrapper()
+        w2.implicit_object = True
+        payload2, *_ = w2.forward(local, (8, 8))
+        gap = (w2._scan_center_px.cpu() - w._scan_center_px.cpu()) * torch.as_tensor(
+            samp, dtype=torch.float32
+        )
+        assert torch.allclose(payload2.coords_yx_A, payload.coords_yx_A - gap, atol=1e-5)
+        assert float(gap.abs().max()) > 0  # the two definitions differ on this grid
 
     def test_payload_coords_are_A_centered_on_scan_grid(self):
         """Payload coords are physical Å with the origin at the scan-grid center.

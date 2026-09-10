@@ -46,8 +46,13 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     the inherited storage, so ``num_gpts = sum(per-tilt scan points)`` and all per-position
     parameters/targets are flat-indexed. ``_tilt_offsets`` maps flat indices to tilts.
 
-    Scope: identical scan geometry across tilts, known tilt angles, no descan / scan-position
-    learning. Pose refinement: the per-tilt beam-frame shift ``_pose_shifts`` (phase 1) and the
+    Scope: known tilt angles, no descan / scan-position learning. Every tilt must share the
+    detector geometry (``roi_shape``, ``detector_sampling``); the scan grid (``gpts``,
+    ``scan_sampling``) MAY differ per tilt (2026-09-09, plan-view step 02: the scan across the
+    layers widens with tilt). ASSUMPTION BAKED IN: the object grid, the lateral FOV and the scan
+    centre (rotation pivot) are taken from the REFERENCE tilt = the dataset with the smallest
+    |tilt| (``ref_tilt_index``), and every other tilt's scan is centred on that pivot
+    (``_set_initial_scan_positions_px``). Pose refinement: the per-tilt beam-frame shift ``_pose_shifts`` (phase 1) and the
     per-tilt tilt-axis Euler angles ``_pose_z1`` / ``_pose_z3`` (phase 2) are learnable
     (``set_learn_pose_shifts`` / ``set_learn_pose_angles``, each gauge-fixed by pinning the
     reference tilt — see the pose refinement region), as is the per-dataset probe defocus
@@ -102,23 +107,44 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             raise ValueError(
                 f"got {len(angles)} tilt angles for {len(tilt_datasets)} tilt datasets"
             )
-        ref = tilt_datasets[0]
+        # reference tilt = smallest |tilt| (tilt 0 in every live series): its scan grid defines
+        # the object grid / FOV / scan centre for the whole series (class docstring)
+        ref_index = int(np.argmin(np.abs(angles)))
+        ref = tilt_datasets[ref_index]
+        grids_differ = False
         for i, ds in enumerate(tilt_datasets):
             if not isinstance(ds, PtychographyDatasetRaster):
                 raise TypeError(
                     f"tilt_datasets[{i}] must be a PtychographyDatasetRaster, got {type(ds)}"
                 )
-            same = (
-                np.array_equal(ds.roi_shape, ref.roi_shape)
-                and np.array_equal(ds.gpts, ref.gpts)
-                and np.allclose(ds.scan_sampling, ref.scan_sampling)
-                and np.allclose(ds.detector_sampling, ref.detector_sampling)
+            same_detector = np.array_equal(ds.roi_shape, ref.roi_shape) and np.allclose(
+                ds.detector_sampling, ref.detector_sampling
             )
-            if not same:
+            if not same_detector:
                 raise ValueError(
-                    f"tilt_datasets[{i}] geometry (roi/gpts/sampling) differs from tilt 0; "
-                    "v1 requires identical scan geometry across tilts"
+                    f"tilt_datasets[{i}] detector geometry (roi_shape / detector_sampling) "
+                    f"differs from the reference tilt {ref_index}; every tilt must share it"
                 )
+            if len(ds.gpts) != len(ref.gpts):
+                raise ValueError(
+                    f"tilt_datasets[{i}] scan dimensionality {len(ds.gpts)} != {len(ref.gpts)}"
+                )
+            if not (
+                np.array_equal(ds.gpts, ref.gpts)
+                and np.allclose(ds.scan_sampling, ref.scan_sampling)
+            ):
+                grids_differ = True
+        if grids_differ and verbose:
+            print(
+                "per-tilt scan grids differ (gpts x sampling): "
+                + ", ".join(
+                    f"{float(a):+.0f}deg {tuple(int(g) for g in ds.gpts)}x"
+                    f"{tuple(round(float(v), 4) for v in ds.scan_sampling)}"
+                    for a, ds in zip(angles, tilt_datasets)
+                )
+                + f"; object grid / pivot from the reference tilt {ref_index}",
+                flush=True,
+            )
 
         arrays = [self._tilt_array_3d(ds) for ds in tilt_datasets]
         concat = Dataset3d.from_array(
@@ -129,6 +155,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             units=ref.dset.units,
         )
         self.tilt_datasets = tilt_datasets  # plain list: not registered as submodules
+        self._ref_tilt_index = ref_index
         super().__init__(
             dset=concat,
             detector_mask=detector_mask,
@@ -906,25 +933,47 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     # endregion --- pose refinement ---
 
-    # region --- per-tilt scan geometry (identical across tilts; raster-level properties) ---
+    # region --- per-tilt scan geometry (reference-tilt properties; grids may differ per tilt) ---
+    @property
+    def ref_tilt_index(self) -> int:
+        """Index of the reference tilt (smallest |tilt|): its scan grid defines the object grid,
+        the FOV and the scan centre for the whole series (baked-in assumption, see the class
+        docstring)."""
+        return int(getattr(self, "_ref_tilt_index", 0))
+
     @property
     def gpts(self) -> np.ndarray:
-        """Scan grid of ONE tilt (identical across tilts). Note ``num_gpts == num_tilts *
-        prod(gpts)`` for this wrapper."""
-        return self.tilt_datasets[0].gpts
+        """Scan grid of the REFERENCE tilt (the 2-D raster shape, not a count). Grids may differ
+        per tilt (``gpts_per_tilt``); the total position count is ``num_gpts`` =
+        ``sum(prod(g) for g in gpts_per_tilt)``."""
+        return self.tilt_datasets[self.ref_tilt_index].gpts
+
+    @property
+    def gpts_per_tilt(self) -> list[np.ndarray]:
+        """Scan grid ``(rows, cols)`` of every tilt, in tilt order."""
+        return [ds.gpts for ds in self.tilt_datasets]
 
     @property
     def scan_sampling(self) -> np.ndarray:
-        return self.tilt_datasets[0].scan_sampling
+        """Scan step (Å) of the REFERENCE tilt; see ``scan_sampling_per_tilt``."""
+        return self.tilt_datasets[self.ref_tilt_index].scan_sampling
+
+    @property
+    def scan_sampling_per_tilt(self) -> list[np.ndarray]:
+        return [ds.scan_sampling for ds in self.tilt_datasets]
 
     @property
     def scan_units(self) -> list[str]:
-        return self.tilt_datasets[0].scan_units
+        return self.tilt_datasets[self.ref_tilt_index].scan_units
 
     @property
     def fov(self) -> np.ndarray:
-        """Lateral field of view of one tilt's scan (Å)."""
+        """Lateral field of view (Å) of the REFERENCE tilt's scan (sets the object grid)."""
         return self.scan_sampling * (self.gpts - 1)
+
+    @property
+    def fov_per_tilt(self) -> list[np.ndarray]:
+        return [ds.scan_sampling * (ds.gpts - 1) for ds in self.tilt_datasets]
 
     # endregion --- per-tilt scan geometry ---
 
@@ -1023,26 +1072,69 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         obj_padding_px: np.ndarray | tuple[int, ...] | None,
         positions_mask: np.ndarray | None = None,
     ) -> None:
-        """Delegate per tilt (identical geometry -> identical per-tilt positions), then
-        concatenate into the inherited flat parameters."""
+        """Delegate per tilt, centre every tilt's block on the reference tilt's scan centre,
+        then concatenate into the inherited flat parameters.
+
+        The base raster class anchors each tilt's positions at its own top-left corner (min ->
+        0 + padding), so tilts with different scan extents would sit off the rotation pivot by
+        half the extent difference. Every simulated tilt is centred on the pivot (CONVENTIONS
+        §Geometry), so each block is shifted by ``centre_ref - centre_i`` (px, per axis; the
+        centre is the midpoint of the block's extent). The shift is exactly zero when all grids
+        are equal, so equal-grid series are unchanged.
+        """
         for ds in self.tilt_datasets:
             ds._set_initial_scan_positions_px(obj_padding_px, positions_mask)
-        positions = torch.cat(
-            [ds.scan_positions_px.data.detach().cpu() for ds in self.tilt_datasets]
-        )
+        blocks = [ds.scan_positions_px.data.detach().cpu() for ds in self.tilt_datasets]
+
+        def _centre(b: torch.Tensor) -> torch.Tensor:
+            return (b.min(dim=0).values + b.max(dim=0).values) / 2.0
+
+        c_ref = _centre(blocks[self.ref_tilt_index])
+        blocks = [b + (c_ref - _centre(b)) for b in blocks]
+        positions = torch.cat(blocks)
         self.scan_positions_px = positions
         self.initial_scan_positions_px = self.scan_positions_px.data.clone()
 
-    def _set_scan_center(self, obj_padding_px: "np.ndarray | tuple[int, int]") -> None:
-        """Set the beam-frame coordinate origin: the center of the scan grid at this padding.
+    # scan-centre (rotation pivot) definition; class-level default so a wrapper deserialized
+    # from an older cache (bypasses __init__) reads the current default
+    _scan_center_mode: str = "positions"
 
-        Positions carry the same padding offset, so the origin is padding-invariant in Å. Must
-        be re-called if positions are re-derived at a different padding (the base
-        ``obj_padding_px`` setter path does this via ``PtychoTomography.preprocess``).
+    def set_scan_center_mode(self, mode: str) -> None:
+        """``"positions"`` (default since 2026-09-09): the pivot is the exact centre of the
+        reference tilt's scan positions. ``"grid"``: the pre-2026-09-09 definition
+        ``(object grid - 1)/2``, which sits up to half an object pixel short of the true scan
+        centre (0.77 px = 0.13 Å on the plan-view series) -- kept only to reproduce old records.
+        Call before ``preprocess``."""
+        if mode not in ("positions", "grid"):
+            raise ValueError(f"scan_center_mode must be 'positions' or 'grid', got {mode!r}")
+        self._scan_center_mode = mode
+
+    @property
+    def scan_center_mode(self) -> str:
+        return str(getattr(self, "_scan_center_mode", "positions"))
+
+    def _set_scan_center(self, obj_padding_px: "np.ndarray | tuple[int, int]") -> None:
+        """Set the beam-frame coordinate origin (the rotation pivot) at this padding.
+
+        ``scan_center_mode == "positions"``: the midpoint of the reference tilt's scan
+        positions (every tilt's block is centred there by ``_set_initial_scan_positions_px``).
+        ``"grid"``: the legacy ``(full object grid - 1)/2``. Positions carry the same padding
+        offset, so the origin is padding-invariant in Å. Must be re-called if positions are
+        re-derived at a different padding (the base ``obj_padding_px`` setter path does this via
+        ``PtychoTomography.preprocess``).
         """
-        full2d = self._obj_shape_full_2d(obj_padding_px)
+        if self.scan_center_mode == "grid":
+            full2d = self._obj_shape_full_2d(obj_padding_px)
+            centre = [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0]
+        else:
+            i0, i1 = (
+                int(self._tilt_offsets[self.ref_tilt_index]),
+                int(self._tilt_offsets[self.ref_tilt_index + 1]),
+            )
+            block = self.scan_positions_px.data[i0:i1].detach().cpu()
+            centre = ((block.min(dim=0).values + block.max(dim=0).values) / 2.0).tolist()
         self._scan_center_px = torch.tensor(
-            [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0],
+            [float(centre[0]), float(centre[1])],
             dtype=self._scan_center_px.dtype,
             device=self._scan_center_px.device,
         )
