@@ -1113,6 +1113,67 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def scan_center_mode(self) -> str:
         return str(getattr(self, "_scan_center_mode", "positions"))
 
+    def scan_center_px_for_mode(
+        self, mode: str, obj_padding_px: "np.ndarray | tuple[int, int] | None" = None
+    ) -> torch.Tensor:
+        """The pivot (px, padded grid) that ``mode`` implies for the CURRENT scan positions.
+
+        ``"positions"``: the midpoint of the reference tilt's block of ``scan_positions_px``;
+        ``"grid"``: the legacy ``(full object grid - 1)/2`` at ``obj_padding_px`` (default: the
+        padding recorded by ``preprocess``). This is the arithmetic of ``_set_scan_center`` made
+        available without side effects, so a wrapper loaded from a cache can be VERIFIED against
+        it (``verify_scan_center``, 2026-09-09).
+        """
+        if mode not in ("positions", "grid"):
+            raise ValueError(f"scan_center_mode must be 'positions' or 'grid', got {mode!r}")
+        if mode == "grid":
+            pad_px: "np.ndarray | tuple[int, ...]"
+            if obj_padding_px is None:
+                pad = self._preprocessing_params["obj_padding_px"]
+                assert isinstance(pad, tuple), "preprocess() records obj_padding_px as a tuple"
+                pad_px = pad
+            else:
+                pad_px = obj_padding_px
+            full2d = self._obj_shape_full_2d(pad_px)
+            centre = [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0]
+        else:
+            i0, i1 = (
+                int(self._tilt_offsets[self.ref_tilt_index]),
+                int(self._tilt_offsets[self.ref_tilt_index + 1]),
+            )
+            block = self.scan_positions_px.data[i0:i1].detach().cpu()
+            centre = ((block.min(dim=0).values + block.max(dim=0).values) / 2.0).tolist()
+        return torch.tensor([float(centre[0]), float(centre[1])], dtype=torch.float64)
+
+    def verify_scan_center(
+        self,
+        mode: str,
+        obj_padding_px: "np.ndarray | tuple[int, int] | None" = None,
+        tol_px: float = 1e-3,
+    ) -> None:
+        """Raise ``ValueError`` unless the stored pivot ``_scan_center_px`` is the one ``mode``
+        implies for the stored positions (``scan_center_px_for_mode``).
+
+        Why (2026-09-09): a wrapper cache written before the ``scan_center_mode`` attribute
+        existed has no such attribute, so after loading it REPORTS the class default
+        ``"positions"`` although the pivot it stores is the old grid point (0.77 px short on the
+        plan-view series). Recomputing the pivot from the positions themselves catches that, and
+        any other stale pivot, regardless of what the cache says about itself.
+        """
+        if not torch.isfinite(self._scan_center_px).all():
+            raise ValueError("scan center not set; run preprocess() first")
+        expected = self.scan_center_px_for_mode(mode, obj_padding_px)
+        stored = self._scan_center_px.detach().cpu().to(torch.float64)
+        gap = (stored - expected).abs().max().item()
+        if gap > tol_px:
+            raise ValueError(
+                f"scan centre (rotation pivot) mismatch: stored {stored.tolist()} px, but "
+                f"scan_center_mode={mode!r} implies {expected.tolist()} px for the stored "
+                f"positions (gap {gap:.4f} px). A cache written before 2026-09-09 carries the old "
+                "grid-point pivot and reports the default mode; rebuild it under a new "
+                "--cache-wrap path, or pass --legacy-scan-center to reproduce the old pivot."
+            )
+
     def _set_scan_center(self, obj_padding_px: "np.ndarray | tuple[int, int]") -> None:
         """Set the beam-frame coordinate origin (the rotation pivot) at this padding.
 
@@ -1123,16 +1184,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         re-derived at a different padding (the base ``obj_padding_px`` setter path does this via
         ``PtychoTomography.preprocess``).
         """
-        if self.scan_center_mode == "grid":
-            full2d = self._obj_shape_full_2d(obj_padding_px)
-            centre = [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0]
-        else:
-            i0, i1 = (
-                int(self._tilt_offsets[self.ref_tilt_index]),
-                int(self._tilt_offsets[self.ref_tilt_index + 1]),
-            )
-            block = self.scan_positions_px.data[i0:i1].detach().cpu()
-            centre = ((block.min(dim=0).values + block.max(dim=0).values) / 2.0).tolist()
+        centre = self.scan_center_px_for_mode(self.scan_center_mode, obj_padding_px)
         self._scan_center_px = torch.tensor(
             [float(centre[0]), float(centre[1])],
             dtype=self._scan_center_px.dtype,

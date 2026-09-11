@@ -1155,3 +1155,45 @@ class TestPoseDefocus:
         assert torch.allclose(payload.window_dz_A, window)
         assert w._last_probe_dz_A is not None
         assert torch.allclose(w._last_probe_dz_A, window + 4.0)
+
+
+class TestScanCenterVerify:
+    """A4 (2026-09-09): a cached wrapper's stored pivot is checked against the pivot its
+    requested mode implies for the stored positions -- an old cache (no mode attribute, grid
+    pivot) must be refused in 'positions' mode and accepted in 'grid' mode."""
+
+    def test_for_mode_matches_set_scan_center(self):
+        w = _build_wrapper()
+        assert torch.allclose(
+            w.scan_center_px_for_mode("positions"), w._scan_center_px.cpu().to(torch.float64)
+        )
+        grid = w.scan_center_px_for_mode("grid")
+        full2d = w._obj_shape_full_2d((8, 8))
+        expected = [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0]
+        assert torch.allclose(grid, torch.tensor(expected, dtype=torch.float64))
+        assert (grid - w.scan_center_px_for_mode("positions")).abs().max() > 1e-3
+        w.verify_scan_center("positions")
+        with pytest.raises(ValueError, match="pivot"):
+            w.verify_scan_center("grid")
+        with pytest.raises(ValueError, match="scan_center_mode"):
+            w.scan_center_px_for_mode("bogus")
+
+    def test_old_cache_is_caught(self, tmp_path):
+        # an old cache: preprocessed with the grid pivot, and the mode attribute never written
+        dsets = [_make_dset4d(seed=i) for i in range(len(TILTS))]
+        w = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, TILTS, verbose=0)
+        w.set_scan_center_mode("grid")
+        w.preprocess(obj_padding_px=(8, 8))
+        path = tmp_path / "old_cache.zip"
+        w.save(path, mode="o")
+        loaded = autoserialize_load(path)
+        del loaded.__dict__["_scan_center_mode"]
+        assert loaded.scan_center_mode == "positions"  # the class default LIES about the cache
+        with pytest.raises(ValueError, match="mismatch"):
+            loaded.verify_scan_center("positions")
+        loaded.verify_scan_center("grid")  # the pivot it stores IS the grid point
+        # and a cache that was built in positions mode passes as itself
+        w2 = _build_wrapper()
+        path2 = tmp_path / "new_cache.zip"
+        w2.save(path2, mode="o")
+        autoserialize_load(path2).verify_scan_center("positions")
