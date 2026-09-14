@@ -23,6 +23,17 @@ into |z| > thickness/2, and for planar (non-vacuum-padded) samples real density 
 Coordinates are rotated in physical Å and then renormalized **per axis** to the box (the
 normalized coordinates are anisotropic). The beam-frame multislice slab stack spans the same
 padded box.
+
+Optional coordinate warp (off by default): when a margin is added around the specimen box, the
+backend spends its features evenly over box + 2*margin, so the part we actually care about gets
+fewer features. ``set_geometry(warp_box_frac=...)`` stretches the specimen box over a chosen
+share ``a`` of the ``[-1, 1]`` range on that axis and squeezes each margin into what is left.
+With ``c`` the share the box has today (specimen half-width / padded half-width), a normalized
+coordinate ``u`` is mapped to ``u * (a / c)`` inside the box (``|u| <= c``) and to
+``sign(u) * (a + (|u| - c) * (1 - a) / (1 - c))`` in the margin. The map is continuous and
+monotone, fixes 0 and ``±1``, and is the identity when ``a == c``. Only the coordinates handed
+to the backend change: the physical meaning of the box, the materialized volume and the crops
+are all unchanged.
 """
 
 from copy import deepcopy
@@ -274,6 +285,10 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         # and out-of-support quadrature points are trimmed by the existing in-box mask. None =
         # classic behavior (stack ≡ padded box thickness).
         self._slab_extent_A: float | None = None
+        # Optional per-axis coordinate warp (z, y, x): the share of the [-1, 1] backend range
+        # given to the specimen box on that axis. None per axis = that axis is untouched; the
+        # whole thing None = no warp at all (the default). See the module docstring.
+        self._warp_box_frac: tuple[float | None, float | None, float | None] | None = None
         self.slice_thicknesses = self.slab_extent_A / num_slices if num_slices > 1 else None
         self._set_pretrained_weights(self._model)
         self._num_z_voxels = int(num_z_voxels) if num_z_voxels is not None else None
@@ -372,12 +387,81 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             raise ValueError("lateral_box_A not set; call set_geometry() (new preprocess path).")
         return (self._thickness_A, self._lateral_box_A[0], self._lateral_box_A[1])
 
+    @property
+    def warp_box_frac(self) -> tuple[float | None, float | None, float | None] | None:
+        """Per-axis ``(z, y, x)`` share of the backend's ``[-1, 1]`` range given to the specimen
+        box, or None when the coordinate warp is off (the default). A ``None`` entry means that
+        axis is left alone. Set through :meth:`set_geometry`."""
+        return getattr(self, "_warp_box_frac", None)  # deserialized pre-warp objects
+
+    @property
+    def warp_knots(self) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+        """Per axis ``(z, y, x)``, the pair ``(c, a)`` describing the coordinate warp.
+
+        ``c`` is the share of the ``[-1, 1]`` range the specimen box occupies without any warp
+        (specimen half-width / padded half-width) and ``a`` is the share it occupies with the
+        warp applied. Untouched axes report ``a == c`` (the identity map).
+        """
+        half = self._box_half_extents
+        box = self.specimen_box_A
+        warp = self.warp_box_frac
+        knots = []
+        for axis in range(3):
+            c = (box[axis] / 2.0) / half[axis]
+            share = None if warp is None else warp[axis]
+            knots.append((c, c if share is None else float(share)))
+        return (knots[0], knots[1], knots[2])
+
+    def _validate_warp_box_frac(
+        self, warp_box_frac: "Sequence[float | None] | None"
+    ) -> tuple[float | None, float | None, float | None] | None:
+        """Check a requested warp against the current geometry and normalize it for storage.
+
+        Returns None (warp off) or a 3-tuple in which untouched axes are None. Requires the box
+        and padded extents to be known, so call it after the geometry has been resolved.
+        """
+        if warp_box_frac is None:
+            return None
+        vals = list(warp_box_frac)
+        if len(vals) != 3:
+            raise ValueError(
+                f"warp_box_frac must have 3 (z, y, x) components, got {warp_box_frac}"
+            )
+        half = self._box_half_extents
+        box = self.specimen_box_A
+        out: list[float | None] = []
+        for axis, (name, val) in enumerate(zip("zyx", vals)):
+            if val is None:
+                out.append(None)
+                continue
+            a = float(val)
+            c = (box[axis] / 2.0) / half[axis]
+            if abs(a - c) < 1e-9:  # identity: keep the untouched (no-op) code path
+                out.append(None)
+                continue
+            if a < c:
+                raise ValueError(
+                    f"warp_box_frac[{name}] = {a:.6g} is smaller than the share the specimen "
+                    f"box already has ({c:.6g}); the warp can only give the box more of the "
+                    "coordinate range, not less"
+                )
+            if a >= 1.0:
+                raise ValueError(
+                    f"warp_box_frac[{name}] = {a:.6g} must be < 1; at 1 the margin outside the "
+                    "specimen box would be squeezed to zero width"
+                )
+            out.append(a)
+        if all(v is None for v in out):
+            return None
+        return (out[0], out[1], out[2])
+
     def set_geometry(
         self,
         *,
         lateral_box_A: "tuple[float, float] | np.ndarray",
         sampling: "tuple[float, float] | np.ndarray",
         box_margin_A: "tuple[float, float, float] | np.ndarray" = (0.0, 0.0, 0.0),
+        warp_box_frac: "Sequence[float | None] | None" = None,
     ) -> None:
         """Physical-units geometry handshake (replaces the pixel-padding ``_initialize_obj``).
 
@@ -387,6 +471,11 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         y and x (raises otherwise); the z voxel is ``box_thickness_A / D`` with
         ``D = round(box_thickness_A / s)`` — equal to the lateral pixel to <0.1% (exact when the
         box thickness is a whole number of pixels).
+
+        ``warp_box_frac`` optionally turns on the per-axis coordinate warp: a ``(z, y, x)``
+        triple giving the share of the backend's ``[-1, 1]`` range that the specimen box should
+        occupy on each axis (``None`` for an axis to leave it alone, ``None`` for the whole
+        triple to keep the warp off). See the module docstring for the map.
         """
         samp = np.asarray(sampling, dtype=float).ravel()
         if samp.size == 3:  # tolerate a (z, y, x) triple; lateral components are authoritative
@@ -429,6 +518,8 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             if self._volume_shape != new_shape:
                 self._volume_shape = new_shape
                 self._allocate_backend()
+        # validated last: it is checked against the box/margin extents resolved just above
+        self._warp_box_frac = self._validate_warp_box_frac(warp_box_frac)
         self._geometry_set = True
         self._invalidate_obj_cache()
 
@@ -539,6 +630,34 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             (int(h_full) - 1) / 2.0 * float(samp[0]),
             (int(w_full) - 1) / 2.0 * float(samp[1]),
         )
+
+    def _to_backend_coords(self, pts: torch.Tensor) -> torch.Tensor:
+        """Apply the per-axis coordinate warp to ``(N, 3)`` normalized ``(z, y, x)`` points.
+
+        ``pts`` are the plain normalized coordinates (physical position divided by the padded
+        half-extent). With the warp off this returns ``pts`` itself, so every caller is
+        bit-identical to the pre-warp code. With the warp on, each set axis is stretched inside
+        the specimen box and squeezed in the margin; untouched axes pass through. Differentiable
+        (used inside checkpointed regions); dtype and device follow ``pts``.
+        """
+        warp = self.warp_box_frac
+        if warp is None:
+            return pts
+        half = self._box_half_extents
+        box = self.specimen_box_A
+        cols = []
+        for axis in range(3):
+            u = pts[..., axis]
+            a = warp[axis]
+            if a is None:
+                cols.append(u)
+                continue
+            c = (box[axis] / 2.0) / half[axis]
+            mag = u.abs()
+            inside = u * (a / c)
+            outside = torch.sign(u) * (a + (mag - c) * (1.0 - a) / (1.0 - c))
+            cols.append(torch.where(mag <= c, inside, outside))
+        return torch.stack(cols, dim=-1)
 
     @property
     def obj(self) -> torch.Tensor:
@@ -744,7 +863,9 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             dest = (sl.view(-1, 1) * bhw + base.view(1, -1)).reshape(-1)[sel]
             if pts.shape[0] == 0:
                 return pts.new_zeros((0,)), dest
-            return self._model(pts).reshape(-1), dest  # (n_inside,)
+            # warp last, on the kept points only: the in-box mask above is defined on the
+            # plain (unwarped) coordinates, so the point count is the same either way
+            return self._model(self._to_backend_coords(pts)).reshape(-1), dest  # (n_inside,)
 
         for start in range(0, n_samples, group):
             # tensor slicing self-clamps at the end of the range, so no explicit ``g`` needed
@@ -793,7 +914,7 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         for i in range(0, d, chunk):
             zz, yy, xx = torch.meshgrid(zs[i : i + chunk], ys, xs, indexing="ij")
             pts = torch.stack([zz, yy, xx], dim=-1).reshape(-1, 3)
-            out.append(self._model(pts).reshape(-1, hh, ww))
+            out.append(self._model(self._to_backend_coords(pts)).reshape(-1, hh, ww))
         return torch.cat(out, dim=0)
 
     def _materialize_obj(self) -> torch.Tensor:
@@ -882,13 +1003,13 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
 
     def _sampled_positivity_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._model(self._to_backend_coords(coords)).squeeze(-1)
         return weight * torch.relu(-value).mean()
 
     def _sampled_l1_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
         """Soft L1 sparsity: ``weight * mean(|density|)`` at randomly sampled coordinates."""
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._model(self._to_backend_coords(coords)).squeeze(-1)
         return weight * value.abs().mean()
 
     def _sampled_tv3d_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
@@ -903,13 +1024,14 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         """
         real_dtype = getattr(torch, config.get("dtype_real"))
         coords = self._sample_volume_coords(num_samples)
-        value = self._model(coords).squeeze(-1)
+        value = self._model(self._to_backend_coords(coords)).squeeze(-1)
         loss = self._get_zero_loss_tensor()
         for axis in range(3):
             h = 2.0 / max(int(self.volume_shape[axis]), 2)  # one cubic-voxel step
             offset = torch.zeros(3, device=self.device, dtype=real_dtype)
             offset[axis] = h
-            shifted = self._model(coords + offset).squeeze(-1)
+            # the step is taken on the plain coordinates, so it stays one physical voxel
+            shifted = self._model(self._to_backend_coords(coords + offset)).squeeze(-1)
             # L2 (squared) difference to match tomography; ptychography uses L1 (abs).
             loss = loss + weight * torch.mean((shifted - value) ** 2)
         return loss
@@ -1059,6 +1181,10 @@ class ObjectVoxelTomo(ObjectPtychoTomoBase):
         self._invalidate_obj_cache()
 
     def _materialize_obj(self) -> torch.Tensor:
+        if self.warp_box_frac is not None:
+            # with the warp on the voxel grid lives in warped coordinates, so it is no longer
+            # the specimen volume on a uniform physical grid — go through the generic query
+            return super()._materialize_obj()
         # fast path: the parameter IS the specimen volume on the volume_shape grid
         model = self._model
         assert isinstance(model, VoxelGrid)
@@ -1107,29 +1233,49 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         plane axes (H and W), averaged over feature channels; sum the per-level penalties. For the
         tilted backend (:class:`KPlanesTILTED`) the ``3`` planes of each of the ``T`` learned
         rotations are summed and then averaged over rotations, matching the tomography module's
-        ``_get_plane_tv_loss``. ``CPTilted`` line factors ``(3*T, C, L)`` are handled by
-        differencing the single spatial axis. Backprops straight into the ``grids`` parameters, so
-        it is a much stronger and cheaper smoothness prior than the coordinate-sampled 3D TV on the
-        sub-1e-3 output density.
+        ``_get_plane_tv_loss``; with per-axis planes the three plane types of a level sit in three
+        separate ``(T, C, H, W)`` tensors and are summed across those instead. ``CPTilted`` line
+        factors ``(3*T, C, L)`` are handled by differencing the single spatial axis. Backprops
+        straight into the ``grids`` parameters, so it is a much stronger and cheaper smoothness
+        prior than the coordinate-sampled 3D TV on the sub-1e-3 output density.
         """
         model = self.model
         grids = getattr(model, "grids", None)
         if grids is None or len(grids) == 0:
             return self._get_zero_loss_tensor()
         is_tilted = bool(getattr(model, "tilted", False))
-        per_level = []
-        for p in grids:
-            if p.ndim == 4:  # (3*T, C, H, W) feature planes
+
+        def per_plane_tv(p: torch.Tensor) -> torch.Tensor:
+            """Squared adjacent differences of one plane tensor, one number per leading index."""
+            if p.ndim == 4:  # (..., C, H, W) feature planes
                 dh = (p[:, :, 1:, :] - p[:, :, :-1, :]).pow(2).mean(dim=(1, 2, 3))
                 dw = (p[:, :, :, 1:] - p[:, :, :, :-1]).pow(2).mean(dim=(1, 2, 3))
-                per_plane = dh + dw  # (3*T,)
-            else:  # (3*T, C, L) CP line factors
-                per_plane = (p[..., 1:] - p[..., :-1]).pow(2).mean(dim=tuple(range(1, p.ndim)))
+                return dh + dw
+            # (3*T, C, L) CP line factors
+            return (p[..., 1:] - p[..., :-1]).pow(2).mean(dim=tuple(range(1, p.ndim)))
+
+        # One entry per multiscale level: a single stacked tensor, or a triple of per-plane-type
+        # tensors when the tilted model was built with per-axis planes.
+        group_levels = getattr(model, "ms_grid_levels", None)
+        if callable(group_levels):
+            levels: list[Any] = list(cast(Sequence[Any], group_levels()))
+        else:
+            levels = list(grids)
+        per_level = []
+        for level in levels:
+            planes = list(level) if isinstance(level, tuple) else [level]
+            parts = [per_plane_tv(p) for p in planes]
             if is_tilted:
+                if len(parts) == 3:
+                    # per-axis planes: one (T,) vector per plane type -> (T, 3)
+                    per_rotation = torch.stack(parts, dim=1)
+                else:
+                    # stacked planes: (3*T,) ordered rotation-major -> (T, 3)
+                    per_rotation = parts[0].view(cast(int, model.T), 3)
                 # sum the 3 planes of each rotation, then average across the T rotations
-                level_tv = per_plane.view(cast(int, model.T), 3).sum(dim=1).mean()
+                level_tv = per_rotation.sum(dim=1).mean()
             else:
-                level_tv = per_plane.sum()
+                level_tv = parts[0].sum()
             per_level.append(level_tv)
         return weight * torch.stack(per_level).sum()
 
@@ -1187,6 +1333,7 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         hybrid_num_layers: int = 2,
         tilted: bool = False,
         T: int = 4,
+        per_axis_planes: bool = False,
         obj_type: object_type = "potential",
         device: str = "cpu",
         rng: np.random.Generator | int | None = None,
@@ -1197,6 +1344,11 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         the soft ``positivity_weight`` constraint) with the final decoder layer zeroed so the
         object starts at vacuum. ``tilted=True`` builds a :class:`KPlanesTILTED` (T learned SO(3)
         rotations, r9 parameterization by default in the core model).
+
+        ``per_axis_planes=True`` (tilted only) stores each multiscale level as three feature-plane
+        tensors, one per plane type, so an anisotropic ``resolution`` really gives each axis the
+        number of features asked for — see :func:`quantem.core.ml.models.kplanes.
+        per_axis_plane_shapes`.
         """
         density_activation: nn.Module = nn.Identity()
         ms = list(multiscale_res_multipliers) if multiscale_res_multipliers is not None else None
@@ -1208,11 +1360,17 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
                 multiscale_res_multipliers=ms,
                 density_activation=density_activation,
                 T=T,
+                per_axis_planes=per_axis_planes,
                 use_hybrid_mlp=use_hybrid_mlp,
                 hybrid_hidden_dim=hybrid_hidden_dim,
                 hybrid_num_layers=hybrid_num_layers,
             )
         else:
+            if per_axis_planes:
+                raise ValueError(
+                    "per_axis_planes is only available for the tilted K-Planes backend "
+                    "(pass tilted=True)"
+                )
             model = KPlanes(
                 M_features=M_features,
                 resolution=resolution,

@@ -309,14 +309,49 @@ class KPlanes(PPLR, TensorDecompositionModel):
 # ---------------------------------------------------------------------------
 
 
+# The coordinate pair each of the three tilted plane types is sampled with. The FIRST entry of a
+# pair becomes grid_sample's x coordinate, which indexes the plane's W axis; the second becomes y,
+# which indexes H. Axis numbering is (0, 1, 2) = (z, y, x), matching the model's coordinate order.
+TILTED_PLANE_AXES: tuple[tuple[int, int], ...] = ((0, 1), (2, 0), (1, 2))
+
+# One multiscale level is either today's single stacked tensor (3*T, C, H, W) or, with per-axis
+# planes, three tensors (T, C, H_p, W_p), one per plane type, in plane-type order.
+PlaneLevel = torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def per_axis_plane_shapes(
+    T: int, C: int, resolution: Sequence[int]
+) -> list[tuple[int, int, int, int]]:
+    """Shapes of the three per-plane-type feature tensors of one multiscale level.
+
+    ``resolution`` is ``(res_z, res_y, res_x)``. Each plane is ``(T, C, H, W)`` where W carries the
+    resolution of the first axis of that plane's coordinate pair and H that of the second, because
+    that is the order ``grid_sample`` reads the two coordinates in:
+
+        plane 0, pair (z, y) -> (T, C, res_y, res_z)
+        plane 1, pair (x, z) -> (T, C, res_z, res_x)
+        plane 2, pair (y, x) -> (T, C, res_x, res_y)
+
+    One stacked tensor cannot express this: it uses ``(res_y, res_z)`` for all three plane types,
+    so only plane 0 is sampled on the axes its coordinate pair names. With an isotropic
+    resolution the three shapes coincide and the two layouts agree.
+    """
+    res = [int(r) for r in resolution]
+    return [(int(T), int(C), res[second], res[first]) for first, second in TILTED_PLANE_AXES]
+
+
 def interpolate_ms_features_tilted(
     pts: torch.Tensor,  # (B, 3)
-    ms_grids: nn.ParameterList,  # each grid: (3*T, C, H, W)
+    ms_grids: Sequence[PlaneLevel],  # per level: (3*T, C, H, W), or 3x (T, C, H_p, W_p)
     rotation_matrices: torch.Tensor,  # (T, 3, 3)
 ) -> torch.Tensor:
     """
     Fully-vectorized multi-scale, multi-rotation K-Planes feature interpolation.
     Returns features of shape (B, C * T * num_scales).
+
+    A level given as three tensors (one per plane type) is sampled with three grid_sample calls
+    instead of one and folded exactly the same way, so with equal per-type shapes the two layouts
+    give the same numbers.
     """
     T = rotation_matrices.shape[0]
     B = pts.shape[0]
@@ -327,7 +362,7 @@ def interpolate_ms_features_tilted(
     # Build (T, 3, B, 2) coords for planes XY, ZX, YZ in one shot.
     # index_select is faster and cleaner than advanced indexing with python lists.
     # Plane axis layout: XY=(0,1), ZX=(2,0), YZ=(1,2)
-    idx = torch.tensor([[0, 1], [2, 0], [1, 2]], device=pts.device)  # (3, 2)
+    idx = torch.tensor(TILTED_PLANE_AXES, device=pts.device)  # (3, 2)
     # rotated: (T, B, 3) -> gather along last dim with idx (3, 2)
     # Result: (T, 3, B, 2)
     coords = (
@@ -339,19 +374,36 @@ def interpolate_ms_features_tilted(
 
     per_scale_features = []
     for plane_coef in ms_grids:
-        # plane_coef: (3T, C, H, W)
-        C = plane_coef.shape[1]
+        # one stacked (3T, C, H, W) tensor, or three (T, C, H_p, W_p) tensors, one per plane type
+        planes = list(plane_coef) if isinstance(plane_coef, (tuple, list)) else [plane_coef]
+        C = planes[0].shape[1]
 
-        sampled = F.grid_sample(
-            plane_coef,
-            coord_tensor,
-            align_corners=True,
-            mode="bilinear",
-            padding_mode="border",
-        )  # (3T, C, B, 1)
+        if len(planes) == 1:
+            # planes[0]: (3T, C, H, W)
+            sampled = F.grid_sample(
+                planes[0],
+                coord_tensor,
+                align_corners=True,
+                mode="bilinear",
+                padding_mode="border",
+            )  # (3T, C, B, 1)
 
-        # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
-        sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+            # (3T, C, B) -> (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
+            sampled = sampled.squeeze(-1).view(T, 3, C, B).prod(dim=1)
+        else:
+            # each plane type is sampled with its own coordinate pair
+            per_type = [
+                F.grid_sample(
+                    plane,
+                    coords[:, ptype].reshape(T, B, 1, 2),
+                    align_corners=True,
+                    mode="bilinear",
+                    padding_mode="border",
+                ).squeeze(-1)  # (T, C, B)
+                for ptype, plane in enumerate(planes)
+            ]
+            # (T, 3, C, B) -> Hadamard across the "3" dim -> (T, C, B)
+            sampled = torch.stack(per_type, dim=1).prod(dim=1)
 
         # (T, C, B) -> (B, T, C) -> (B, T*C) to concatenate rotations along feature dim
         per_scale_features.append(sampled.permute(2, 0, 1).reshape(B, T * C))
@@ -391,6 +443,12 @@ class KPlanesTILTED(KPlanes):
     tau_init : str
         "random" (paper default) or "identity".
         Irrelevant if you're calling load_tau_state() right after __init__.
+    per_axis_planes : bool
+        False (default): every level is one stacked tensor (3*T, C, res_y, res_z), which gives
+        plane types 1 and 2 the wrong two resolutions unless the resolution is isotropic.
+        True: three tensors per level, each shaped for the two axes it is actually sampled on
+        (see :func:`per_axis_plane_shapes`). Nothing is added to the saved state; the layout is
+        read off the tensor shapes, so older saved models keep loading.
     All other args are forwarded to KPlanes.
     """
 
@@ -405,6 +463,7 @@ class KPlanesTILTED(KPlanes):
         # TILTED parameters
         T: int = 4,
         tau_init: Literal["random", "identity"] = "random",
+        per_axis_planes: bool = False,
         # Hybrid MLP parameters
         use_hybrid_mlp: bool = False,
         hybrid_hidden_dim: int = 64,
@@ -440,14 +499,25 @@ class KPlanesTILTED(KPlanes):
         )
 
         self.T = T
+        self._per_axis_planes = bool(per_axis_planes)
 
         # ---- Rebuild grids: (3*T, M_features, H, W) per scale ----
+        # With per_axis_planes the level is split into three (T, M_features, H_p, W_p) tensors
+        # instead, one per plane type, so each plane type gets the resolutions of its own two axes.
+        # They stay in one flat ParameterList (level ``l``, plane type ``p`` at index ``3*l + p``)
+        # so the state_dict keys remain ``grids.<index>``.
         self.grids = nn.ParameterList()
         for res_mult in multiscale_res_multipliers:
             scaled_res = [int(r * res_mult) for r in resolution]
-            plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
-            nn.init.uniform_(plane, 0.1, 0.5)
-            self.grids.append(plane)
+            if self._per_axis_planes:
+                for shape in per_axis_plane_shapes(T, M_features, scaled_res):
+                    plane = nn.Parameter(torch.empty(*shape))
+                    nn.init.uniform_(plane, 0.1, 0.5)
+                    self.grids.append(plane)
+            else:
+                plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
+                nn.init.uniform_(plane, 0.1, 0.5)
+                self.grids.append(plane)
 
         # ---- Rebuild sigma_net with the correct feature_dim ----
         # KPlanes built sigma_net with self.feature_dim (= M * num_scales),
@@ -494,12 +564,30 @@ class KPlanesTILTED(KPlanes):
     # Core forward
     # ------------------------------------------------------------------
 
+    def ms_grid_levels(self) -> list[PlaneLevel]:
+        """Group the flat ``grids`` list into multiscale levels.
+
+        Default: one stacked ``(3*T, C, H, W)`` tensor per level. With per-axis planes: a triple
+        of ``(T, C, H_p, W_p)`` tensors per level, in plane-type order. The flag is read with a
+        ``False`` default so models pickled before it existed group the old way; the plane
+        geometry itself is always read off the tensors, never from the flag.
+        """
+        grids = list(self.grids)
+        if not getattr(self, "_per_axis_planes", False):
+            return cast(list[PlaneLevel], grids)
+        return [(grids[3 * i], grids[3 * i + 1], grids[3 * i + 2]) for i in range(len(grids) // 3)]
+
+    @property
+    def per_axis_planes(self) -> bool:
+        """True when each level is stored as three per-plane-type tensors."""
+        return bool(getattr(self, "_per_axis_planes", False))
+
     def get_densities(self, coords: torch.Tensor) -> torch.Tensor:
         pts = coords.reshape(-1, 3)
         R = self.so3.as_matrix()  # (T, 3, 3)
         features = interpolate_ms_features_tilted(
             pts=pts,
-            ms_grids=self.grids,
+            ms_grids=self.ms_grid_levels(),
             rotation_matrices=R,
         )
         density_before_activation = self.sigma_net(features)

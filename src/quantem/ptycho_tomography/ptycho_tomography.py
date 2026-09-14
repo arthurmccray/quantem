@@ -266,6 +266,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         plot_com: str | bool = False,
         plot_probe_overlap: bool = False,
         *,
+        warp_box_frac: "tuple[float | None, float | None, float | None] | None" = None,
         probe_energy: float | None = None,
         free_per_tilt_arrays: bool = True,
         obj_padding_px: tuple[int, int] | None = None,  # DEPRECATED
@@ -286,6 +287,12 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
           default zeros. Only useful when true material extends beyond the box (plan-view /
           real data); under tilt the beam samples up to ``±(bz/2)·sin(θ_max)`` laterally beyond
           the 0° footprint. ``volume_cropped`` removes margins on ALL three axes.
+        - ``warp_box_frac``: optional ``(z, y, x)`` per-axis coordinate warp, off by default.
+          Each entry is the share of the object model's ``[-1, 1]`` backend range that the
+          specimen box should occupy on that axis (``None`` leaves an axis alone). With a
+          margin the backend otherwise spends its features evenly over box + 2*margin; the warp
+          moves that spending back into the box. It changes only the coordinates handed to the
+          backend — the box, the materialized volume and the crops keep their meaning.
 
         Tilt-series specifics as before: a common (usually zero) CoM rotation is forced across
         tilts, and the 2D probe-overlap FOV mask is replaced by a trivial mask.
@@ -398,7 +405,12 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
                 (int(full2d_nopad[1]) - 1) * float(samp[1]) + float(roi[1]) * float(samp[1]),
             )
 
-        obj.set_geometry(lateral_box_A=lateral_box, sampling=samp, box_margin_A=margins)
+        obj.set_geometry(
+            lateral_box_A=lateral_box,
+            sampling=samp,
+            box_margin_A=margins,
+            warp_box_frac=warp_box_frac,
+        )
         self.compute_propagator_arrays()
 
         # trivial FOV mask (ndim-3 expanded by the setter); obj_model.mask stays empty so the
