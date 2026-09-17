@@ -490,8 +490,9 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         self, raw: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
-        Apply hard constraints: range clamping and filtering. All hard constaints are applied in
-        place with torch.no_grad().
+        Apply hard constraints: range clamping and filtering. Constraints are evaluated under
+        torch.no_grad() and returned as a straight-through op, so this is safe to call on a
+        live autograd tensor (e.g. ObjectDIP's network output) as well as on a leaf parameter.
         """
         c = self.constraints
         with torch.no_grad():
@@ -502,7 +503,14 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
             else:  # potential
                 constrained = self._apply_hard_potential(raw, c, mask)
             constrained = self._apply_shared_hard(constrained, c, mask)
-        return raw + (constrained - raw).detach()
+        out = raw + (constrained - raw).detach()
+        if self.num_slices > 1 and c.identical_slices:
+            # Averaging is linear, so it is applied outside the straight-through wrapper and
+            # differentiated properly: every slice then receives the same mean gradient. Under
+            # the straight-through path each slice would instead keep its own gradient, leaving
+            # the slices free to diverge along a direction the loss cannot see.
+            out = out.mean(dim=0, keepdim=True).expand_as(out)
+        return out
 
     def _apply_hard_complex(
         self, obj: torch.Tensor, c: PtychoObjConstraintParams.Raster
@@ -571,10 +579,6 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         if any([c.q_lowpass, c.q_highpass]):
             obj = self.butterworth_constraint(obj, sampling=self.sampling)
 
-        if self.num_slices > 1 and c.identical_slices:
-            # In-place mutation is safe because apply_hard_constraints is
-            # always called under outer torch.no_grad (see its docstring).
-            obj[:] = torch.mean(obj, dim=0, keepdim=True)
         return obj
 
     def apply_soft_constraints(
@@ -1297,9 +1301,7 @@ class ObjectDIP(ObjectConstraints):
         model_input = add_input_noise(
             self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
         )
-        obj_array = self.model(model_input)[0]
-        if self.mask.numel() > 0:
-            obj_array = obj_array * self._mask
+        obj_array = self.apply_hard_constraints(self.model(model_input)[0], mask=self.mask)
         return self._get_obj_patches(obj_array, patch_indices)
 
     def to(self, *args, **kwargs):
