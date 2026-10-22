@@ -193,3 +193,59 @@ class TestINRRayMath:
         d2.to("cpu")
         d2.load_parameters(path)
         assert torch.allclose(d2.z1_params.detach(), d.z1_params.detach())
+
+
+class TestTomographySplatDataset:
+    def _dset(self, learn_tilt_offset=False, n=12):
+        from quantem.tomography.dataset_models import TomographySplatDataset
+
+        stack = _stack(5, n)
+        return TomographySplatDataset.from_data(
+            stack,
+            np.array([-40.0, -20.0, 0.0, 20.0, 40.0]),
+            sampling=0.5,
+            learn_tilt_offset=learn_tilt_offset,
+        ), stack
+
+    def test_intensity_scale_restores_units_and_sampling_validated(self):
+        from quantem.tomography.dataset_models import TomographySplatDataset
+
+        dset, stack = self._dset()
+        restored = dset.tilt_stack.numpy() * dset.intensity_scale
+        assert np.allclose(restored, stack, rtol=1e-5)
+        assert dset.image_shape == (12, 12) and dset.num_tilts == 5
+        with pytest.raises(ValueError):
+            TomographySplatDataset.from_data(stack, np.zeros(5), sampling=0.0)
+
+    def test_rotations_invert_inr_transform_and_tilt_sign_kept(self):
+        dset, _ = self._dset()
+        dset.to("cpu")
+        with torch.no_grad():
+            dset.z1_params.fill_(6.0)
+            dset.z3_params.fill_(-9.0)
+        R = dset.rotations()
+        assert R.shape == (5, 3, 3)
+        assert torch.allclose(dset.tilt_angles, torch.tensor([-40.0, -20.0, 0.0, 20.0, 40.0]))
+        _, z1, z3, _ = dset.forward()
+        k = 4
+        rays = torch.tensor([[[0.2, -0.4, 0.7]]])
+        spec = TomographyINRDataset.transform_batch_rays(
+            rays,
+            z1[k : k + 1],
+            dset.tilt_angles[k : k + 1],
+            z3[k : k + 1],
+            torch.zeros(1, 2),
+            3,
+            1.0,
+        )
+        assert torch.allclose(R[k] @ spec[0, 0], rays[0, 0], atol=1e-5)
+
+    def test_tilt_offset_gauge_fixed_at_reference_and_gated(self):
+        dset, _ = self._dset(learn_tilt_offset=True)
+        dset.to("cpu")
+        with torch.no_grad():
+            dset.dtilt_params.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+        dtilt = dset.forward()[3]
+        assert dtilt.tolist() == [1.0, 2.0, 0.0, 3.0, 4.0]  # reference tilt (index 2) pinned to 0
+        dset.learn_tilt_offset = False
+        assert torch.all(dset.forward()[3] == 0)

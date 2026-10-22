@@ -272,3 +272,109 @@ class TestObjectTensorDecompTV:
             obj._normalize_optimizer_params(
                 {"grids": OptimizerParams.Adam(), "wrong": OptimizerParams.Adam()}
             )
+
+
+class TestObjectGaussianSplat:
+    def _obj(self, **kw):
+        from quantem.tomography.object_models import ObjectGaussianSplat
+
+        pos = np.array([[0.0, 0.0, 0.0], [2.88, 0.0, 0.0], [0.0, 2.88, 0.6]])
+        return ObjectGaussianSplat.from_positions(
+            pos, 1.7e-3, 0.4, fov_A=12.0, num_tilts=3, view_sampling=0.5, **kw
+        )
+
+    def test_parse_splat_constraints(self):
+        c = ObjConstraintParams.parse_dict({"name": "obj_splat", "tie_sigma": 0.2})
+        assert isinstance(c, ObjConstraintParams.ObjSplatConstraints) and c.tie_sigma == 0.2
+        assert set(c.soft_constraint_keys) | set(c.hard_constraint_keys) <= set(vars(c))
+
+    def test_parameter_groups_and_optimizer_param_normalisation(self):
+        from quantem.core.ml.optimizer_mixin import OptimizerParams
+
+        obj = self._obj()
+        assert list(obj.get_optimization_parameters()) == [
+            "positions",
+            "amplitudes",
+            "sigmas",
+            "background",
+        ]
+        obj.optimizer_params = OptimizerParams.Adam(lr=3e-3)
+        assert set(obj.optimizer_params) == {"positions", "amplitudes", "sigmas", "background"}
+        with pytest.raises(ValueError):
+            obj.optimizer_params = {"positions": OptimizerParams.Adam(lr=1e-2)}
+        obj.set_optimizer(OptimizerParams.Adam(lr=1e-2))
+        assert len(obj.optimizer.param_groups) == 4
+
+    def test_from_volume_seeds_known_atoms_and_from_xyz_permutes(self, tmp_path):
+        from quantem.tomography.atom_trace import render_isotropic
+        from quantem.tomography.object_models import ObjectGaussianSplat
+
+        v = 0.5
+        D = 24
+        pos = torch.tensor([[1.0, -2.0, 0.5], [-3.0, 1.5, -1.0]])
+        vox = torch.stack(
+            (
+                pos[:, 2] / v + (D - 1) / 2,
+                pos[:, 1] / v + (D - 1) / 2,
+                pos[:, 0] / v + (D - 1) / 2,
+            ),
+            1,
+        )
+        vol = render_isotropic(vox, torch.tensor([1.0, 0.8]), 1.2, (D, D, D), 5)
+        obj = ObjectGaussianSplat.from_volume(
+            vol, v, 1.0, 0.4, min_distance=2.0, threshold_fraction=0.999, view_sampling=v
+        )
+        assert obj.num_atoms == 2
+        d = torch.cdist(torch.as_tensor(obj.positions), pos).min(dim=1).values
+        assert float(d.max()) < 0.5 * v
+        xyz = tmp_path / "a.xyz"
+        xyz.write_text("1\ncomment\nAu 1.0 2.0 3.0\n")
+        obj2 = ObjectGaussianSplat.from_xyz(str(xyz), 1.0, 0.4, fov_A=10.0)
+        assert obj2.positions.tolist() == [[2.0, 1.0, 3.0]]
+
+    def test_hard_constraints_clamp_sigma_amplitude_and_box(self):
+        obj = self._obj()
+        with torch.no_grad():
+            obj._log_sigmas.fill_(np.log(5.0))
+            obj._log_amplitudes.fill_(np.log(1e-9))
+            obj._positions[0] = torch.tensor([50.0, -50.0, 0.0])
+        obj.apply_hard_constraints()
+        assert float(obj.sigmas.detach().max()) == pytest.approx(1.5, rel=1e-5)
+        assert float(obj.amplitudes.detach().min()) == pytest.approx(1e-6, rel=1e-4)
+        assert obj.positions[0].tolist() == pytest.approx([8.0, -8.0, 0.0], abs=1e-5)
+
+    def test_soft_constraints_ties_repulsion_and_prior(self):
+        obj = self._obj()
+        obj.constraints = {
+            "tie_amplitude": 1.0,
+            "tie_sigma": 1.0,
+            "repulsion": 1.0,
+            "min_distance": 3.0,
+        }
+        obj.refresh_neighbors()
+        assert float(obj.apply_soft_constraints()) > 0  # two pairs closer than 3 A
+        obj.constraints = {"repulsion": 0.0}
+        assert float(obj.apply_soft_constraints()) == 0.0  # uniform A, sigma -> ties vanish
+        with torch.no_grad():
+            obj._log_amplitudes[0] += 1.0
+        assert float(obj.apply_soft_constraints()) > 0
+        obj.constraints = {"tie_amplitude": 0.0, "tie_sigma": 0.0}
+        target = obj._positions.detach() + torch.tensor([0.3, 0.0, 0.0])
+        obj.set_prior_target(target, lam=2.0)
+        assert float(obj.apply_soft_constraints()) == pytest.approx(2.0 * 0.09, rel=1e-5)
+        with pytest.raises(ValueError):
+            obj.set_prior_target(torch.zeros(2, 3), 1.0)
+
+    def test_obj_view_sum_matches_zero_tilt_render(self):
+        obj = self._obj()
+        view = obj.obj_view
+        assert view.shape == (1, 24, 24, 24)
+        proj = view[0].sum(axis=0) * obj._view_sampling  # density * dz -> 2D mass per A^2
+        img = (
+            obj.forward(
+                torch.eye(3)[None], torch.zeros(1, 2), (24, 24), 0.5, tilt_idx=torch.tensor([0])
+            )[0]
+            .detach()
+            .numpy()
+        )
+        assert np.abs(proj - img).max() < 0.02 * img.max()

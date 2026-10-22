@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from numpy.typing import NDArray
 from tqdm.auto import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
@@ -14,7 +15,7 @@ from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.ddp import DDPMixin
 from quantem.core.ml.loss_functions import get_loss_module
 from quantem.core.ml.models.model_base import PlanarDecompositionModel
-from quantem.core.ml.optimizer_mixin import OptimizerMixin
+from quantem.core.ml.optimizer_mixin import OptimizerMixin, OptimizerParams, OptimizerParamsType
 from quantem.core.utils.rng import RNGMixin
 from quantem.tomography.dataset_models import TomographyINRPretrainDataset
 from quantem.tomography.tomography_context import ReconstructionContext
@@ -22,9 +23,7 @@ from quantem.tomography.tomography_context import ReconstructionContext
 
 def _tomography_autocast(device: torch.device | str, use_bfloat16: bool):
     device = torch.device(device)
-    enabled = bool(
-        use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
-    )
+    enabled = bool(use_bfloat16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
 
 
@@ -141,6 +140,43 @@ class ObjConstraintParams:
         soft_constraint_keys = ["tv_vol", "tv_plane", "sparsity"]
         hard_constraint_keys = ["positivity", "shrinkage"]
 
+    @dataclass
+    class ObjSplatConstraints(Constraints):
+        """
+        Constraints for a Gaussian-splat (explicit atoms) object representation.
+
+        Attributes
+        ----------
+        tie_amplitude : float
+            Weight of ``mean((log A - mean(log A))^2)``: pulls every atom's amplitude toward
+            the species mean (0 disables).
+        tie_sigma : float
+            Same for ``log sigma``.
+        repulsion : float
+            Weight of ``sum_{pairs d < min_distance} (min_distance - d)^2 / N`` over the cached
+            neighbour pairs (0 disables).
+        min_distance : float
+            Pair distance (Angstrom) below which the repulsion acts.
+        sigma_bounds : tuple[float, float]
+            Hard clamp on sigma in Angstrom.
+        amplitude_min : float
+            Hard lower bound on the amplitude.
+        box_pad : float
+            Positions are clamped to the field-of-view box extended by this margin (Angstrom).
+        """
+
+        tie_amplitude: float = 0.0
+        tie_sigma: float = 0.0
+        repulsion: float = 0.0
+        min_distance: float = 2.0
+        sigma_bounds: tuple[float, float] = (0.15, 1.5)
+        amplitude_min: float = 1e-6
+        box_pad: float = 2.0
+        _name: str = "obj_splat"
+
+        soft_constraint_keys = ["tie_amplitude", "tie_sigma", "repulsion", "min_distance"]
+        hard_constraint_keys = ["sigma_bounds", "amplitude_min", "box_pad"]
+
     @classmethod
     def parse_dict(
         cls, d: dict
@@ -194,6 +230,8 @@ class ObjConstraintParams:
             return ObjConstraintParams.ObjINRConstraints(**d)
         elif name == "obj_tensor_decomp":
             return ObjConstraintParams.ObjTensorDecompConstraints(**d)
+        elif name == "obj_splat":
+            return ObjConstraintParams.ObjSplatConstraints(**d)
         else:
             raise ValueError(f"Unknown object constraint type: {name.lower()}")
 
@@ -202,6 +240,7 @@ ObjConstraintsType = (
     ObjConstraintParams.ObjPixelatedConstraints
     | ObjConstraintParams.ObjINRConstraints
     | ObjConstraintParams.ObjTensorDecompConstraints
+    | ObjConstraintParams.ObjSplatConstraints
 )
 
 
@@ -1065,4 +1104,565 @@ class ObjectTensorDecomp(ObjectINR):
         )
 
 
-ObjectModelType = ObjectPixelated | ObjectINR | ObjectTensorDecomp
+class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraints], ObjectBase):
+    """
+    Explicit-atom object: a set of isotropic 3D Gaussians with free position, amplitude and
+    width, rendered analytically onto tilt images (:func:`quantem.core.ml.splat.render_projections`).
+
+    Parameters are ``_positions`` ``(N, 3)`` in Angstrom (specimen frame, ``(x, y, z)`` with
+    ``x`` the tilt axis), ``_log_amplitudes`` ``(N,)`` and ``_log_sigmas`` ``(N,)`` (log so that
+    ``A, sigma > 0`` structurally) and an optional per-tilt constant ``_background`` ``(T,)``.
+    The optimizer has one param group per key (``positions``, ``amplitudes``, ``sigmas``,
+    ``background``). A learned prior enters through ``set_prior_target`` as the soft term
+    ``lam * mean ||x - x_hat||^2`` (``x_hat`` detached).
+    """
+
+    DEFAULT_CONSTRAINTS = ObjConstraintParams.ObjSplatConstraints()
+    DEFAULT_LRS = {"positions": 2e-2, "amplitudes": 1e-2, "sigmas": 5e-3, "background": 1e-2}
+    PARAM_KEYS = ("positions", "amplitudes", "sigmas", "background")
+
+    def __init__(
+        self,
+        shape: tuple[int, int, int],
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
+    ):
+        super().__init__(shape=shape, device=device, rng=rng, _token=_token)
+        self._positions: nn.Parameter
+        self._log_amplitudes: nn.Parameter
+        self._log_sigmas: nn.Parameter
+        self._background: nn.Parameter | None = None
+        self._box_half = torch.zeros(3)
+        self._view_sampling = 1.0
+        self._species = "Au"
+        self._init_state: dict[str, torch.Tensor | None] = {}
+        self._prior_target: torch.Tensor | None = None
+        self._prior_lambda: float = 0.0
+        self._pair_idx: torch.Tensor | None = None
+
+    # region --- factories ---
+    @classmethod
+    def from_positions(
+        cls,
+        positions: NDArray | torch.Tensor,
+        amplitude: float | NDArray | torch.Tensor,
+        sigma: float | NDArray | torch.Tensor,
+        *,
+        fov_A: float | tuple[float, float, float],
+        num_tilts: int | None = None,
+        background: float | NDArray | torch.Tensor = 0.0,
+        species: str = "Au",
+        view_sampling: float = 0.5,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> "ObjectGaussianSplat":
+        """Build from explicit positions (Angstrom, specimen frame) and shared or per-atom
+        amplitude / sigma. ``fov_A`` is the (x, y, z) extent of the reconstruction box."""
+        pos = torch.as_tensor(np.asarray(positions), dtype=dtype).reshape(-1, 3)
+        n = pos.shape[0]
+        amp = torch.as_tensor(np.asarray(amplitude), dtype=dtype).reshape(-1).expand(n).clone()
+        sig = torch.as_tensor(np.asarray(sigma), dtype=dtype).reshape(-1).expand(n).clone()
+        if (amp <= 0).any() or (sig <= 0).any():
+            raise ValueError("amplitude and sigma must be > 0")
+        fov = (fov_A,) * 3 if isinstance(fov_A, (int, float)) else tuple(fov_A)
+        shape = tuple(int(np.ceil(f / view_sampling)) for f in fov[::-1])  # (z, y, x) voxels
+        obj = cls(shape=shape, device=device, rng=rng, _token=cls._token)  # type: ignore[arg-type]
+        obj._species = species
+        obj._view_sampling = float(view_sampling)
+        obj._box_half = torch.as_tensor([f / 2 for f in fov], dtype=dtype)
+        obj._positions = nn.Parameter(pos)
+        obj._log_amplitudes = nn.Parameter(torch.log(amp))
+        obj._log_sigmas = nn.Parameter(torch.log(sig))
+        if num_tilts is not None:
+            bg = (
+                torch.as_tensor(np.asarray(background), dtype=dtype)
+                .reshape(-1)
+                .expand(num_tilts)
+                .clone()
+            )
+            obj._background = nn.Parameter(bg)
+        obj._store_init_state()
+        obj.to(device)
+        return obj
+
+    @classmethod
+    def from_xyz(
+        cls,
+        path: str,
+        amplitude: float,
+        sigma: float,
+        *,
+        atom_to_spec: tuple[int, int, int] = (1, 0, 2),
+        center: bool = False,
+        **kwargs,
+    ) -> "ObjectGaussianSplat":
+        """Build from a 2-line-header xyz file (``El x y z`` in Angstrom). ``atom_to_spec``
+        permutes the file columns into the specimen ``(x, y, z)`` order; the default maps the
+        HAADF simulator's atom frame (image axis 0 = atom x, axis 1 = atom y = tilt axis)."""
+        xyz = np.loadtxt(path, skiprows=2, usecols=(1, 2, 3), dtype=np.float64, ndmin=2)
+        xyz = xyz[:, list(atom_to_spec)]
+        if center:
+            xyz = xyz - xyz.mean(axis=0, keepdims=True)
+        return cls.from_positions(xyz, amplitude, sigma, **kwargs)
+
+    @classmethod
+    def from_volume(
+        cls,
+        volume: NDArray | torch.Tensor,
+        voxel_size: float,
+        amplitude: float,
+        sigma: float,
+        *,
+        axis_order: tuple[str, str, str] = ("z", "y", "x"),
+        blur_sigmas: tuple[float, float] | float = (1.0, 2.0),
+        threshold_fraction: float = 0.99,
+        min_distance: float = 0.0,
+        max_peaks: int | None = None,
+        **kwargs,
+    ) -> "ObjectGaussianSplat":
+        """Seed atoms from a volume with :func:`quantem.tomography.atom_trace.seed_peaks`.
+        Voxel ``(k, i, j)`` of a ``("z", "y", "x")`` volume sits at
+        ``((j - (W-1)/2) v, (i - (H-1)/2) v, (k - (D-1)/2) v)``; ``min_distance`` is in Angstrom."""
+        from quantem.tomography.atom_trace import seed_peaks
+
+        vol = torch.as_tensor(
+            np.asarray(volume) if not isinstance(volume, torch.Tensor) else volume
+        )
+        vol = vol.detach().float().cpu()
+        peaks, _ = seed_peaks(
+            vol,
+            blur_sigmas=blur_sigmas,
+            threshold_fraction=threshold_fraction,
+            min_distance=float(min_distance) / float(voxel_size),
+            max_peaks=max_peaks,
+        )
+        shape = vol.shape
+        pos = {}
+        for axis, name in enumerate(axis_order):
+            pos[name] = (peaks[:, axis].double() - (shape[axis] - 1) / 2) * float(voxel_size)
+        xyz = torch.stack((pos["x"], pos["y"], pos["z"]), dim=1).numpy()
+        if "fov_A" not in kwargs:
+            kwargs["fov_A"] = tuple(
+                float(shape[axis_order.index(n)] * voxel_size) for n in ("x", "y", "z")
+            )
+        return cls.from_positions(xyz, amplitude, sigma, **kwargs)
+
+    @classmethod
+    def from_dataset(
+        cls,
+        dset,
+        sigma: float = 0.38,
+        amplitude: float | None = None,
+        *,
+        voxel_size: float | None = None,
+        fov_z_A: float | None = None,
+        n_atoms_guess: int | None = None,
+        **seed_kwargs,
+    ) -> "ObjectGaussianSplat":
+        """Seed atoms from the unfiltered back-projection of a ``TomographySplatDataset``
+        (its current poses). ``amplitude`` defaults to the mean image mass per atom
+        (``n_atoms_guess`` = number of seeds when not given)."""
+        from quantem.core.ml.splat.renderer import backproject_images
+
+        with torch.no_grad():
+            target, rot, shifts = dset.batch(None)
+            H, W = dset.image_shape
+            s = dset.sampling
+            v = float(voxel_size) if voxel_size is not None else 2.0 * s
+            fov_xy = (W * s, H * s)
+            fov_z = float(fov_z_A) if fov_z_A is not None else min(fov_xy)
+            shape = (int(round(fov_z / v)), int(round(fov_xy[1] / v)), int(round(fov_xy[0] / v)))
+            vol = backproject_images(target.detach(), rot.detach(), shifts.detach(), s, shape, v)
+        obj = cls.from_volume(
+            vol,
+            v,
+            1.0,
+            sigma,
+            fov_A=(fov_xy[0], fov_xy[1], fov_z),
+            num_tilts=dset.num_tilts,
+            **seed_kwargs,
+        )
+        n = obj.num_atoms if n_atoms_guess is None else int(n_atoms_guess)
+        if amplitude is None:
+            amplitude = float(target.sum(dim=(1, 2)).mean()) * s * s / max(n, 1)
+        with torch.no_grad():
+            obj._log_amplitudes.fill_(float(np.log(amplitude)))
+        obj._store_init_state()
+        return obj
+
+    # endregion
+
+    # region --- properties ---
+    @property
+    def num_atoms(self) -> int:
+        return int(self._positions.shape[0])
+
+    @property
+    def positions(self) -> np.ndarray:
+        return self._positions.detach().cpu().numpy()
+
+    @property
+    def amplitudes(self) -> torch.Tensor:
+        return torch.exp(self._log_amplitudes)
+
+    @property
+    def sigmas(self) -> torch.Tensor:
+        return torch.exp(self._log_sigmas)
+
+    @property
+    def amplitudes_np(self) -> np.ndarray:
+        return self.amplitudes.detach().cpu().numpy()
+
+    @property
+    def sigmas_np(self) -> np.ndarray:
+        return self.sigmas.detach().cpu().numpy()
+
+    @property
+    def background(self) -> torch.Tensor | None:
+        return self._background
+
+    @property
+    def species(self) -> str:
+        return self._species
+
+    @property
+    def box_half(self) -> torch.Tensor:
+        return self._box_half
+
+    @property
+    def device(self) -> torch.device:
+        return self._positions.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._positions.dtype
+
+    @property
+    def model(self) -> nn.Module:
+        return self
+
+    @property
+    def params(self) -> Generator[torch.nn.Parameter, None, None]:
+        yield self._positions
+        yield self._log_amplitudes
+        yield self._log_sigmas
+        if self._background is not None:
+            yield self._background
+
+    @property
+    def prior_target(self) -> torch.Tensor | None:
+        return self._prior_target
+
+    @property
+    def obj(self) -> torch.Tensor:
+        return self.render_volume()
+
+    @property
+    def obj_view(self) -> np.ndarray:
+        """``(1, D, H, W)`` volume indexed ``(z, y, x)`` at ``view_sampling``; ``obj_view[0].sum(0)``
+        is the zero-tilt projection on the image axes."""
+        return self.render_volume().detach().cpu().numpy()[None]
+
+    # endregion
+
+    # region --- optimizer wiring ---
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        groups = {
+            "positions": [self._positions],
+            "amplitudes": [self._log_amplitudes],
+            "sigmas": [self._log_sigmas],
+        }
+        if self._background is not None:
+            groups["background"] = [self._background]
+        return groups
+
+    def _normalize_optimizer_params(self, params):
+        """A single spec is broadcast to every group; a dict must name exactly the groups."""
+        keys = list(self.get_optimization_parameters().keys())
+        if isinstance(params, OptimizerParamsType) or (
+            isinstance(params, dict) and self._is_single_optimizer_dict(params)
+        ):
+            spec = (
+                params
+                if isinstance(params, OptimizerParamsType)
+                else OptimizerParams.parse_dict(d=params)
+            )
+            return {k: deepcopy(spec) for k in keys}
+        if not isinstance(params, dict):
+            raise TypeError(f"optimizer_params must be a spec or a dict keyed by {keys}")
+        if set(params) != set(keys):
+            raise ValueError(f"optimizer_params keys must be {keys}, got {sorted(params)}")
+        return super()._normalize_optimizer_params(params)
+
+    # endregion
+
+    # region --- forward / rendering ---
+    def window_radius(self, sampling: float, window_sigmas: float = 4.0) -> int:
+        from quantem.core.ml.splat.renderer import window_radius_for
+
+        return window_radius_for(float(self.sigmas.detach().max()), sampling, window_sigmas)
+
+    def forward(  # type: ignore[override]
+        self,
+        rotations: torch.Tensor,
+        shifts: torch.Tensor,
+        image_shape: tuple[int, int],
+        sampling: float,
+        tilt_idx: torch.Tensor | None = None,
+        window_sigmas: float = 4.0,
+        tilt_chunk: int | None = None,
+    ) -> torch.Tensor:
+        """Render ``(B, H, W)`` images for the given poses."""
+        from quantem.core.ml.splat.renderer import render_projections
+
+        bg = None
+        if self._background is not None:
+            bg = self._background if tilt_idx is None else self._background[tilt_idx]
+            if bg.shape[0] != rotations.shape[0]:
+                raise ValueError(
+                    f"{bg.shape[0]} background values for {rotations.shape[0]} poses: pass tilt_idx"
+                )
+        return render_projections(
+            self._positions,
+            self.amplitudes,
+            self.sigmas,
+            rotations,
+            shifts,
+            sampling,
+            image_shape,
+            self.window_radius(sampling, window_sigmas),
+            background=bg,
+            tilt_chunk=tilt_chunk,
+        )
+
+    def render_volume(
+        self, view_sampling: float | None = None, window_sigmas: float = 4.0
+    ) -> torch.Tensor:
+        """Sum of the 3D Gaussians on a ``(D, H, W)`` grid indexed ``(z, y, x)``."""
+        from quantem.tomography.atom_trace import render_isotropic
+
+        v = float(view_sampling) if view_sampling is not None else self._view_sampling
+        D, H, W = self.shape
+        with torch.no_grad():
+            pos = self._positions.detach()
+            vox = torch.stack(
+                (
+                    pos[:, 2] / v + (D - 1) / 2,
+                    pos[:, 1] / v + (H - 1) / 2,
+                    pos[:, 0] / v + (W - 1) / 2,
+                ),
+                dim=1,
+            )
+            sig = self.sigmas.detach()
+            peak = self.amplitudes.detach() / ((2 * np.pi) ** 1.5 * sig**3)  # density per A^3
+            r = int(np.ceil(window_sigmas * float(sig.max()) / v))
+            return render_isotropic(vox, peak, sig / v, (D, H, W), r)
+
+    # endregion
+
+    # region --- constraints and prior ---
+    def apply_hard_constraints(self) -> None:  # type: ignore[override]
+        c = self.constraints
+        with torch.no_grad():
+            lo, hi = c.sigma_bounds
+            self._log_sigmas.clamp_(np.log(lo), np.log(hi))
+            self._log_amplitudes.clamp_(min=np.log(c.amplitude_min))
+            half = (self._box_half + c.box_pad).to(self._positions)
+            self._positions.copy_(torch.maximum(torch.minimum(self._positions, half), -half))
+
+    def apply_soft_constraints(self, ctx: ReconstructionContext | None = None) -> torch.Tensor:  # type: ignore[override]
+        self.reset_soft_constraint_losses()
+        c = self.constraints
+        loss = torch.zeros((), device=self.device, dtype=self.dtype)
+        if c.tie_amplitude > 0:
+            la = self._log_amplitudes
+            term = c.tie_amplitude * ((la - la.mean().detach()) ** 2).mean()
+            self.add_soft_constraint_loss("tie_amplitude", term)
+            loss = loss + term
+        if c.tie_sigma > 0:
+            ls = self._log_sigmas
+            term = c.tie_sigma * ((ls - ls.mean().detach()) ** 2).mean()
+            self.add_soft_constraint_loss("tie_sigma", term)
+            loss = loss + term
+        if c.repulsion > 0 and self._pair_idx is not None and self._pair_idx.numel() > 0:
+            pi = self._pair_idx
+            d = (self._positions[pi[:, 0]] - self._positions[pi[:, 1]]).norm(dim=-1)
+            pen = torch.clamp(c.min_distance - d, min=0.0)
+            term = c.repulsion * (pen * pen).sum() / max(self.num_atoms, 1)
+            self.add_soft_constraint_loss("repulsion", term)
+            loss = loss + term
+        if self._prior_target is not None and self._prior_lambda > 0:
+            term = (
+                self._prior_lambda
+                * ((self._positions - self._prior_target) ** 2).sum(dim=-1).mean()
+            )
+            self.add_soft_constraint_loss("prior", term)
+            loss = loss + term
+        return loss
+
+    def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
+        return torch.zeros((), device=self.device, dtype=self.dtype)
+
+    def set_prior_target(self, target: torch.Tensor, lam: float) -> None:
+        """Store a detached clean-position estimate ``x_hat`` and its weight."""
+        if target.shape != self._positions.shape:
+            raise ValueError(
+                f"prior target shape {tuple(target.shape)} != {tuple(self._positions.shape)}"
+            )
+        self._prior_target = target.detach().to(self._positions)
+        self._prior_lambda = float(lam)
+
+    def clear_prior_target(self) -> None:
+        self._prior_target = None
+        self._prior_lambda = 0.0
+
+    def refresh_neighbors(self, min_distance: float | None = None) -> None:
+        """Cache the atom pairs closer than ``min_distance`` (default: the constraint value)."""
+        from scipy.spatial import cKDTree
+
+        r = float(self.constraints.min_distance if min_distance is None else min_distance)
+        pairs = cKDTree(self.positions).query_pairs(r, output_type="ndarray")
+        self._pair_idx = torch.as_tensor(pairs, dtype=torch.long, device=self.device).reshape(
+            -1, 2
+        )
+
+    # endregion
+
+    # region --- densification ---
+    def _rebuild(
+        self,
+        keep_idx: torch.Tensor | None,
+        new_pos: torch.Tensor | None = None,
+        new_amp: torch.Tensor | None = None,
+        new_sig: torch.Tensor | None = None,
+    ) -> None:
+        """Replace the per-atom Parameters by ``kept rows (+ appended new rows)`` and remap the
+        optimizer state accordingly."""
+        from quantem.core.ml.splat.densify import remap_optimizer_state
+
+        def _new(param: nn.Parameter, extra: torch.Tensor | None) -> nn.Parameter:
+            kept = param.detach() if keep_idx is None else param.detach()[keep_idx]
+            if extra is not None:
+                kept = torch.cat((kept, extra.to(kept)), dim=0)
+            return nn.Parameter(kept.clone())
+
+        n_new = 0 if new_pos is None else int(new_pos.shape[0])
+        p_new = _new(self._positions, new_pos)
+        a_new = _new(self._log_amplitudes, None if new_amp is None else torch.log(new_amp))
+        s_new = _new(self._log_sigmas, None if new_sig is None else torch.log(new_sig))
+        for old, new in (
+            (self._positions, p_new),
+            (self._log_amplitudes, a_new),
+            (self._log_sigmas, s_new),
+        ):
+            remap_optimizer_state(self.optimizer, old, new, keep_idx, n_new)
+        self._positions, self._log_amplitudes, self._log_sigmas = p_new, a_new, s_new
+        self._prior_target = None
+        self._pair_idx = None
+
+    def prune(self, keep_mask: torch.Tensor) -> int:
+        """Remove the atoms where ``keep_mask`` is False; returns the number removed."""
+        keep_idx = torch.nonzero(keep_mask.to(self.device)).reshape(-1)
+        removed = self.num_atoms - int(keep_idx.numel())
+        if removed:
+            self._rebuild(keep_idx)
+        return removed
+
+    def add_atoms(
+        self,
+        positions: torch.Tensor | NDArray,
+        amplitude: float | torch.Tensor | None = None,
+        sigma: float | torch.Tensor | None = None,
+    ) -> int:
+        """Append atoms (default amplitude / sigma = current medians); returns how many."""
+        pos = torch.as_tensor(
+            np.asarray(positions) if not isinstance(positions, torch.Tensor) else positions
+        )
+        pos = pos.to(self._positions).reshape(-1, 3)
+        n = int(pos.shape[0])
+        if n == 0:
+            return 0
+        amp = (
+            self.amplitudes.detach().median() if amplitude is None else torch.as_tensor(amplitude)
+        )
+        sig = self.sigmas.detach().median() if sigma is None else torch.as_tensor(sigma)
+        amp = amp.to(self._positions).reshape(-1).expand(n)
+        sig = sig.to(self._positions).reshape(-1).expand(n)
+        self._rebuild(torch.arange(self.num_atoms, device=self.device), pos, amp, sig)
+        return n
+
+    def merge(self, min_distance: float) -> int:
+        """Merge atoms closer than ``min_distance`` Angstrom; returns the number removed."""
+        from quantem.core.ml.splat.densify import merge_close_atoms
+
+        keep_idx, pos, amp, sig = merge_close_atoms(
+            self._positions, self.amplitudes, self.sigmas, min_distance
+        )
+        removed = self.num_atoms - int(keep_idx.numel())
+        if removed:
+            self._rebuild(keep_idx)
+            with torch.no_grad():
+                self._positions.copy_(pos)
+                self._log_amplitudes.copy_(torch.log(amp))
+                self._log_sigmas.copy_(torch.log(sig))
+        return removed
+
+    # endregion
+
+    # region --- state ---
+    def _store_init_state(self) -> None:
+        self._init_state = {
+            "positions": self._positions.detach().cpu().clone(),
+            "log_amplitudes": self._log_amplitudes.detach().cpu().clone(),
+            "log_sigmas": self._log_sigmas.detach().cpu().clone(),
+            "background": None
+            if self._background is None
+            else self._background.detach().cpu().clone(),
+        }
+
+    def reset(self) -> None:
+        st = self._init_state
+        dev = self.device
+        self._positions = nn.Parameter(st["positions"].to(dev).clone())
+        self._log_amplitudes = nn.Parameter(st["log_amplitudes"].to(dev).clone())
+        self._log_sigmas = nn.Parameter(st["log_sigmas"].to(dev).clone())
+        if st["background"] is not None:
+            self._background = nn.Parameter(st["background"].to(dev).clone())
+        self.clear_prior_target()
+        self._pair_idx = None
+        if self.optimizer is not None:
+            self.set_optimizer(self.optimizer_params)
+
+    def to(self, device: str | torch.device):  # type: ignore[override]
+        dev = torch.device(device)
+        self._positions = nn.Parameter(self._positions.detach().to(dev))
+        self._log_amplitudes = nn.Parameter(self._log_amplitudes.detach().to(dev))
+        self._log_sigmas = nn.Parameter(self._log_sigmas.detach().to(dev))
+        if self._background is not None:
+            self._background = nn.Parameter(self._background.detach().to(dev))
+        self._box_half = self._box_half.to(dev)
+        if self._prior_target is not None:
+            self._prior_target = self._prior_target.to(dev)
+        if self._pair_idx is not None:
+            self._pair_idx = self._pair_idx.to(dev)
+        self._rng_to_device(dev)
+        self.reconnect_optimizer_to_parameters()
+        return self
+
+    def sites_dict(self) -> dict[str, np.ndarray]:
+        """Plain-numpy snapshot ``{positions, amplitudes, sigmas, background}``."""
+        return {
+            "positions": self.positions,
+            "amplitudes": self.amplitudes_np,
+            "sigmas": self.sigmas_np,
+            "background": None
+            if self._background is None
+            else self._background.detach().cpu().numpy(),
+        }
+
+    # endregion
+
+
+ObjectModelType = ObjectPixelated | ObjectINR | ObjectTensorDecomp | ObjectGaussianSplat

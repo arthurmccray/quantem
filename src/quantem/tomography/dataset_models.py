@@ -11,7 +11,7 @@ from quantem.core.datastructures.dataset3d import Dataset3d
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.ml.constraints import BaseConstraints, Constraints
 from quantem.core.ml.optimizer_mixin import OptimizerMixin
-from quantem.tomography.utils import tv_loss_1d
+from quantem.tomography.utils import pose_to_rotations, tv_loss_1d
 
 # --- Constraints ---
 
@@ -178,9 +178,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
         if _token is not self._token:
             raise RuntimeError("Use TomographyPixDataset.from_* to instantiate this class.")
 
-        if not (
-            tilt_stack.shape[0] == tilt_angles.shape[0]
-        ):
+        if not (tilt_stack.shape[0] == tilt_angles.shape[0]):
             raise ValueError(
                 "The number of tilt projections should be in the first dimension of the dataset."
             )
@@ -509,18 +507,12 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
         with torch.autocast(device_type=self.device.type, enabled=False):
-            pixel_i = batch["pixel_i"].to(
-                self.device, dtype=torch.float32, non_blocking=True
-            )
-            pixel_j = batch["pixel_j"].to(
-                self.device, dtype=torch.float32, non_blocking=True
-            )
+            pixel_i = batch["pixel_i"].to(self.device, dtype=torch.float32, non_blocking=True)
+            pixel_j = batch["pixel_j"].to(self.device, dtype=torch.float32, non_blocking=True)
             phis = batch["phi"].to(self.device, dtype=torch.float32, non_blocking=True)
             projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
             with torch.no_grad():
-                batch_ray_coords = self.create_batch_rays(
-                    pixel_i, pixel_j, N, num_samples_per_ray
-                )
+                batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
 
             shifts, z1_params, z3_params = self.forward(None)
             batch_shifts = torch.index_select(shifts.float(), 0, projection_indices)
@@ -695,6 +687,202 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
             self.reconnect_optimizer_to_parameters()
 
 
+class TomographySplatDataset(TomographyDatasetConstraints):
+    """
+    Dataset class for Gaussian-splat tomography: whole tilt images in physical units.
+
+    Differences from the INR dataset: a ``sampling`` (Angstrom per pixel) is required, the
+    normalisation factor the base class divides the stack by is kept as ``intensity_scale``,
+    tilt angles are stored as given (no negation), and an optional learnable per-tilt
+    tilt-angle offset ``dtilt`` (degrees, zero at the reference tilt) is added to the
+    ``z1`` / ``z3`` / ``shifts`` pose parameters. ``rotations()`` returns the specimen -> beam
+    matrices used by :func:`quantem.core.ml.splat.render_projections`.
+    """
+
+    def __init__(
+        self,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        sampling: float,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        learn_tilt_offset: bool = False,
+        norm_quantile: bool = True,
+        dose_e_per_A2: float | None = None,
+        _token: object | None = None,
+    ):
+        stack = tilt_stack if isinstance(tilt_stack, torch.Tensor) else torch.as_tensor(tilt_stack)
+        stack = stack.float()
+        if norm_quantile:
+            flat = stack.reshape(-1)
+            if flat.numel() > 4_000_000:
+                flat = flat[torch.randperm(flat.numel())[:4_000_000]]
+            scale = float(torch.quantile(flat, 0.95))
+        else:
+            scale = float(stack.max())
+        super().__init__(
+            tilt_stack=stack,
+            tilt_angles=torch.as_tensor(tilt_angles).float(),
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            norm_quantile=norm_quantile,
+            _token=_token,
+        )
+        if sampling <= 0:
+            raise ValueError(f"sampling must be > 0 Angstrom/px, got {sampling}")
+        self._sampling = float(sampling)
+        self._intensity_scale = scale
+        self._dose_e_per_A2 = None if dose_e_per_A2 is None else float(dose_e_per_A2)
+        self._learn_tilt_offset = bool(learn_tilt_offset)
+        self._dtilt = torch.zeros(self.learnable_tilts)
+        self._dtilt_ref = torch.zeros(1)
+
+    @classmethod
+    def from_data(  # type: ignore[override]
+        cls,
+        tilt_stack: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        sampling: float,
+        learn_shift: bool = True,
+        learn_tilt_axis: bool = True,
+        learn_tilt_offset: bool = False,
+        norm_quantile: bool = True,
+        dose_e_per_A2: float | None = None,
+    ):
+        return cls(
+            tilt_stack=tilt_stack,
+            tilt_angles=tilt_angles,
+            sampling=sampling,
+            learn_shift=learn_shift,
+            learn_tilt_axis=learn_tilt_axis,
+            learn_tilt_offset=learn_tilt_offset,
+            norm_quantile=norm_quantile,
+            dose_e_per_A2=dose_e_per_A2,
+            _token=cls._token,
+        )
+
+    # --- Properties ---
+    @property
+    def sampling(self) -> float:
+        """Angstrom per pixel."""
+        return self._sampling
+
+    @property
+    def intensity_scale(self) -> float:
+        """The factor the raw stack was divided by (95 % quantile or max)."""
+        return self._intensity_scale
+
+    @property
+    def dose_e_per_A2(self) -> float | None:
+        return self._dose_e_per_A2
+
+    @property
+    def learn_tilt_offset(self) -> bool:
+        return self._learn_tilt_offset
+
+    @learn_tilt_offset.setter
+    def learn_tilt_offset(self, value: bool):
+        self._learn_tilt_offset = bool(value)
+
+    @property
+    def image_shape(self) -> tuple[int, int]:
+        return (int(self.tilt_stack.shape[1]), int(self.tilt_stack.shape[2]))
+
+    @property
+    def num_tilts(self) -> int:
+        return int(self.tilt_stack.shape[0])
+
+    @property
+    def dtilt_params(self) -> torch.nn.Parameter:
+        return self._dtilt_params
+
+    @property
+    def counts_per_pixel(self) -> torch.Tensor | None:
+        """Expected electron counts per pixel (needs ``dose_e_per_A2``), for Poisson losses."""
+        if self._dose_e_per_A2 is None:
+            return None
+        return self.tilt_stack * self._intensity_scale * self._dose_e_per_A2 * self._sampling**2
+
+    # --- Forward pass (pose parameters) ---
+    def _splice(self, params: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+        k = self.reference_tilt_idx
+        return torch.cat([params[:k], ref, params[k:]], dim=0)
+
+    def forward(self, dummy_input: Any = None):  # type: ignore[override]
+        """Returns ``(shifts (T, 2) px, z1 (T,), z3 (T,), dtilt (T,))`` with the reference row
+        re-inserted; disabled groups return zeros of the right shape."""
+        shifts = self._splice(self.shifts_params, self._shifts_ref)
+        z1 = self._splice(self.z1_params, self._z1_ref)
+        z3 = self._splice(self.z3_params, self._z3_ref)
+        dtilt = self._splice(self.dtilt_params, self._dtilt_ref)
+        if not self.learn_shift:
+            shifts = torch.zeros_like(shifts)
+        if not self.learn_tilt_axis:
+            z1 = torch.zeros_like(z1)
+            z3 = torch.zeros_like(z3)
+        if not self.learn_tilt_offset:
+            dtilt = torch.zeros_like(dtilt)
+        return shifts, z1, z3, dtilt
+
+    def rotations(self, tilt_idx: torch.Tensor | None = None) -> torch.Tensor:
+        """``(B, 3, 3)`` specimen -> beam rotations (differentiable in the pose parameters)."""
+        _, z1, z3, dtilt = self.forward(None)
+        tilt = self.tilt_angles + dtilt
+        if tilt_idx is not None:
+            tilt, z1, z3 = tilt[tilt_idx], z1[tilt_idx], z3[tilt_idx]
+        return pose_to_rotations(tilt, z1, z3)
+
+    def batch(self, tilt_idx: torch.Tensor | None = None):
+        """``(target (B, H, W), rotations (B, 3, 3), shifts (B, 2))`` for the given tilts."""
+        shifts = self.forward(None)[0]
+        if tilt_idx is None:
+            return self.tilt_stack, self.rotations(), shifts
+        return self.tilt_stack[tilt_idx], self.rotations(tilt_idx), shifts[tilt_idx]
+
+    # --- Constraints ---
+    def apply_soft_constraints(self) -> torch.Tensor:
+        soft_loss = super().apply_soft_constraints()
+        if self.constraints.tv_zs > 0 and self.learn_tilt_offset:
+            soft_loss = soft_loss + self.constraints.tv_zs * tv_loss_1d(self.dtilt_params)
+        return soft_loss
+
+    # --- Device ---
+    def to(self, device: torch.device | str):
+        self.tilt_stack = self.tilt_stack.to(device)
+        self.tilt_angles = self.tilt_angles.to(device)
+        self._z1_params = nn.Parameter(self._z1_angles.to(device))
+        self._z3_params = nn.Parameter(self._z3_angles.to(device))
+        self._shifts_params = nn.Parameter(self._shifts.to(device))
+        self._dtilt_params = nn.Parameter(self._dtilt.to(device))
+        self._z1_ref = self._z1_ref.to(device)
+        self._z3_ref = self._z3_ref.to(device)
+        self._shifts_ref = self._shifts_ref.to(device)
+        self._dtilt_ref = self._dtilt_ref.to(device)
+        self.device = device
+        self.reconnect_optimizer_to_parameters()
+
+    # --- Save learned parameters ---
+    def save_parameters(self, path: str):
+        torch.save(
+            {
+                "z1": self._z1_params.detach().cpu(),
+                "z3": self._z3_params.detach().cpu(),
+                "shifts": self._shifts_params.detach().cpu(),
+                "dtilt": self._dtilt_params.detach().cpu(),
+            },
+            path,
+        )
+
+    def load_parameters(self, path: str):
+        data = torch.load(path)
+        self._z1_params = nn.Parameter(data["z1"].to(self.device))
+        self._z3_params = nn.Parameter(data["z3"].to(self.device))
+        self._shifts_params = nn.Parameter(data["shifts"].to(self.device))
+        self._dtilt_params = nn.Parameter(data["dtilt"].to(self.device))
+        if self.optimizer is not None:
+            self.reconnect_optimizer_to_parameters()
+
+
 class TomographyINRPretrainDataset(Dataset):
     """
     Dataset class for pretraining INR models.
@@ -736,4 +924,4 @@ class TomographyINRPretrainDataset(Dataset):
         return {"coords": self.coords[idx], "target": self.targets[idx]}
 
 
-DatasetModelType = TomographyINRDataset | TomographyPixDataset
+DatasetModelType = TomographyINRDataset | TomographyPixDataset | TomographySplatDataset

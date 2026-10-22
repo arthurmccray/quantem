@@ -76,3 +76,22 @@ class TestRotations:
         out.sum().backward()
         assert vol.grad is not None
         assert torch.isfinite(vol.grad).all()
+
+
+class TestPoseToRotations:
+    def test_identity_orthonormal_and_matches_inr_transform(self):
+        from quantem.tomography.dataset_models import TomographyINRDataset
+        from quantem.tomography.utils import pose_to_rotations
+
+        R0 = pose_to_rotations(torch.tensor([0.0]), torch.tensor([0.0]), torch.tensor([0.0]))
+        assert torch.allclose(R0[0], torch.eye(3), atol=1e-7)
+        tilt, z1, z3 = torch.tensor([37.0]), torch.tensor([-9.0]), torch.tensor([14.0])
+        R = pose_to_rotations(tilt, z1, z3)
+        assert torch.allclose(R[0] @ R[0].T, torch.eye(3), atol=1e-6)
+        # R must invert the beam -> specimen map of transform_batch_rays (no shift)
+        rays = torch.tensor([[[0.3, -0.5, 0.8]]])  # (1 ray, 1 sample, xyz) beam frame
+        spec = TomographyINRDataset.transform_batch_rays(
+            rays, z1, tilt, z3, torch.zeros(1, 2), 3, 1.0
+        )
+        back = (R[0] @ spec[0, 0]).reshape(-1)
+        assert torch.allclose(back, rays[0, 0], atol=1e-5)

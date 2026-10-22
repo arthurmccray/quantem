@@ -15,10 +15,17 @@ from quantem.tomography.dataset_models import (
     DatasetConstraintsType,
     TomographyINRDataset,
     TomographyPixDataset,
+    TomographySplatDataset,
 )
-from quantem.tomography.logger_tomography import LoggerTomography
-from quantem.tomography.object_models import ObjConstraintsType, ObjectINR, ObjectPixelated
+from quantem.tomography.logger_tomography import LoggerTomography, LoggerTomographySplat
+from quantem.tomography.object_models import (
+    ObjConstraintsType,
+    ObjectGaussianSplat,
+    ObjectINR,
+    ObjectPixelated,
+)
 from quantem.tomography.tomography import Tomography, TomographyConventional
+from quantem.tomography.tomography_splat import TomographySplat
 
 
 class TomographyLiteINR(Tomography):
@@ -170,3 +177,106 @@ class TomographyLiteConv(TomographyConventional):
         )
 
         return tomography
+
+
+class TomographyLiteSplat(TomographySplat):
+    """
+    One-call Gaussian-splat tomography: build the dataset and the atoms, then ``reconstruct``.
+    """
+
+    @classmethod
+    def from_dataset(  # type: ignore[override]
+        cls,
+        tilt_series: Dataset3d | NDArray | torch.Tensor,
+        tilt_angles: NDArray | torch.Tensor,
+        sampling: float,
+        init: Literal["backproject"] | NDArray | torch.Tensor | str | os.PathLike = "backproject",
+        sigma_init: float = 0.38,
+        amplitude_init: float | None = None,
+        learn_tilt_offset: bool = False,
+        voxel_size: float | None = None,
+        fov_z_A: float | None = None,
+        device: str = "cuda",
+        log_dir: os.PathLike | str | None = None,
+        log_images_every: int = 10,
+        rng: np.random.Generator | int | None = None,
+        **seed_kwargs,
+    ) -> Self:
+        dset = TomographySplatDataset.from_data(
+            tilt_stack=tilt_series,
+            tilt_angles=tilt_angles,
+            sampling=sampling,
+            learn_tilt_offset=learn_tilt_offset,
+        )
+        dset.to("cpu")
+        H, W = dset.image_shape
+        fov = (
+            W * sampling,
+            H * sampling,
+            float(fov_z_A) if fov_z_A is not None else min(W, H) * sampling,
+        )
+        if isinstance(init, str) and init == "backproject":
+            obj = ObjectGaussianSplat.from_dataset(
+                dset,
+                sigma=sigma_init,
+                amplitude=amplitude_init,
+                voxel_size=voxel_size,
+                fov_z_A=fov_z_A,
+                **seed_kwargs,
+            )
+        else:
+            if amplitude_init is None:
+                stack = dset.tilt_stack
+                n = (
+                    len(np.loadtxt(init, skiprows=2, usecols=(1,)))
+                    if isinstance(init, (str, os.PathLike))
+                    else len(init)
+                )
+                amplitude_init = float(stack.sum(dim=(1, 2)).mean()) * sampling**2 / max(n, 1)
+            if isinstance(init, (str, os.PathLike)):
+                obj = ObjectGaussianSplat.from_xyz(
+                    str(init), amplitude_init, sigma_init, fov_A=fov, num_tilts=dset.num_tilts
+                )
+            else:
+                obj = ObjectGaussianSplat.from_positions(
+                    init, amplitude_init, sigma_init, fov_A=fov, num_tilts=dset.num_tilts
+                )
+        logger = None
+        if log_dir is not None:
+            logger = LoggerTomographySplat(
+                log_dir=str(log_dir), run_prefix="splat", log_images_every=log_images_every
+            )
+        return cls.from_models(dset=dset, obj_model=obj, logger=logger, device=device, rng=rng)
+
+    def reconstruct(  # type: ignore[override]
+        self,
+        num_iter: int = 100,
+        position_lr: float = 2e-2,
+        amplitude_lr: float = 1e-2,
+        sigma_lr: float = 5e-3,
+        background_lr: float = 1e-2,
+        pose_lr: float = 5e-2,
+        learn_pose: bool = True,
+        batch_size: int | None = None,
+        scheduler_type: Literal["none", "cosine_annealing", "exponential"] = "none",
+        scheduler_params: dict = {},
+        **kwargs,
+    ) -> Self:
+        if not self.obj_model.has_optimizer():
+            lrs = {
+                "positions": position_lr,
+                "amplitudes": amplitude_lr,
+                "sigmas": sigma_lr,
+                "background": background_lr,
+            }
+            obj = {
+                k: OptimizerParams.Adam(lr=lrs[k])
+                for k in self.obj_model.get_optimization_parameters()
+            }
+            kwargs["optimizer_params"] = {"object": obj, "pose": OptimizerParams.Adam(lr=pose_lr)}
+            if scheduler_type != "none":
+                sp = {"name": scheduler_type, **scheduler_params}
+                kwargs["scheduler_params"] = {"object": sp, "pose": sp}
+        return super().reconstruct(
+            num_iter=num_iter, batch_size=batch_size, learn_pose=learn_pose, **kwargs
+        )

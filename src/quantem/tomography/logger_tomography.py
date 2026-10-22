@@ -89,3 +89,94 @@ class LoggerTomography(LoggerBase):
         ax.set_ylabel("Pixel")
         self.log_figure("shifts", fig, iter)
         plt.close(fig)
+
+
+class LoggerTomographySplat(LoggerTomography):
+    """
+    Logger for Gaussian-splat reconstructions: scalar histories per group, atom statistics,
+    prior diagnostics, measured / rendered / residual panels and the pose plots of the parent.
+    """
+
+    def log_iter_splat(
+        self, recon, iter: int, total_loss: float, data_loss: float, soft_loss: float
+    ):
+        obj = recon.obj_model
+        self.log_scalar("loss/total", total_loss, iter)
+        self.log_scalar("loss/data", data_loss, iter)
+        self.log_scalar("loss/soft", soft_loss, iter)
+        for name, val in obj.soft_constraint_loss.items():
+            self.log_scalar(f"loss/soft_{name}", float(val), iter)
+        self.log_scalar("atoms/count", obj.num_atoms, iter)
+        with torch.no_grad():
+            amp = obj.amplitudes.detach().cpu().numpy()
+            sig = obj.sigmas.detach().cpu().numpy()
+        self.log_scalar("atoms/amplitude_median", float(np.median(amp)), iter)
+        self.log_scalar(
+            "atoms/amplitude_spread", float(np.std(amp) / max(np.mean(amp), 1e-30)), iter
+        )
+        self.log_scalar("atoms/sigma_median", float(np.median(sig)), iter)
+        if obj.optimizer is not None:
+            for key, group in zip(
+                obj.get_optimization_parameters().keys(), obj.optimizer.param_groups
+            ):
+                self.log_scalar(f"learning_rate/{key}", float(group["lr"]), iter)
+        if recon.dset.optimizer is not None:
+            self.log_scalar(
+                "learning_rate/pose", float(recon.dset.optimizer.param_groups[0]["lr"]), iter
+            )
+        if recon.prior_history and recon.prior_history[-1]["iteration"] == iter:
+            for k, v in recon.prior_history[-1].items():
+                if k != "iteration":
+                    self.log_scalar(f"prior/{k}", float(v), iter)
+
+    def log_iter_images_splat(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        dataset_model,
+        obj_model,
+        iter: int,
+        logger_cmap: str = "magma",
+    ):
+        tilts = dataset_model.tilt_angles.detach().cpu().numpy()
+        sel = {
+            "min": int(np.argmin(tilts)),
+            "ref": int(dataset_model.reference_tilt_idx),
+            "max": int(np.argmax(tilts)),
+        }
+        pred_np, target_np = pred.cpu().numpy(), target.cpu().numpy()
+        for tag, k in sel.items():
+            fig, axs = plt.subplots(1, 3, figsize=(10, 3.4))
+            vmin, vmax = (
+                float(min(target_np[k].min(), pred_np[k].min())),
+                float(max(target_np[k].max(), pred_np[k].max())),
+            )
+            for ax, img, title in zip(axs, (target_np[k], pred_np[k]), ("measured", "rendered")):
+                im = ax.imshow(img, cmap=logger_cmap, vmin=vmin, vmax=vmax)
+                ax.set_title(f"{title} tilt {tilts[k]:+.0f}")
+                ax.axis("off")
+            fig.colorbar(im, ax=axs[:2], shrink=0.8)
+            res = target_np[k] - pred_np[k]
+            im = axs[2].imshow(res, cmap=logger_cmap)
+            axs[2].set_title("residual")
+            axs[2].axis("off")
+            fig.colorbar(im, ax=axs[2], shrink=0.8)
+            self.log_figure(f"projections/{tag}", fig, iter)
+            plt.close(fig)
+        self.log_histogram("atoms/amplitudes", obj_model.amplitudes.detach().cpu(), iter)
+        self.log_histogram("atoms/sigmas", obj_model.sigmas.detach().cpu(), iter)
+        self.log_iter_images(
+            pred_volume=obj_model.obj_view,
+            dataset_model=dataset_model,
+            iter=iter,
+            logger_cmap=logger_cmap,
+        )
+        if getattr(dataset_model, "learn_tilt_offset", False):
+            fig, ax = plt.subplots()
+            ax.plot(dataset_model.dtilt_params.detach().cpu().numpy(), label="dtilt")
+            ax.legend()
+            ax.set_title("Tilt-angle offsets")
+            ax.set_xlabel("Tilt image")
+            ax.set_ylabel("Degree")
+            self.log_figure("dtilt", fig, iter)
+            plt.close(fig)
