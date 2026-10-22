@@ -111,6 +111,36 @@ class PtychoTomoObjConstraintParams:
             density), a given weight bites far harder than ``tv_weight`` and is cheap (no model
             forward). Smooths the tensor-decomposition representation itself — the natural place
             to suppress rotation-induced high-frequency aliasing in the tilted K-Planes object.
+        sparsity_plane_weight : float, default ``0.0``
+            Soft (**K-Planes backend only**; ignored by the voxel backend). L1 sparsity applied
+            **directly on the K-Planes feature planes** rather than on the sampled output
+            density: ``mean(|plane|)`` of every feature plane, reduced across planes, rotations
+            and multiscale levels exactly as ``tv_plane_weight``. A plane element near zero
+            silences every density value that reads it, so this favours compact support in the
+            factor planes. The decoder weights are not penalized, so part of the pull can be
+            absorbed by a rescaling of planes against the decoder.
+        tv_l1_weight : float, default ``0.0``
+            Soft. **Isotropic L1** 3D total variation at sampled coordinates:
+            ``weight * mean(sqrt(dz^2 + dy^2 + dx^2 + eps^2) - eps)`` with forward differences
+            over ``tv_l1_step`` voxels on each axis. Unlike ``tv_weight`` (squared differences,
+            which blurs edges) it favours piecewise-flat density with sharp boundaries.
+            Independent of ``tv_weight``; both can be on.
+        tv_l1_step : float, default ``1.0``
+            Step of the ``tv_l1_weight`` differences, in voxels of ``volume_shape`` (same
+            physical length on every axis). A step above 1 makes the penalty act on coarser
+            structure (e.g. particle boundaries) more than on fine (lattice) contrast.
+        sparsity_log_weight : float, default ``0.0``
+            Soft. Log sparsity at sampled coordinates:
+            ``weight * mean(log(1 + |value| / sparsity_log_eps))``. Unlike the L1 ``sparsity_weight``
+            (the same pull on every voxel, so everything shrinks together), its pull
+            ``weight / (eps + |value|)`` is strong on faint density (below ``eps``) and weak on
+            strong density: it removes a faint haze while keeping the bright objects.
+        sparsity_log_eps : float, default ``1e-3``
+            The density scale (same units as the volume) separating "faint" from "strong" for
+            ``sparsity_log_weight``.
+        tv_l1_axes : str, default ``"zyx"``
+            Axes included in ``tv_l1_weight`` (any of ``z``, ``y``, ``x``). ``"z"`` penalizes
+            only changes along the specimen z (beam at 0°), leaving the lateral contrast free.
         positivity : bool, default ``True``
             Hard (voxel backend only). Clamp the density >= 0 after every optimizer step
             (``potential`` only) — suppresses the phase-winding instability; mirrors the
@@ -134,6 +164,12 @@ class PtychoTomoObjConstraintParams:
         positivity_weight: float = 0.0
         sparsity_weight: float = 0.0
         tv_plane_weight: float = 0.0
+        sparsity_plane_weight: float = 0.0
+        tv_l1_weight: float = 0.0
+        tv_l1_step: float = 1.0
+        tv_l1_axes: str = "zyx"
+        sparsity_log_weight: float = 0.0
+        sparsity_log_eps: float = 1e-3
         positivity: bool = True
         shrink_quantile: float | None = None
         fix_potential_baseline: bool = False
@@ -151,9 +187,15 @@ class PtychoTomoObjConstraintParams:
             "positivity_weight",
             "sparsity_weight",
             "tv_plane_weight",
+            "sparsity_plane_weight",
+            "tv_l1_weight",
+            "sparsity_log_weight",
         ]
         hard_constraint_keys = [
             "positivity",
+            "tv_l1_step",  # step of the tv_l1_weight differences (not a loss weight)
+            "tv_l1_axes",  # axes of the tv_l1_weight differences (not a loss weight)
+            "sparsity_log_eps",  # density scale of sparsity_log_weight (not a loss weight)
             "shrink_quantile",
             "fix_potential_baseline",
             "fix_potential_baseline_factor",
@@ -963,7 +1005,8 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         the lateral axes, matching the tomography module's ``tv_vol``. Evaluated at randomly
         sampled coordinates so the penalty is differentiable without materializing the volume.
         ``tv_plane_weight`` additionally applies TV directly on the K-Planes feature planes (a
-        no-op on the voxel backend); see :meth:`_plane_tv_loss`.
+        no-op on the voxel backend); see :meth:`_plane_tv_loss`. ``sparsity_plane_weight`` does
+        the same for an L1 penalty on the planes; see :meth:`_plane_l1_loss`.
         """
         self.reset_soft_constraint_losses()
         loss = self._get_zero_loss_tensor()
@@ -973,6 +1016,22 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             tv_loss = self._sampled_tv3d_loss(w_tv, num_samples=n_samp)
             loss = loss + tv_loss
             self.add_soft_constraint_loss("tv_loss", tv_loss)
+        # getattr: constraint sets saved before these fields existed load without them
+        w_tv_l1 = float(getattr(self.constraints, "tv_l1_weight", 0.0))
+        if w_tv_l1 > 0:
+            step = float(getattr(self.constraints, "tv_l1_step", 1.0))
+            axes = str(getattr(self.constraints, "tv_l1_axes", "zyx"))
+            tv_l1_loss = self._sampled_tv3d_l1_loss(
+                w_tv_l1, step=step, axes=axes, num_samples=n_samp
+            )
+            loss = loss + tv_l1_loss
+            self.add_soft_constraint_loss("tv_l1_loss", tv_l1_loss)
+        w_log = float(getattr(self.constraints, "sparsity_log_weight", 0.0))
+        if w_log > 0:
+            eps = float(getattr(self.constraints, "sparsity_log_eps", 1e-3))
+            log_loss = self._sampled_log_sparsity_loss(w_log, eps, num_samples=n_samp)
+            loss = loss + log_loss
+            self.add_soft_constraint_loss("sparsity_log_loss", log_loss)
         w_plane = self.constraints.tv_plane_weight
         if w_plane > 0:
             plane_loss = self._plane_tv_loss(w_plane)
@@ -988,6 +1047,12 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             l1_loss = self._sampled_l1_loss(w_l1, num_samples=n_samp)
             loss = loss + l1_loss
             self.add_soft_constraint_loss("sparsity_loss", l1_loss)
+        # getattr: constraint sets saved before this field existed load without it
+        w_plane_l1 = float(getattr(self.constraints, "sparsity_plane_weight", 0.0))
+        if w_plane_l1 > 0:
+            plane_l1_loss = self._plane_l1_loss(w_plane_l1)
+            loss = loss + plane_l1_loss
+            self.add_soft_constraint_loss("sparsity_plane_loss", plane_l1_loss)
         self.accumulate_constraint_losses()
         return loss
 
@@ -1011,6 +1076,14 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         coords = self._sample_volume_coords(num_samples)
         value = self._model(self._to_backend_coords(coords)).squeeze(-1)
         return weight * value.abs().mean()
+
+    def _sampled_log_sparsity_loss(
+        self, weight: float, eps: float, num_samples: int = 4096
+    ) -> torch.Tensor:
+        """Log sparsity: ``weight * mean(log(1 + |density| / eps))`` at sampled coordinates."""
+        coords = self._sample_volume_coords(num_samples)
+        value = self._model(self._to_backend_coords(coords)).squeeze(-1)
+        return weight * torch.log1p(value.abs() / eps).mean()
 
     def _sampled_tv3d_loss(self, weight: float, num_samples: int = 4096) -> torch.Tensor:
         """Isotropic **L2 (squared-difference)** TV at sampled coordinates (same weight on z, xy).
@@ -1036,12 +1109,46 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
             loss = loss + weight * torch.mean((shifted - value) ** 2)
         return loss
 
+    def _sampled_tv3d_l1_loss(
+        self,
+        weight: float,
+        step: float = 1.0,
+        axes: str = "zyx",
+        num_samples: int = 4096,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Isotropic **L1** TV at sampled coordinates: ``mean(sqrt(sum_axis d^2 + eps^2) - eps)``.
+
+        ``d`` is the forward difference over ``step`` voxels of ``volume_shape`` on each axis
+        (cubic voxels, so the same physical length on z and xy). ``eps`` (in density units)
+        only keeps the gradient finite where all three differences vanish. ``axes`` limits the
+        sum to some of ``z``, ``y``, ``x``.
+        """
+        use = [a for a, name in enumerate("zyx") if name in axes.lower()]
+        if not use:
+            raise ValueError(f"tv_l1_axes must name at least one of z, y, x; got {axes!r}")
+        real_dtype = getattr(torch, config.get("dtype_real"))
+        coords = self._sample_volume_coords(num_samples)
+        value = self._model(self._to_backend_coords(coords)).squeeze(-1)
+        sq = torch.zeros_like(value)
+        for axis in use:
+            h = 2.0 * step / max(int(self.volume_shape[axis]), 2)
+            offset = torch.zeros(3, device=self.device, dtype=real_dtype)
+            offset[axis] = h
+            shifted = self._model(self._to_backend_coords(coords + offset)).squeeze(-1)
+            sq = sq + (shifted - value) ** 2
+        return weight * (torch.sqrt(sq + eps**2) - eps).mean()
+
     def _plane_tv_loss(self, weight: float) -> torch.Tensor:
         """Plane-TV hook. Only the K-Planes backend implements it (voxel returns zero).
 
         The dense voxel grid has no factor planes, so plane-TV is meaningless there and this base
         returns zero; :class:`ObjectKPlanesTomo` overrides it with the real penalty on the grids.
         """
+        return self._get_zero_loss_tensor()
+
+    def _plane_l1_loss(self, weight: float) -> torch.Tensor:
+        """Plane-L1 hook. Only the K-Planes backend implements it (voxel returns zero)."""
         return self._get_zero_loss_tensor()
 
     # endregion --- constraints ---
@@ -1239,11 +1346,6 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         straight into the ``grids`` parameters, so it is a much stronger and cheaper smoothness
         prior than the coordinate-sampled 3D TV on the sub-1e-3 output density.
         """
-        model = self.model
-        grids = getattr(model, "grids", None)
-        if grids is None or len(grids) == 0:
-            return self._get_zero_loss_tensor()
-        is_tilted = bool(getattr(model, "tilted", False))
 
         def per_plane_tv(p: torch.Tensor) -> torch.Tensor:
             """Squared adjacent differences of one plane tensor, one number per leading index."""
@@ -1253,6 +1355,39 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
                 return dh + dw
             # (3*T, C, L) CP line factors
             return (p[..., 1:] - p[..., :-1]).pow(2).mean(dim=tuple(range(1, p.ndim)))
+
+        return weight * self._reduce_plane_penalty(per_plane_tv)
+
+    def _plane_l1_loss(self, weight: float) -> torch.Tensor:
+        """L1 sparsity on the K-Planes **feature planes** themselves (dense, cheap).
+
+        ``mean(|plane|)`` over channels and plane elements of every feature plane (or CP line
+        factor), reduced across planes, rotations and multiscale levels exactly as
+        :meth:`_plane_tv_loss`. Backprops straight into the ``grids`` parameters.
+        """
+
+        def per_plane_l1(p: torch.Tensor) -> torch.Tensor:
+            """Mean absolute value of one plane tensor, one number per leading index."""
+            return p.abs().mean(dim=tuple(range(1, p.ndim)))
+
+        return weight * self._reduce_plane_penalty(per_plane_l1)
+
+    def _reduce_plane_penalty(
+        self, per_plane: Callable[[torch.Tensor], torch.Tensor]
+    ) -> torch.Tensor:
+        """Reduce a per-plane penalty over planes, rotations and multiscale levels.
+
+        ``per_plane`` maps one plane tensor to one number per leading index. For the tilted
+        backend the ``3`` planes of each of the ``T`` rotations are summed and then averaged over
+        rotations, matching the tomography module's ``_get_plane_tv_loss``; with per-axis planes
+        the three plane types of a level sit in three separate ``(T, C, H, W)`` tensors and are
+        summed across those instead. The per-level values are summed. Zero without grids.
+        """
+        model = self.model
+        grids = getattr(model, "grids", None)
+        if grids is None or len(grids) == 0:
+            return self._get_zero_loss_tensor()
+        is_tilted = bool(getattr(model, "tilted", False))
 
         # One entry per multiscale level: a single stacked tensor, or a triple of per-plane-type
         # tensors when the tilted model was built with per-axis planes.
@@ -1264,7 +1399,7 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
         per_level = []
         for level in levels:
             planes = list(level) if isinstance(level, tuple) else [level]
-            parts = [per_plane_tv(p) for p in planes]
+            parts = [per_plane(p) for p in planes]
             if is_tilted:
                 if len(parts) == 3:
                     # per-axis planes: one (T,) vector per plane type -> (T, 3)
@@ -1273,11 +1408,11 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
                     # stacked planes: (3*T,) ordered rotation-major -> (T, 3)
                     per_rotation = parts[0].view(cast(int, model.T), 3)
                 # sum the 3 planes of each rotation, then average across the T rotations
-                level_tv = per_rotation.sum(dim=1).mean()
+                level_value = per_rotation.sum(dim=1).mean()
             else:
-                level_tv = parts[0].sum()
-            per_level.append(level_tv)
-        return weight * torch.stack(per_level).sum()
+                level_value = parts[0].sum()
+            per_level.append(level_value)
+        return torch.stack(per_level).sum()
 
     @classmethod
     def from_model(

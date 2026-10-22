@@ -405,6 +405,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         if reset:
             self.reset_recon()
+            if _dist_world_size > 1 and dist.is_available() and dist.is_initialized():
+                # reset_recon() reloads each rank's OWN initial weights (the models are built
+                # per rank, so random inits differ), which undoes the rank-0 broadcast done by
+                # the launch path; without this the ranks train different objects (averaged
+                # gradients, different parameters) until the next reconstruct() call.
+                self._broadcast_parameters(src=0)
         if constraints:
             self.constraints = constraints
 

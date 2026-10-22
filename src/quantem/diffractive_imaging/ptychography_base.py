@@ -68,6 +68,13 @@ class Snapshot(TypedDict):
     iteration: int
 
 
+def _is_dense(t: torch.Tensor) -> bool:
+    """Contiguous in the default or (4-D) channels-last layout."""
+    return t.is_contiguous() or (
+        t.dim() == 4 and t.is_contiguous(memory_format=torch.channels_last)
+    )
+
+
 class PtychographyBase(RNGMixin, AutoSerialize):
     """
     A base class for performing phase retrieval using the Ptychography algorithm.
@@ -950,7 +957,10 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         ]
         if params:
             for p in params:
-                if p.grad is not None and not p.grad.is_contiguous():
+                # NCCL needs a dense tensor; channels-last (e.g. the K-Planes feature planes)
+                # is dense, so only other layouts are copied (a copy would also leave the grad
+                # with strides that differ from its parameter's)
+                if p.grad is not None and not _is_dense(p.grad):
                     p.grad = p.grad.contiguous()
             all_reduce_params(*params)
 

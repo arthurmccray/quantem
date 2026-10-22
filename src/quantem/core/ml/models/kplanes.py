@@ -506,16 +506,19 @@ class KPlanesTILTED(KPlanes):
         # instead, one per plane type, so each plane type gets the resolutions of its own two axes.
         # They stay in one flat ParameterList (level ``l``, plane type ``p`` at index ``3*l + p``)
         # so the state_dict keys remain ``grids.<index>``.
+        # The planes are stored channels-last ((T, H, W, C) in memory, still (T, C, H, W) in
+        # shape): the fused CUDA kernels (quantem-cuda ``kplanes_tilted_fuse*``) read and write
+        # that layout, so their per-call layout conversion becomes a view instead of a full copy
+        # of every plane in every forward and backward call. grid_sample accepts either layout.
         self.grids = nn.ParameterList()
         for res_mult in multiscale_res_multipliers:
             scaled_res = [int(r * res_mult) for r in resolution]
             if self._per_axis_planes:
-                for shape in per_axis_plane_shapes(T, M_features, scaled_res):
-                    plane = nn.Parameter(torch.empty(*shape))
-                    nn.init.uniform_(plane, 0.1, 0.5)
-                    self.grids.append(plane)
+                shapes = per_axis_plane_shapes(T, M_features, scaled_res)
             else:
-                plane = nn.Parameter(torch.empty(3 * T, M_features, scaled_res[1], scaled_res[0]))
+                shapes = [(3 * T, M_features, scaled_res[1], scaled_res[0])]
+            for shape in shapes:
+                plane = nn.Parameter(torch.empty(*shape, memory_format=torch.channels_last))
                 nn.init.uniform_(plane, 0.1, 0.5)
                 self.grids.append(plane)
 

@@ -12,6 +12,18 @@ else:
         import torch
 
 
+def _fused_ok(param_groups: list[dict[str, Any]]) -> bool | None:
+    """``True`` (torch's single-kernel fused Adam/AdamW step) when every parameter is a real
+    floating-point CUDA tensor, else ``None`` (torch's default, foreach). The fused step is
+    faster than foreach on large tensors and gives the same update up to fp32 rounding; complex
+    parameters (pixelated probes / objects) are not supported by it."""
+    params = [p for g in param_groups for p in g["params"]]
+    ok = bool(params) and all(
+        p.is_cuda and p.dtype in (torch.float16, torch.bfloat16, torch.float32) for p in params
+    )
+    return True if ok else None
+
+
 class OptimizerParams:
     """
     Container for optimizer parameter dataclasses.
@@ -674,9 +686,9 @@ class OptimizerMixin:
         """
         match opt_params:
             case OptimizerParams.Adam():
-                return torch.optim.Adam(param_groups)
+                return torch.optim.Adam(param_groups, fused=_fused_ok(param_groups))
             case OptimizerParams.AdamW():
-                return torch.optim.AdamW(param_groups)
+                return torch.optim.AdamW(param_groups, fused=_fused_ok(param_groups))
             case OptimizerParams.SGD():
                 return torch.optim.SGD(param_groups)
             case OptimizerParams.NoneOptimizer():

@@ -34,22 +34,66 @@ def find_free_port() -> str:
         return str(s.getsockname()[1])
 
 
+_NERSC_NCCL_ROOT = "/global/common/software/nersc9/nccl"
+
+
+def find_nccl_ofi_plugin() -> str | None:
+    """Path of an AWS-OFI (libfabric) NCCL net plugin for Slingshot, or None.
+
+    ``$QUANTEM_NCCL_NET_PLUGIN`` (a ``libnccl-net.so`` path) wins. Otherwise, on NERSC systems,
+    the plugin of the newest ``nccl/<version>-cu<major>`` module whose CUDA major matches torch's
+    (``/global/common/software/nersc9/nccl/*-cu13/plugin/lib/libnccl-net.so`` for cu13). torch's
+    own bundled NCCL loads it by absolute path; no module or ``LD_LIBRARY_PATH`` change is needed.
+    """
+    env = os.environ.get("QUANTEM_NCCL_NET_PLUGIN")
+    if env:
+        return env if os.path.isfile(env) else None
+    cuda = torch.version.cuda
+    if not cuda or not os.path.isdir(_NERSC_NCCL_ROOT):
+        return None
+    suffix = f"-cu{cuda.split('.')[0]}"
+    found = []
+    for name in os.listdir(_NERSC_NCCL_ROOT):
+        lib = os.path.join(_NERSC_NCCL_ROOT, name, "plugin", "lib", "libnccl-net.so")
+        if name.endswith(suffix) and os.path.isfile(lib):
+            version = tuple(int(v) for v in name[: -len(suffix)].split(".") if v.isdigit())
+            found.append((version, lib))
+    return max(found)[1] if found else None
+
+
 def maybe_configure_fabric_env() -> None:
     """Set the NCCL/libfabric env for the HPE Slingshot (``hsn``) fabric, if present.
 
-    Perlmutter (and other Slingshot-11 systems) need ``NCCL_SOCKET_IFNAME=hsn`` plus
-    ``FI_CXI_ATS=0`` / ``NCCL_CROSS_NIC=1`` for NCCL to bring up its communicators cleanly;
-    without them multi-GPU init can hang or emit fatal socket errors. Gated on the presence
-    of an ``hsn0`` interface and on each var being unset, so this is a no-op on non-Slingshot
-    systems (e.g. a local GPU workstation) and never overrides an explicit user setting.
+    Without a libfabric net plugin NCCL talks across nodes over TCP sockets on ``hsn``, which on
+    Perlmutter is ~13x slower for large all-reduces (2.45 s vs 0.18 s for a 6.9 GB gradient over
+    16 GPUs). So when :func:`find_nccl_ofi_plugin` finds the AWS-OFI plugin, NCCL is pointed at it
+    with the settings of NERSC's ``nccl`` module (``NCCL_NET_PLUGIN``, ``NCCL_NET``,
+    ``NCCL_CROSS_NIC=2``, ``NCCL_NET_GDR_LEVEL=PHB``, ``FI_CXI_DISABLE_HOST_REGISTER=1``,
+    ``FI_CXI_RDZV_THRESHOLD=0``). Otherwise (or with ``QUANTEM_NCCL_OFI=0``) it falls back to
+    sockets with ``NCCL_SOCKET_IFNAME=hsn`` plus ``FI_CXI_ATS=0`` / ``NCCL_CROSS_NIC=1``, which
+    NCCL needs to bring up its communicators cleanly. Gated on the presence of an ``hsn0``
+    interface and on each var being unset, so this is a no-op on non-Slingshot systems and never
+    overrides an explicit user setting (an explicit ``NCCL_NET`` / ``NCCL_NET_PLUGIN`` skips the
+    plugin lookup). Must run before the process group is created.
     """
     if not os.path.isdir("/sys/class/net/hsn0"):
         return
-    defaults = {
-        "NCCL_SOCKET_IFNAME": "hsn",
-        "FI_CXI_ATS": "0",
-        "NCCL_CROSS_NIC": "1",
-    }
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "hsn")
+    plugin = None
+    user_net = "NCCL_NET" in os.environ or "NCCL_NET_PLUGIN" in os.environ
+    if os.environ.get("QUANTEM_NCCL_OFI", "1") != "0" and not user_net:
+        plugin = find_nccl_ofi_plugin()
+    if plugin is not None:
+        defaults = {
+            "NCCL_NET_PLUGIN": plugin,
+            "NCCL_NET": "AWS Libfabric",
+            "NCCL_CROSS_NIC": "2",
+            "NCCL_NET_GDR_LEVEL": "PHB",
+            "FI_CXI_DISABLE_HOST_REGISTER": "1",
+            "FI_CXI_RDZV_THRESHOLD": "0",
+        }
+    else:
+        defaults = {"FI_CXI_ATS": "0", "NCCL_CROSS_NIC": "1"}
     for key, value in defaults.items():
         os.environ.setdefault(key, value)
 
