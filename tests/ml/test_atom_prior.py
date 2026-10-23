@@ -30,7 +30,9 @@ def test_zero_velocity_returns_input_and_constant_velocity_adds_step():
         device="cpu",
     )
     out = const.clean_estimate(pos, t=0.7, noise_scale=0.0)
-    assert torch.allclose(out, pos + 0.3 * 0.5)
+    assert torch.allclose(out, pos, atol=1e-5)  # a pure translation is rigid: removed
+    out_raw = const.clean_estimate(pos, t=0.7, noise_scale=0.0, remove_rigid=False)
+    assert torch.allclose(out_raw, pos + 0.3 * 0.5)
     assert const.t_of_sigma(0.3) == pytest.approx(0.8) and const.sigma_of_t(0.8) == pytest.approx(
         0.3
     )
@@ -57,3 +59,21 @@ def test_graph_is_free_space_and_velocity_sees_neighbours():
         pos, t=0.5, noise_scale=0.0, n_rot=3, generator=torch.Generator().manual_seed(0)
     )
     assert torch.allclose(x_hat, pos + 0.5 * v, atol=1e-4)
+
+
+def test_remove_rigid_motion_keeps_only_non_rigid_part():
+    from quantem.core.ml.splat.atom_prior import remove_rigid_motion
+
+    g = torch.arange(3, dtype=torch.float64) * 2.88
+    x = torch.stack(torch.meshgrid(g, g, g, indexing="ij"), -1).reshape(-1, 3)  # 27 atoms
+    a = torch.tensor(0.3)
+    R = torch.tensor(
+        [[torch.cos(a), -torch.sin(a), 0.0], [torch.sin(a), torch.cos(a), 0.0], [0.0, 0.0, 1.0]],
+        dtype=x.dtype,
+    )
+    rigid = x @ R.T + torch.tensor([0.5, -0.2, 0.1], dtype=x.dtype)
+    assert torch.allclose(remove_rigid_motion(x, rigid), x, atol=1e-6)
+    bend = rigid.clone()
+    bend[0] += torch.tensor([0.0, 0.0, 0.4], dtype=x.dtype)  # one non-rigid displacement survives
+    out = remove_rigid_motion(x, bend)
+    assert float((out - x).norm(dim=-1).max()) > 0.3  # ~0.4 (1 - 1/N) survives the rigid fit

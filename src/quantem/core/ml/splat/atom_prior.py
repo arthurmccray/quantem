@@ -28,7 +28,7 @@ else:
     if config.get("has_torch"):
         import torch
 
-__all__ = ["AtomPrior"]
+__all__ = ["AtomPrior", "remove_rigid_motion"]
 
 _INSTALL_HINT = (
     "the learned atomic prior needs tricor (editable from ~/atomode-spec-v1), graphite, "
@@ -204,13 +204,16 @@ class AtomPrior:
         n_rot: int = 1,
         numbers: "torch.Tensor | None" = None,
         generator: "torch.Generator | None" = None,
+        remove_rigid: bool = True,
     ) -> "torch.Tensor":
         """Clean-structure estimate ``x_hat`` for the current positions.
 
         ``x_t = x + noise_scale * (1 - t) * sigma_max * eps`` (the training corruption; ``noise_scale=0``
         treats ``x`` itself as the noisy state), ``x_hat = x_t + (1 - t) * v_hat``, averaged over
         ``n_draws`` noise draws and ``n_rot`` random rotations (test-time augmentation for the
-        non-equivariant network). Returned in the input frame and dtype.
+        non-equivariant network). With ``remove_rigid`` (default) the rigid-body part of
+        ``x_hat - x`` (best-fit rotation + translation, Kabsch) is removed, so the prior never asks
+        for a global motion of the structure (poses own that); returned in the input frame and dtype.
         """
         t = self.t_of_sigma(sigma) if sigma is not None else self._clamp_t(t)
         x = positions_A.detach().to(self.device, torch.float32)
@@ -224,7 +227,10 @@ class AtomPrior:
                 v = self.velocity(x_t, t, numbers=numbers, rotation=rot)
                 acc += x_t + (1.0 - t) * v
                 count += 1
-        return (acc / count).to(positions_A.dtype).to(positions_A.device)
+        x_hat = acc / count
+        if remove_rigid and x.shape[0] >= 3:
+            x_hat = remove_rigid_motion(x, x_hat)
+        return x_hat.to(positions_A.dtype).to(positions_A.device)
 
     @torch.no_grad()
     def velocity_rmsd(
@@ -251,6 +257,25 @@ class AtomPrior:
         return out
 
     # endregion
+
+
+def remove_rigid_motion(x: "torch.Tensor", x_hat: "torch.Tensor") -> "torch.Tensor":
+    """Return ``x_hat`` with its best-fit rigid transform relative to ``x`` removed.
+
+    Kabsch: fit ``R, t`` minimising ``|R x + t - x_hat|``; return ``x_hat - (R x + t) + x``, i.e.
+    only the non-rigid part of the displacement field survives (det R = +1 enforced).
+    """
+    xc = x.mean(dim=0, keepdim=True)
+    yc = x_hat.mean(dim=0, keepdim=True)
+    p = (x - xc).double()
+    q = (x_hat - yc).double()
+    h = p.T @ q
+    u, _, vt = torch.linalg.svd(h)
+    d = torch.sign(torch.det(vt.T @ u.T))
+    dmat = torch.diag(torch.tensor([1.0, 1.0, float(d)], dtype=h.dtype, device=h.device))
+    r = vt.T @ dmat @ u.T
+    rigid = (p @ r.T).to(x_hat.dtype) + yc
+    return x_hat - rigid + x
 
 
 def _find_config(ckpt: Path) -> Path | None:
