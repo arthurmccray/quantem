@@ -1160,7 +1160,9 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
     ) -> "ObjectGaussianSplat":
         """Build from explicit positions (Angstrom, specimen frame) and shared or per-atom
         amplitude / sigma. ``fov_A`` is the (x, y, z) extent of the reconstruction box."""
-        pos = torch.as_tensor(np.asarray(positions), dtype=dtype).reshape(-1, 3)
+        pos = torch.as_tensor(np.array(positions, copy=True), dtype=dtype).reshape(
+            -1, 3
+        )  # never alias the caller
         n = pos.shape[0]
         amp = torch.as_tensor(np.asarray(amplitude), dtype=dtype).reshape(-1).expand(n).clone()
         sig = torch.as_tensor(np.asarray(sigma), dtype=dtype).reshape(-1).expand(n).clone()
@@ -1505,8 +1507,12 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
         return torch.zeros((), device=self.device, dtype=self.dtype)
 
-    def set_prior_target(self, target: torch.Tensor, lam: float) -> None:
-        """Store a detached clean-position estimate ``x_hat`` and its weight."""
+    def set_prior_target(self, target: torch.Tensor | None, lam: float) -> None:
+        """Store a detached clean-position estimate ``x_hat`` and its weight (``None`` clears it)."""
+        if target is None:
+            self._prior_target = None
+            self._prior_lambda = 0.0
+            return
         if target.shape != self._positions.shape:
             raise ValueError(
                 f"prior target shape {tuple(target.shape)} != {tuple(self._positions.shape)}"

@@ -8,6 +8,7 @@ adds the object and dataset soft constraints (including the prior term
 runs on one device (CPU or a single GPU).
 """
 
+import math
 from dataclasses import dataclass
 from typing import Callable, Literal, Protocol, Self
 
@@ -83,7 +84,7 @@ class PriorSchedule:
     lam : ScheduleValue
         Prior weight. With ``lam_mode="relative"`` it multiplies a scale fixed at the first
         application so that ``||grad L_prior|| = lam * ||grad L_data||`` on the positions.
-    lam_mode : {"relative", "absolute"}
+    lam_mode : {"relative", "relative_live", "absolute"}
     anneal_frac : float
         Fraction of ``num_iter`` over which tuple schedules anneal (then held).
     """
@@ -93,8 +94,16 @@ class PriorSchedule:
     t: ScheduleValue | None = 0.5
     sigma: ScheduleValue | None = None
     lam: ScheduleValue = 0.3
-    lam_mode: Literal["relative", "absolute"] = "relative"
+    lam_mode: Literal["relative", "relative_live", "absolute"] = "relative"
     anneal_frac: float = 0.6
+    stop: int = (
+        10**9
+    )  # no prior from this iteration on (data-only fine-tune, "three-stage" schedules)
+    mode: Literal["loss", "proximal"] = (
+        "loss"  # "proximal": move the atoms a fraction ``alpha`` of the
+    )
+    # way to x̂ at every refresh (plug-and-play / RED style) instead of adding a loss term; ``lam`` unused
+    alpha: float = 0.3
 
     def at(
         self, it: int, num_iter: int, prior: AtomPrior | None = None
@@ -126,6 +135,22 @@ class DensifyParams:
     add_blur_sigmas: tuple[float, float] = (1.0, 2.0)  # voxels
     max_add: int | None = None
     voxel_size: float | None = None  # Angstrom; default 2 * sampling
+    split_from_residual: bool = False  # split over-bright atoms toward rejected residual peaks
+    split_amplitude_frac: float = 1.5  # an atom is "fat" when A > frac * median(A)
+    split_min_offset: float = 0.7  # Angstrom; a residual peak closer than this is the same site
+    max_add_frac: float | None = (
+        None  # add at most this fraction of the current atom count per pass
+    )
+    prune_reference: Literal["median", "max_median"] = (
+        "median"  # "max_median": the running maximum
+    )
+    # of the median amplitude over passes, so a flood of weak spurious atoms cannot lower the bar
+    add_noise_region: Literal["support", "volume"] = "support"  # where the residual noise is
+    # measured: inside the particle (voxels where the back-projected model exceeds 10 % of its
+    # maximum, where shot noise is highest and where candidates compete with real atoms) or everywhere
+    add_noise_sigmas: float = 0.0  # also require a residual peak > this many robust sigmas of the
+    # residual's own filtered noise (MAD over the volume); 0 disables. Needed at low dose, where the
+    # single-atom-relative threshold alone admits shot-noise peaks.
 
 
 class TomographySplat(TomographyOpt, TomographyBase):
@@ -236,13 +261,17 @@ class TomographySplat(TomographyOpt, TomographyBase):
         from quantem.tomography.atom_trace import gaussian_blur3d, seed_peaks
 
         obj = self.obj_model
-        out = {"pruned": 0, "merged": 0, "added": 0}
+        out = {"pruned": 0, "merged": 0, "added": 0, "split": 0}
         if params.prune_amplitude_frac > 0 and obj.num_atoms > 1:
             amp = obj.amplitudes.detach()
+            ref = float(amp.median())
+            if params.prune_reference == "max_median":
+                ref = max(ref, float(getattr(self, "_prune_amp_ref", 0.0)))
+                self._prune_amp_ref = ref
             keep = prune_mask(
                 amp,
                 obj._positions.detach(),
-                float(params.prune_amplitude_frac * amp.median()),
+                float(params.prune_amplitude_frac * ref),
                 obj.box_half if params.prune_outside_box else None,
             )
             out["pruned"] = obj.prune(keep)
@@ -284,6 +313,26 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 if params.add_min_rel_peak > 0
                 else None
             )
+            if params.add_noise_sigmas > 0:
+                vc = vol.cpu()
+                resp = (
+                    gaussian_blur3d(vc, float(bs[0])) - gaussian_blur3d(vc, float(bs[1]))
+                    if isinstance(bs, (tuple, list))
+                    else gaussian_blur3d(vc, float(bs))
+                )
+                if params.add_noise_region == "support":
+                    bp_pred = backproject_images(
+                        pred.detach(), rot, shifts, sampling, vol_shape, v
+                    ).cpu()
+                    sel = resp[bp_pred > 0.1 * float(bp_pred.max())]
+                    if sel.numel() < 64:
+                        sel = resp.reshape(-1)
+                else:
+                    sel = resp.reshape(-1)
+                med = sel.median()
+                noise = 1.4826 * float((sel - med).abs().median())
+                self._last_add_noise = noise
+                thr = max(thr or 0.0, params.add_noise_sigmas * noise)
             peaks, _ = seed_peaks(
                 vol.cpu(),
                 blur_sigmas=params.add_blur_sigmas,
@@ -301,11 +350,64 @@ class TomographySplat(TomographyOpt, TomographyBase):
                     ),
                     dim=1,
                 ).float()
+                rejected = pos[:0]
+                rejected_nn = torch.zeros(0, dtype=torch.long)
                 if obj.num_atoms:
-                    d = torch.cdist(pos, obj._positions.detach().cpu()).min(dim=1).values
-                    pos = pos[d > params.add_min_distance]
-                out["added"] = obj.add_atoms(pos)
+                    d, nn = torch.cdist(pos, obj._positions.detach().cpu()).min(dim=1)
+                    accept = d > params.add_min_distance
+                    rejected, rejected_nn = pos[~accept], nn[~accept]
+                    pos = pos[accept]
+                if params.max_add_frac is not None and obj.num_atoms:
+                    cap = max(1, int(params.max_add_frac * obj.num_atoms))
+                    pos = pos[:cap]  # seed_peaks returns peaks strongest first
+                out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
+                if params.split_from_residual and rejected.shape[0]:
+                    out["split"] = self._split_fat_atoms(rejected, rejected_nn, params)
         return out
+
+    def _split_fat_atoms(
+        self, candidates: torch.Tensor, nearest: torch.Tensor, params: DensifyParams
+    ) -> int:
+        """Replace each over-bright atom that has a rejected residual peak nearby by two half-amplitude
+        atoms: at the peak and at its mirror image through the atom (or at the two nearest peaks when
+        there are two). This is the "two atoms collapsed onto one Gaussian between two sites" case,
+        which the add step cannot fix because both true sites lie within ``add_min_distance`` of the
+        fat atom. Returns the number of atoms split."""
+        obj = self.obj_model
+        amp = obj.amplitudes.detach().cpu()
+        pos = obj._positions.detach().cpu()
+        fat = amp > params.split_amplitude_frac * amp.median()
+        min_sep = float(params.merge_distance or 0.0)
+        new_pos, new_amp, drop = [], [], []
+        for i in torch.unique(nearest).tolist():
+            if not bool(fat[i]):
+                continue
+            c = candidates[nearest == i]
+            off = (c - pos[i]).norm(dim=1)
+            c = c[off >= params.split_min_offset]
+            if c.shape[0] == 0:
+                continue
+            order = torch.argsort((c - pos[i]).norm(dim=1))
+            q1 = c[order[0]]
+            q2 = c[order[1]] if c.shape[0] >= 2 else 2.0 * pos[i] - q1
+            if float((q1 - q2).norm()) < min_sep:
+                continue  # the merge step would undo it
+            new_pos += [q1, q2]
+            new_amp += [amp[i] / 2.0, amp[i] / 2.0]
+            drop.append(i)
+        if not drop:
+            return 0
+        keep = torch.ones(obj.num_atoms, dtype=torch.bool)
+        keep[drop] = False
+        keep_idx = torch.nonzero(keep).reshape(-1).to(obj.device)
+        sig = obj.sigmas.detach().median().reshape(1).expand(len(new_pos))
+        obj._rebuild(
+            keep_idx,
+            torch.stack(new_pos).to(obj._positions),
+            torch.stack(new_amp).to(obj._positions),
+            sig,
+        )
+        return len(drop)
 
     # endregion
 
@@ -331,6 +433,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
         store_snapshots_every: int | None = None,
         show_metrics: bool = False,
         schedule_total: int | None = None,
+        uniform_every: int = 0,
+        uniform_window: tuple[float, float] | None = None,
     ) -> Self:
         """
         Fit the atoms (and poses) to the tilt series.
@@ -461,15 +565,23 @@ class TomographySplat(TomographyOpt, TomographyBase):
             if (
                 prior is not None
                 and prior_schedule is not None
-                and it >= prior_schedule.start
+                and prior_schedule.start <= it < prior_schedule.stop
                 and ((it - prior_schedule.start) % max(1, prior_schedule.every) == 0)
             ):
                 t, lam_raw = prior_schedule.at(it, schedule_total or num_iter, prior)
                 x = self.obj_model._positions.detach()
                 x_hat = prior.clean_estimate(x, t=t).to(x)
                 pull = (x_hat - x).norm(dim=-1)
-                if prior_schedule.lam_mode == "relative":
-                    if self._lam_scale is None:
+                if prior_schedule.mode == "proximal":
+                    with torch.no_grad():
+                        self.obj_model._positions.add_(prior_schedule.alpha * (x_hat - x))
+                    self.obj_model.set_prior_target(None, 0.0)
+                    lam = 0.0
+                elif prior_schedule.lam_mode in ("relative", "relative_live"):
+                    # "relative": the data/prior gradient-norm ratio is measured once, at the first
+                    # application; "relative_live": re-measured at every application, so lam_rel keeps
+                    # its meaning when the prior starts late on an already-converged fit
+                    if self._lam_scale is None or prior_schedule.lam_mode == "relative_live":
                         g_data = self._positions_grad_norm_data(
                             loss_func, image_shape, sampling, window_sigmas, tilt_chunk
                         )
@@ -478,7 +590,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
                     lam = lam_raw * self._lam_scale
                 else:
                     lam = lam_raw
-                self.obj_model.set_prior_target(x_hat, lam)
+                if prior_schedule.mode != "proximal":
+                    self.obj_model.set_prior_target(x_hat, lam)
                 self._prior_history.append(
                     {
                         "iteration": it,
@@ -490,6 +603,20 @@ class TomographySplat(TomographyOpt, TomographyBase):
                     }
                 )
 
+            if prior is not None and prior_schedule is not None and it == prior_schedule.stop:
+                self.obj_model.set_prior_target(None, 0.0)
+            if uniform_every and (it + 1) % uniform_every == 0:
+                with torch.no_grad():  # single species: one amplitude and one width for every atom
+                    la, ls = self.obj_model._log_amplitudes, self.obj_model._log_sigmas
+                    ma, ms = float(la.median()), float(ls.median())
+                    if uniform_window is None:
+                        la.fill_(ma)
+                        ls.fill_(ms)
+                    else:  # leave the outliers alone so spurious atoms can still decay and be pruned
+                        lo, hi = math.log(uniform_window[0]), math.log(uniform_window[1])
+                        sel = (la - ma >= lo) & (la - ma <= hi)
+                        la[sel] = ma
+                        ls[sel] = ms
             if store_snapshots_every and (it + 1) % store_snapshots_every == 0:
                 self._snapshots.append(self._snapshot(it))
 

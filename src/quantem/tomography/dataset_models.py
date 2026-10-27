@@ -189,6 +189,11 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
             tilt_angles = torch.from_numpy(tilt_angles)
         if norm_quantile:
             max_val = torch.quantile(tilt_stack, 0.95)
+            if (
+                max_val <= 0
+            ):  # very low dose: most pixels are zero counts, so use the non-zero mean
+                nz = tilt_stack[tilt_stack > 0]
+                max_val = nz.mean() if nz.numel() else torch.max(tilt_stack)
         else:
             max_val = torch.max(tilt_stack)
 
@@ -718,6 +723,9 @@ class TomographySplatDataset(TomographyDatasetConstraints):
             if flat.numel() > 4_000_000:
                 flat = flat[torch.randperm(flat.numel())[:4_000_000]]
             scale = float(torch.quantile(flat, 0.95))
+            if scale <= 0:  # very low dose: most pixels are zero counts, so use the non-zero mean
+                nz = flat[flat > 0]
+                scale = float(nz.mean()) if nz.numel() else float(stack.max())
         else:
             scale = float(stack.max())
         super().__init__(

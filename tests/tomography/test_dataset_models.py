@@ -249,3 +249,16 @@ class TestTomographySplatDataset:
         assert dtilt.tolist() == [1.0, 2.0, 0.0, 3.0, 4.0]  # reference tilt (index 2) pinned to 0
         dset.learn_tilt_offset = False
         assert torch.all(dset.forward()[3] == 0)
+
+
+def test_splat_dataset_normalisation_survives_mostly_zero_counts():
+    """At very low dose the 95 % quantile of a Poisson image is 0; the scale must fall back to a positive value."""
+    from quantem.tomography.dataset_models import TomographySplatDataset
+
+    stack = np.zeros((3, 16, 16), dtype=np.float32)
+    stack[:, 8, 8] = 2.0  # one bright pixel per tilt, everything else zero
+    dset = TomographySplatDataset.from_data(
+        stack, np.array([-10.0, 0.0, 10.0], dtype=np.float32), 0.25
+    )
+    assert dset.intensity_scale > 0, "normalisation scale must be positive"
+    assert np.isfinite(dset.tilt_stack.numpy()).all()
