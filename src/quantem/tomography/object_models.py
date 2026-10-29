@@ -1,7 +1,7 @@
 from abc import abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Optional, cast
+from typing import Any, Callable, Generator, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -163,6 +163,11 @@ class ObjConstraintParams:
             Hard lower bound on the amplitude.
         box_pad : float
             Positions are clamped to the field-of-view box extended by this margin (Angstrom).
+        l1_amplitude : float
+            Weight of the sparsity term ``mean_i(A_i) / A_ref`` with ``A_ref`` the median
+            amplitude when the term is first applied (0 disables): a constant downward pull on
+            every amplitude that only the data can resist, so over-seeded atoms decay and are
+            pruned ("over-seed then prune").
         """
 
         tie_amplitude: float = 0.0
@@ -172,9 +177,10 @@ class ObjConstraintParams:
         sigma_bounds: tuple[float, float] = (0.15, 1.5)
         amplitude_min: float = 1e-6
         box_pad: float = 2.0
+        l1_amplitude: float = 0.0
         _name: str = "obj_splat"
 
-        soft_constraint_keys = ["tie_amplitude", "tie_sigma", "repulsion", "min_distance"]
+        soft_constraint_keys = ["tie_amplitude", "tie_sigma", "repulsion", "min_distance", "l1_amplitude"]
         hard_constraint_keys = ["sigma_bounds", "amplitude_min", "box_pad"]
 
     @classmethod
@@ -1140,6 +1146,7 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._prior_target: torch.Tensor | None = None
         self._prior_lambda: float = 0.0
         self._pair_idx: torch.Tensor | None = None
+        self._l1_ref: float | None = None
 
     # region --- factories ---
     @classmethod
@@ -1261,12 +1268,17 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         voxel_size: float | None = None,
         fov_z_A: float | None = None,
         n_atoms_guess: int | None = None,
+        method: Literal["backproject", "fbp"] = "backproject",
+        fbp_filter: str = "ramp",
         **seed_kwargs,
     ) -> "ObjectGaussianSplat":
-        """Seed atoms from the unfiltered back-projection of a ``TomographySplatDataset``
-        (its current poses). ``amplitude`` defaults to the mean image mass per atom
-        (``n_atoms_guess`` = number of seeds when not given)."""
+        """Seed atoms from the back-projection of a ``TomographySplatDataset`` (its current
+        poses): ``method="backproject"`` is the crude unfiltered back-projection, ``"fbp"`` the
+        filtered one (:func:`quantem.core.ml.splat.seeding.fbp_volume`, filter ``fbp_filter``).
+        ``amplitude`` defaults to the mean image mass per atom (``n_atoms_guess`` = number of seeds
+        when not given)."""
         from quantem.core.ml.splat.renderer import backproject_images
+        from quantem.core.ml.splat.seeding import fbp_volume
 
         with torch.no_grad():
             target, rot, shifts = dset.batch(None)
@@ -1276,7 +1288,14 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             fov_xy = (W * s, H * s)
             fov_z = float(fov_z_A) if fov_z_A is not None else min(fov_xy)
             shape = (int(round(fov_z / v)), int(round(fov_xy[1] / v)), int(round(fov_xy[0] / v)))
-            vol = backproject_images(target.detach(), rot.detach(), shifts.detach(), s, shape, v)
+            if method == "fbp":
+                vol = fbp_volume(
+                    target.detach(), rot.detach(), shifts.detach(), s, shape, v, fbp_filter
+                )
+            elif method == "backproject":
+                vol = backproject_images(target.detach(), rot.detach(), shifts.detach(), s, shape, v)
+            else:
+                raise ValueError(f"unknown seeding method {method!r}")
         obj = cls.from_volume(
             vol,
             v,
@@ -1495,6 +1514,12 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             term = c.repulsion * (pen * pen).sum() / max(self.num_atoms, 1)
             self.add_soft_constraint_loss("repulsion", term)
             loss = loss + term
+        if c.l1_amplitude > 0:
+            if self._l1_ref is None:
+                self._l1_ref = float(self.amplitudes.detach().median())
+            term = c.l1_amplitude * self.amplitudes.mean() / self._l1_ref
+            self.add_soft_constraint_loss("l1_amplitude", term)
+            loss = loss + term
         if self._prior_target is not None and self._prior_lambda > 0:
             term = (
                 self._prior_lambda
@@ -1599,12 +1624,12 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._rebuild(torch.arange(self.num_atoms, device=self.device), pos, amp, sig)
         return n
 
-    def merge(self, min_distance: float) -> int:
+    def merge(self, min_distance: float, amplitude_mode: str = "sum") -> int:
         """Merge atoms closer than ``min_distance`` Angstrom; returns the number removed."""
         from quantem.core.ml.splat.densify import merge_close_atoms
 
         keep_idx, pos, amp, sig = merge_close_atoms(
-            self._positions, self.amplitudes, self.sigmas, min_distance
+            self._positions, self.amplitudes, self.sigmas, min_distance, amplitude_mode
         )
         removed = self.num_atoms - int(keep_idx.numel())
         if removed:

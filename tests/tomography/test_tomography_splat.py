@@ -306,3 +306,107 @@ def test_prior_stop_proximal_mode_and_uniform_reset(five_atom_series):
     amps = rec.obj_model.amplitudes_np
     assert amps[0] < 0.2 * np.median(amps), "the outlier must not be pulled back to the median"
     assert np.ptp(amps[1:]) < 1e-6 * amps[1:].mean()
+    # (e) hard species reset every 2 iterations overrides the window (the outlier is reset too) and does not
+    # fire in between
+    rec.reconstruct(num_iter=1, learn_pose=False, uniform_every=1, uniform_window=(0.5, 2.0), species_reset_every=2)
+    amps = rec.obj_model.amplitudes_np  # global iteration 4 (it + 1 = 4): hard reset
+    assert np.ptp(amps) < 1e-6 * amps.mean(), "the hard reset must reset every atom, outliers included"
+    with torch.no_grad():
+        rec.obj_model._log_amplitudes[0] -= float(np.log(10.0))
+    rec.reconstruct(num_iter=1, learn_pose=False, species_reset_every=2)
+    amps = rec.obj_model.amplitudes_np  # it + 1 = 5: no reset
+    assert amps[0] < 0.2 * np.median(amps), "the hard reset must only fire every species_reset_every iterations"
+
+
+def test_densify_support_and_whitened_rules_remove_a_spurious_atom_and_gate_additions(five_atom_series):
+    """Chapter 06 rules: with the true atoms plus one spurious atom in vacuum, the data-support rule
+    (SNR below the bar) and the whitened-residual rule (model too bright in every view) each remove
+    exactly the spurious atom; the whitened add signal with the chi^2 gate adds nothing to a model
+    that already explains the data; the max-remove cap limits a pass."""
+    gt, tilts, imgs = five_atom_series
+    init = np.vstack([gt.numpy(), [[4.0, -4.0, 4.0]]])
+    for rule in ({"remove_snr_min": 3.0, "add_signal": "residual"}, {"remove_whitened_sigmas": 3.0}):
+        rec = TomographyLiteSplat.from_dataset(
+            imgs, tilts, SAMPLING, init=init, sigma_init=SIGMA, device="cpu", rng=0
+        )
+        rec.dset._dose_e_per_A2 = 1e5  # the rules need the shot-noise level
+        rec.obj_model._log_amplitudes.data[-1] = rec.obj_model._log_amplitudes.data[0] - 1.0
+        rec.reconstruct(
+            num_iter=1,
+            learn_pose=False,
+            densify=DensifyParams(every=1, start=0, prune_amplitude_frac=0.0, add_from_residual=True,
+                                  **{"add_signal": "whitened", "add_chi2_min": 1.5, "add_noise_sigmas": 4.0, **rule}),
+        )  # fmt: skip
+        assert rec.obj_model.num_atoms == 5, rule
+        assert np.linalg.norm(rec.obj_model.positions[:, None] - gt.numpy()[None], axis=-1).min(1).max() < 0.2, rule
+    rec = TomographyLiteSplat.from_dataset(
+        imgs, tilts, SAMPLING, init=np.vstack([init, [[-4.0, 4.0, -4.0]]]), sigma_init=SIGMA, device="cpu", rng=0
+    )
+    rec.dset._dose_e_per_A2 = 1e5
+    rec.obj_model._log_amplitudes.data[-2:] = rec.obj_model._log_amplitudes.data[0] - 1.0
+    rec.reconstruct(num_iter=1, learn_pose=False,
+                    densify=DensifyParams(every=1, start=0, prune_amplitude_frac=0.0, remove_snr_min=3.0, max_remove_frac=0.2))  # fmt: skip
+    assert rec.obj_model.num_atoms == 6  # 7 atoms, cap 20 % -> one removal per pass
+
+
+def test_densify_params_defaults_are_v2_and_v1_is_reachable(five_atom_series):
+    """Gate 06: the plain constructor (and ``v2()``) carry the chapter 06 rules, ``v1()`` the chapter 03
+    values; a dataset without a dose cannot whiten and falls back to v1 with one warning."""
+    d, v2, v1 = DensifyParams(every=5), DensifyParams.v2(every=5, prune_amplitude_frac=0.3), DensifyParams.v1(every=5)
+    assert (d.add_signal, d.remove_snr_min, d.max_remove_frac) == ("whitened", 2.0, 0.2)
+    assert (v2.add_signal, v2.remove_snr_min, v2.max_remove_frac, v2.prune_amplitude_frac) == ("whitened", 2.0, 0.2, 0.3)
+    assert (v1.add_signal, v1.remove_snr_min, v1.max_remove_frac) == ("residual", 0.0, None)
+    assert DensifyParams.v2(add_signal="residual").add_signal == "residual"  # an explicit field wins
+    # round 3: every new rule is off in v1 and v2 (track A re-baselines with them)
+    for name, p in (("v1", v1), ("v2", v2), ("default", d)):
+        assert p.clone_grad_k == 0.0, name
+    gt, tilts, imgs = five_atom_series
+    rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=gt.numpy(), sigma_init=SIGMA, device="cpu", rng=0)
+    assert rec.dset.dose_e_per_A2 is None
+    with pytest.warns(UserWarning, match="falling back"):
+        rec.reconstruct(num_iter=2, learn_pose=False, densify=DensifyParams(every=1, start=0, add_from_residual=True))
+    assert rec.obj_model.num_atoms == 5
+
+
+def test_densify_gradient_clone_splits_the_high_gradient_atom_along_its_descent_direction(five_atom_series):
+    """Round 3 add rule (3DGS-style clone): atom 3 starts 0.4 A off its site, so over the densify interval its
+    positional gradient is far above the population median; it is cloned once, the clone sits ``clone_offset``
+    from it toward the true site, both halves carry half the amplitude (total mass unchanged), no residual add."""
+    gt, tilts, imgs = five_atom_series
+    init = gt.numpy().copy()
+    init[3] += [0.0, 0.0, 0.4]
+    rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=init, sigma_init=SIGMA, device="cpu", rng=0)
+    params = DensifyParams(every=2, start=0, prune_amplitude_frac=0.0, add_from_residual=True, clone_grad_k=5.0,
+                           clone_offset=0.8, add_from_residual_when_cloning=False, add_signal="residual", remove_snr_min=0.0)
+    rec.reconstruct(num_iter=1, learn_pose=False, densify=params)
+    p3 = rec.obj_model.positions[3].copy()
+    a3 = float(rec.obj_model.amplitudes_np[3])
+    mass = float(rec.obj_model.amplitudes_np.sum())
+    rec.reconstruct(num_iter=1, learn_pose=False, densify=params)  # it + 1 = 2: the densify pass
+    obj = rec.obj_model
+    assert obj.num_atoms == 6, f"exactly the displaced atom must be cloned, got {obj.num_atoms - 5} clones"
+    clone = obj.positions[5]
+    assert np.linalg.norm(clone - obj.positions[3]) == pytest.approx(0.8, abs=0.05)
+    u = (clone - obj.positions[3]) / np.linalg.norm(clone - obj.positions[3])
+    assert float(u @ (gt[3].numpy() - p3)) / float(np.linalg.norm(gt[3].numpy() - p3)) > 0.9, "clone not on the descent side"
+    amps = obj.amplitudes_np
+    assert amps[5] == pytest.approx(amps[3], rel=1e-5) and amps[3] == pytest.approx(a3 / 2, rel=0.05)
+    assert float(amps.sum()) == pytest.approx(mass, rel=0.05)
+
+
+def test_pose_l1_penalty_holds_the_learned_shift_at_zero(five_atom_series):
+    """Round 3: an L1 penalty on the pose corrections; tilt 0 is rendered 1 px off, a strong penalty keeps the
+    learned shift near zero while the unpenalised fit follows the data."""
+    gt, tilts, imgs = five_atom_series
+    rot = pose_to_rotations(torch.tensor(tilts, dtype=torch.float32), torch.zeros(len(tilts)), torch.zeros(len(tilts)))
+    sh = torch.zeros(len(tilts), 2)
+    sh[0, 0] = 1.0
+    shifted = render_projections(gt, torch.full((5,), 1.7e-3), torch.full((5,), SIGMA), rot, sh, SAMPLING, (24, 24),
+                                 window_radius_for(SIGMA, SAMPLING)).numpy()  # fmt: skip
+    learned = {}
+    for w in (0.0, 1.0):
+        rec = TomographyLiteSplat.from_dataset(shifted, tilts, SAMPLING, init=gt.numpy(), sigma_init=SIGMA, device="cpu", rng=0)
+        rec.reconstruct(num_iter=25, learn_pose=True, position_lr=0.0, pose_l1=(w, 0.0))
+        learned[w] = float(rec.dset.forward(None)[0][0, 0].detach())
+    assert learned[0.0] > 0.5, f"without the penalty the shift must follow the data, got {learned[0.0]:.3f} px"
+    assert abs(learned[1.0]) < 0.3 * learned[0.0], f"the L1 penalty must hold the shift near 0, got {learned[1.0]:.3f} px"

@@ -8,6 +8,10 @@ from quantem.core.ml.splat.densify import (
     prune_mask as prune_mask,
     remap_optimizer_state as remap_optimizer_state,
 )
+from quantem.core.ml.splat.seeding import (
+    fbp_volume as fbp_volume,
+    filter_images as filter_images,
+)
 from quantem.core.ml.splat.renderer import (
     backproject_images as backproject_images,
     project_positions as project_positions,

@@ -9,7 +9,8 @@ runs on one device (CPU or a single GPU).
 """
 
 import math
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, replace
 from typing import Callable, Literal, Protocol, Self
 
 import numpy as np
@@ -104,6 +105,10 @@ class PriorSchedule:
     )
     # way to x̂ at every refresh (plug-and-play / RED style) instead of adding a loss term; ``lam`` unused
     alpha: float = 0.3
+    # noise added to the current positions before each prior call, as a multiple of sigma_t (the
+    # training corruption; 1.0 = the behaviour since chapter 01). 0.0 treats the positions as the
+    # noisy state x_t themselves (round 4 step 6, 2026-10-28: the fresh noise sets a ~0.03 A floor).
+    noise_scale: float = 1.0
 
     def at(
         self, it: int, num_iter: int, prior: AtomPrior | None = None
@@ -151,6 +156,51 @@ class DensifyParams:
     add_noise_sigmas: float = 0.0  # also require a residual peak > this many robust sigmas of the
     # residual's own filtered noise (MAD over the volume); 0 disables. Needed at low dose, where the
     # single-atom-relative threshold alone admits shot-noise peaks.
+    # --- chapter 06 candidates (defaults = the chapter 03 behaviour) ---
+    add_signal: Literal["residual", "whitened"] = "whitened"  # "whitened": back-project the residual
+    # divided by its expected shot-noise standard deviation (pixel_variance), so the volume's noise is
+    # uniform and sites wrong in many views stand out ("multi-view inconsistency"); needs the dose
+    add_chi2_min: float = 0.0  # accept a candidate only where the back-projected normalised squared
+    # residual (chi^2 per view, 1 = consistent) exceeds this; 0 disables
+    remove_whitened_sigmas: float = 0.0  # remove an atom where the filtered whitened residual volume
+    # is below -k sigma (the model is too bright there in many views); 0 disables
+    remove_snr_min: float = 2.0  # remove atoms whose data support (densify.atom_support, chi^2 the
+    # atom explains) is below snr_min^2, i.e. detection SNR below snr_min; 0 disables
+    max_remove_frac: float | None = 0.2  # cap of the support / whitened removals per pass
+    merge_amplitude: Literal["sum", "max"] = "sum"  # merged atom carries the sum or the larger amplitude
+    # --- chapter 06 round 3: gradient-clone add rule (3DGS densification; Kerbl et al. 2023 sec. 5.2, and the
+    # Gaussian AET preprint arXiv:2512.15034, which duplicates Gaussians with a large |dL/dr|). 0 disables. ---
+    clone_grad_k: float = 0.0  # clone atoms whose mean positional-gradient norm over the densify interval exceeds
+    # k x the population median (relative, so the bar does not depend on the dose or the loss scale)
+    clone_offset: float = 1.0  # Angstrom; the clone sits this far from the original along the accumulated descent
+    # direction -sum(dL/dr); both halves carry A/2 (mass conserving: the model is additive, not alpha-blended)
+    add_from_residual_when_cloning: bool = True  # False = the clone rule replaces the residual back-projection add
+    model_error_frac: float = 0.0  # round 3: add (frac * prediction)^2 to the shot-noise variance used by the whitened add
+    # signal and the data-support removal, a systematic model-error floor that caps the per-pixel SNR at 1 / frac (at full
+    # dose the shot noise is so small that every misfit looks significant); 0 = off (v1 / v2)
+    variance_source: Literal["model", "max", "max_smooth"] = "model"  # round 3: the expected counts used for the shot-noise variance:
+    # "model" = the prediction (v1 / v2); "max" = max(prediction, measured image), so pixels the model does not yet explain
+    # keep their measured variance instead of the empty-pixel floor (at 1e8 that floor is ~1e-4 of a particle pixel's
+    # variance and the whitened add then floods vacuum during the fill-in; chapter 06 round 3, S3vm 1e8); "max_smooth" =
+    # the same with the image smoothed by a Gaussian of ``variance_blur_px`` pixels (no shot-noise bias at low dose)
+    variance_blur_px: float = 1.5
+
+    @classmethod
+    def v2(cls, **kwargs) -> "DensifyParams":
+        """Bookkeeping v2 (chapter 06, 2026-10-27; the defaults since gate 06): the chapter 03 rules
+        plus the shot-noise-whitened residual as the add signal and removal by data support below
+        SNR 2 (at most 20 % of the atoms per pass). Needs ``dose_e_per_A2`` on the dataset (without
+        it the loop falls back to v1 with a warning). ``kwargs`` override any field."""
+        base = {"add_signal": "whitened", "remove_snr_min": 2.0, "max_remove_frac": 0.2}
+        base.update(kwargs)
+        return cls(**base)
+
+    @classmethod
+    def v1(cls, **kwargs) -> "DensifyParams":
+        """The chapter 03 bookkeeping: raw residual as the add signal, no data-support removal."""
+        base = {"add_signal": "residual", "remove_snr_min": 0.0, "max_remove_frac": None}
+        base.update(kwargs)
+        return cls(**base)
 
 
 class TomographySplat(TomographyOpt, TomographyBase):
@@ -256,12 +306,58 @@ class TomographySplat(TomographyOpt, TomographyBase):
     def _densify(
         self, it: int, params: DensifyParams, image_shape, sampling, window_sigmas, tilt_chunk
     ) -> dict:
-        from quantem.core.ml.splat.densify import prune_mask
+        from quantem.core.ml.splat.densify import atom_support, pixel_variance, prune_mask
         from quantem.core.ml.splat.renderer import backproject_images, render_projections
         from quantem.tomography.atom_trace import gaussian_blur3d, seed_peaks
 
         obj = self.obj_model
-        out = {"pruned": 0, "merged": 0, "added": 0, "split": 0}
+        out = {"pruned": 0, "merged": 0, "added": 0, "split": 0, "removed_support": 0, "removed_whitened": 0}
+        clone_sel = self._clone_candidates(params) if params.clone_grad_k > 0 else None
+        if clone_sel is not None and not params.add_from_residual_when_cloning:
+            params = replace(params, add_from_residual=False, split_from_residual=False)
+        whiten = (
+            params.add_signal == "whitened"
+            or params.add_chi2_min > 0
+            or params.remove_whitened_sigmas > 0
+            or params.remove_snr_min > 0
+        )
+        if whiten and self.dset.dose_e_per_A2 is None:
+            if not getattr(self, "_warned_no_dose", False):
+                warnings.warn(
+                    "whitened / support-based densification needs the dataset dose (dose_e_per_A2); "
+                    "falling back to the chapter 03 rules (raw residual, no data-support removal)",
+                    stacklevel=2,
+                )
+                self._warned_no_dose = True
+            params = replace(
+                params, add_signal="residual", add_chi2_min=0.0, remove_whitened_sigmas=0.0, remove_snr_min=0.0
+            )
+            whiten = False
+        need_render = params.add_from_residual or params.remove_snr_min > 0 or params.remove_whitened_sigmas > 0
+        target = rot = shifts = pred = None
+
+        def render():
+            target, rot, shifts = self.dset.batch(None)
+            pred = obj.forward(rot, shifts, image_shape, sampling, None, window_sigmas, tilt_chunk)
+            return target, rot, shifts, pred
+
+        def variance(pred):
+            return pixel_variance(
+                pred, self.dset.intensity_scale, self.dset.dose_e_per_A2, sampling,
+                target=target if params.variance_source in ("max", "max_smooth") else None, model_error_frac=params.model_error_frac,
+                target_blur_px=params.variance_blur_px if params.variance_source == "max_smooth" else 0.0,
+            )  # fmt: skip
+
+        def bs_filter(vol):
+            bs = params.add_blur_sigmas
+            if isinstance(bs, (tuple, list)):
+                return gaussian_blur3d(vol, float(bs[0])) - gaussian_blur3d(vol, float(bs[1]))
+            return gaussian_blur3d(vol, float(bs))
+
+        def robust_sigma(sel):
+            med = sel.median()
+            return 1.4826 * float((sel - med).abs().median())
+
         if params.prune_amplitude_frac > 0 and obj.num_atoms > 1:
             amp = obj.amplitudes.detach()
             ref = float(amp.median())
@@ -275,12 +371,26 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 obj.box_half if params.prune_outside_box else None,
             )
             out["pruned"] = obj.prune(keep)
+        if need_render:
+            target, rot, shifts, pred = render()
+        if params.remove_snr_min > 0 and obj.num_atoms > 1:
+            # data support: the chi^2 each atom explains; below snr_min^2 the data do not need it
+            sup = atom_support(
+                obj._positions.detach(), obj.amplitudes.detach(), obj.sigmas.detach(), rot, shifts,
+                sampling, image_shape, obj.window_radius(sampling, window_sigmas),
+                target - pred, variance(pred), tilt_chunk,
+            )  # fmt: skip
+            self._last_support = sup.detach().cpu()
+            keep = sup >= params.remove_snr_min**2
+            keep = self._cap_removals(keep, sup, params.max_remove_frac)
+            out["removed_support"] = obj.prune(keep)
+            if out["removed_support"]:
+                target, rot, shifts, pred = render()
         if params.merge_distance:
-            out["merged"] = obj.merge(float(params.merge_distance))
-        if params.add_from_residual:
-            target, rot, shifts = self.dset.batch(None)
-            pred = obj.forward(rot, shifts, image_shape, sampling, None, window_sigmas, tilt_chunk)
-            resid = torch.clamp(target - pred, min=0.0)
+            out["merged"] = obj.merge(float(params.merge_distance), params.merge_amplitude)
+            if out["merged"] and need_render:
+                target, rot, shifts, pred = render()
+        if params.add_from_residual or params.remove_whitened_sigmas > 0:
             v = float(params.voxel_size) if params.voxel_size else 2.0 * sampling
             D, H, W = obj.shape
             vol_shape = (
@@ -288,82 +398,195 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 max(2, int(round(H * obj._view_sampling / v))),
                 max(2, int(round(W * obj._view_sampling / v))),
             )
-            vol = backproject_images(resid, rot, shifts, sampling, vol_shape, v)
-            # reference: back-projected peak of one median atom at the origin, same blur as the seeds
-            one = render_projections(
-                torch.zeros(1, 3, device=obj.device, dtype=obj.dtype),
-                obj.amplitudes.detach().median().reshape(1),
-                obj.sigmas.detach().median().reshape(1),
-                rot,
-                shifts,
-                sampling,
-                image_shape,
-                obj.window_radius(sampling, window_sigmas),
-            )
-            ref_vol = backproject_images(one, rot, shifts, sampling, vol_shape, v).cpu()
-            bs = params.add_blur_sigmas
-            if isinstance(bs, (tuple, list)):
-                ref_resp = gaussian_blur3d(ref_vol, float(bs[0])) - gaussian_blur3d(
-                    ref_vol, float(bs[1])
-                )
-            else:
-                ref_resp = gaussian_blur3d(ref_vol, float(bs))
-            thr = (
-                params.add_min_rel_peak * float(ref_resp.max())
-                if params.add_min_rel_peak > 0
-                else None
-            )
-            if params.add_noise_sigmas > 0:
-                vc = vol.cpu()
-                resp = (
-                    gaussian_blur3d(vc, float(bs[0])) - gaussian_blur3d(vc, float(bs[1]))
-                    if isinstance(bs, (tuple, list))
-                    else gaussian_blur3d(vc, float(bs))
-                )
-                if params.add_noise_region == "support":
-                    bp_pred = backproject_images(
-                        pred.detach(), rot, shifts, sampling, vol_shape, v
-                    ).cpu()
+            resid = target - pred  # raw residual: the chapter 03 add signal
+            whiten_add = params.add_signal == "whitened"
+            if whiten:  # whitened residual: the candidate-3 add signal, the whitened removal and the chi^2 gate
+                sd = variance(pred).sqrt()
+                resid_w = resid / sd
+            if whiten_add:
+                resid = resid_w
+            bp_pred = None
+            if params.add_noise_region == "support" and (
+                params.add_noise_sigmas > 0 or params.remove_whitened_sigmas > 0
+            ):
+                bp_pred = backproject_images(pred.detach(), rot, shifts, sampling, vol_shape, v).cpu()
+
+            def noise_of(resp):
+                if bp_pred is not None:
                     sel = resp[bp_pred > 0.1 * float(bp_pred.max())]
-                    if sel.numel() < 64:
-                        sel = resp.reshape(-1)
-                else:
-                    sel = resp.reshape(-1)
-                med = sel.median()
-                noise = 1.4826 * float((sel - med).abs().median())
-                self._last_add_noise = noise
-                thr = max(thr or 0.0, params.add_noise_sigmas * noise)
-            peaks, _ = seed_peaks(
-                vol.cpu(),
-                blur_sigmas=params.add_blur_sigmas,
-                threshold=thr,
-                threshold_fraction=params.add_threshold_fraction,
-                min_distance=params.add_min_distance / v,
-                max_peaks=params.max_add,
-            )
-            if peaks.shape[0]:
-                pos = torch.stack(
-                    (
-                        (peaks[:, 2].double() - (vol_shape[2] - 1) / 2) * v,
-                        (peaks[:, 1].double() - (vol_shape[1] - 1) / 2) * v,
-                        (peaks[:, 0].double() - (vol_shape[0] - 1) / 2) * v,
-                    ),
-                    dim=1,
-                ).float()
-                rejected = pos[:0]
-                rejected_nn = torch.zeros(0, dtype=torch.long)
-                if obj.num_atoms:
-                    d, nn = torch.cdist(pos, obj._positions.detach().cpu()).min(dim=1)
-                    accept = d > params.add_min_distance
-                    rejected, rejected_nn = pos[~accept], nn[~accept]
-                    pos = pos[accept]
-                if params.max_add_frac is not None and obj.num_atoms:
-                    cap = max(1, int(params.max_add_frac * obj.num_atoms))
-                    pos = pos[:cap]  # seed_peaks returns peaks strongest first
-                out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
-                if params.split_from_residual and rejected.shape[0]:
-                    out["split"] = self._split_fat_atoms(rejected, rejected_nn, params)
+                    if sel.numel() >= 64:
+                        return robust_sigma(sel)
+                return robust_sigma(resp.reshape(-1))
+
+            if params.remove_whitened_sigmas > 0 and obj.num_atoms > 1:
+                # the model is too bright in many views where the filtered whitened residual is strongly negative
+                resp_s = bs_filter(backproject_images(resid_w, rot, shifts, sampling, vol_shape, v).cpu())
+                noise = noise_of(resp_s)
+                pos = obj._positions.detach().cpu()
+                idx = [
+                    (pos[:, 2 - k] / v + (vol_shape[k] - 1) / 2).round().long().clamp(0, vol_shape[k] - 1)
+                    for k in range(3)
+                ]
+                at_atom = resp_s[idx[0], idx[1], idx[2]]
+                keep = at_atom >= -params.remove_whitened_sigmas * noise
+                keep = self._cap_removals(keep.to(obj.device), at_atom.to(obj.device), params.max_remove_frac)
+                out["removed_whitened"] = obj.prune(keep)
+                if out["removed_whitened"] and params.add_from_residual:
+                    target, rot, shifts, pred = render()
+                    resid = target - pred
+                    sd = variance(pred).sqrt()
+                    resid_w = resid / sd
+                    if whiten_add:
+                        resid = resid_w
+            if params.add_from_residual:
+                vol = backproject_images(torch.clamp(resid, min=0.0), rot, shifts, sampling, vol_shape, v)
+                # reference: back-projected peak of one median atom at the origin, same blur as the seeds
+                one = render_projections(
+                    torch.zeros(1, 3, device=obj.device, dtype=obj.dtype),
+                    obj.amplitudes.detach().median().reshape(1),
+                    obj.sigmas.detach().median().reshape(1),
+                    rot,
+                    shifts,
+                    sampling,
+                    image_shape,
+                    obj.window_radius(sampling, window_sigmas),
+                )
+                if whiten_add:
+                    one = one / sd
+                ref_resp = bs_filter(backproject_images(one, rot, shifts, sampling, vol_shape, v).cpu())
+                thr = (
+                    params.add_min_rel_peak * float(ref_resp.max())
+                    if params.add_min_rel_peak > 0
+                    else None
+                )
+                if params.add_noise_sigmas > 0:
+                    noise = noise_of(bs_filter(vol.cpu()))
+                    self._last_add_noise = noise
+                    thr = max(thr or 0.0, params.add_noise_sigmas * noise)
+                peaks, _ = seed_peaks(
+                    vol.cpu(),
+                    blur_sigmas=params.add_blur_sigmas,
+                    threshold=thr,
+                    threshold_fraction=params.add_threshold_fraction,
+                    min_distance=params.add_min_distance / v,
+                    max_peaks=params.max_add,
+                )
+                if peaks.shape[0] and params.add_chi2_min > 0:
+                    # multi-view inconsistency gate: chi^2 per view at the candidate (1 = consistent model)
+                    bs = params.add_blur_sigmas
+                    chi2 = gaussian_blur3d(
+                        backproject_images(resid_w * resid_w, rot, shifts, sampling, vol_shape, v).cpu(),
+                        float(bs[0] if isinstance(bs, (tuple, list)) else bs),
+                    )
+                    pk = [peaks[:, k].round().long().clamp(0, vol_shape[k] - 1) for k in range(3)]
+                    ok = chi2[pk[0], pk[1], pk[2]] >= params.add_chi2_min
+                    self._last_chi2_rejected = int((~ok).sum())
+                    peaks = peaks[ok]
+                if peaks.shape[0]:
+                    pos = torch.stack(
+                        (
+                            (peaks[:, 2].double() - (vol_shape[2] - 1) / 2) * v,
+                            (peaks[:, 1].double() - (vol_shape[1] - 1) / 2) * v,
+                            (peaks[:, 0].double() - (vol_shape[0] - 1) / 2) * v,
+                        ),
+                        dim=1,
+                    ).float()
+                    rejected = pos[:0]
+                    rejected_nn = torch.zeros(0, dtype=torch.long)
+                    if obj.num_atoms:
+                        d, nn = torch.cdist(pos, obj._positions.detach().cpu()).min(dim=1)
+                        accept = d > params.add_min_distance
+                        rejected, rejected_nn = pos[~accept], nn[~accept]
+                        pos = pos[accept]
+                    if params.max_add_frac is not None and obj.num_atoms:
+                        cap = max(1, int(params.max_add_frac * obj.num_atoms))
+                        pos = pos[:cap]  # seed_peaks returns peaks strongest first
+                    out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
+                    if params.split_from_residual and rejected.shape[0]:
+                        out["split"] = self._split_fat_atoms(rejected, rejected_nn, params)
+        if clone_sel is not None:
+            out["cloned"] = self._clone_atoms(*clone_sel, params)
+        self._reset_grad_accumulators()
         return out
+
+    # --- gradient-clone add rule (chapter 06 round 3) ---
+    def _reset_grad_accumulators(self) -> None:
+        self._grad_norm_acc = None
+        self._grad_vec_acc = None
+        self._grad_count = 0
+
+    @torch.no_grad()
+    def _accumulate_position_grad(self) -> None:
+        """Add this step's per-atom positional gradient (norm and vector) to the densify-interval accumulators."""
+        g = self.obj_model._positions.grad
+        if g is None:
+            return
+        acc = getattr(self, "_grad_norm_acc", None)
+        if acc is None or acc.shape[0] != g.shape[0]:  # first step, or the atom set changed outside a densify pass
+            self._grad_norm_acc = torch.zeros(g.shape[0], device=g.device, dtype=g.dtype)
+            self._grad_vec_acc = torch.zeros_like(g)
+            self._grad_count = 0
+        self._grad_norm_acc += g.norm(dim=-1)
+        self._grad_vec_acc += g
+        self._grad_count += 1
+
+    @torch.no_grad()
+    def _clone_candidates(self, params: DensifyParams):
+        """Atoms whose mean positional-gradient norm over the interval exceeds ``clone_grad_k`` x the population
+        median, strongest first and capped at ``max_add_frac`` of the atoms; returns ``(positions, descent
+        directions)`` of the selected atoms (positions identify them after the prune / merge / add steps of the pass,
+        which re-index the atoms), or ``None``."""
+        obj = self.obj_model
+        acc = getattr(self, "_grad_norm_acc", None)
+        if acc is None or acc.shape[0] != obj.num_atoms or self._grad_count == 0 or obj.num_atoms < 2:
+            return None
+        score = acc / self._grad_count
+        sel = torch.nonzero(score > params.clone_grad_k * score.median()).reshape(-1)
+        if sel.numel() == 0:
+            return None
+        sel = sel[torch.argsort(score[sel], descending=True)]
+        if params.max_add_frac is not None:
+            sel = sel[: max(1, int(params.max_add_frac * obj.num_atoms))]
+        d = -self._grad_vec_acc[sel]
+        n = d.norm(dim=-1, keepdim=True)
+        flat = n.reshape(-1) <= 1e-30  # a vanishing summed gradient: any direction, take +x
+        d = torch.where(n > 1e-30, d / n.clamp_min(1e-30), torch.zeros_like(d))
+        d[flat, 0] = 1.0
+        return obj._positions.detach()[sel].clone(), d
+
+    @torch.no_grad()
+    def _clone_atoms(self, sel_pos: torch.Tensor, direction: torch.Tensor, params: DensifyParams) -> int:
+        """Clone each selected atom that survived the pass unchanged (same position): the clone sits
+        ``clone_offset`` along the descent direction, original and clone carry half the amplitude each and the
+        original keeps its width, position and optimizer moments (the clone starts from zero moments)."""
+        obj = self.obj_model
+        if obj.num_atoms == 0:
+            return 0
+        d, nn = torch.cdist(sel_pos, obj._positions.detach()).min(dim=1)
+        ok = d < 1e-5  # pruned / merged / split atoms are gone or moved: skip them
+        if not bool(ok.any()):
+            return 0
+        idx = nn[ok]
+        amp = obj.amplitudes.detach()[idx] / 2.0
+        new_pos = obj._positions.detach()[idx] + params.clone_offset * direction[ok]
+        obj._rebuild(None, new_pos, amp, obj.sigmas.detach()[idx])
+        obj._log_amplitudes[idx] -= math.log(2.0)
+        return int(idx.numel())
+
+    @staticmethod
+    def _cap_removals(keep: torch.Tensor, score: torch.Tensor, max_frac: float | None) -> torch.Tensor:
+        """Keep at most ``max_frac`` of the atoms marked for removal per pass (the lowest scores go first)."""
+        if max_frac is None:
+            return keep
+        n_rm = int((~keep).sum())
+        cap = int(max_frac * keep.numel())
+        if n_rm <= cap:
+            return keep
+        keep = keep.clone()
+        order = torch.argsort(score)  # lowest score first
+        marked = order[~keep[order]]
+        keep[marked[cap:]] = True
+        return keep
 
     def _split_fat_atoms(
         self, candidates: torch.Tensor, nearest: torch.Tensor, params: DensifyParams
@@ -435,6 +658,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
         schedule_total: int | None = None,
         uniform_every: int = 0,
         uniform_window: tuple[float, float] | None = None,
+        species_reset_every: int = 0,
+        pose_l1: tuple[float, float] = (0.0, 0.0),
     ) -> Self:
         """
         Fit the atoms (and poses) to the tilt series.
@@ -455,6 +680,15 @@ class TomographySplat(TomographyOpt, TomographyBase):
         schedule_total : int or None
             Total planned iterations for the prior schedule when ``reconstruct`` is called in
             chunks (defaults to ``num_iter``); schedule iteration counts are global (``num_epochs``).
+        uniform_every, uniform_window
+            Every ``uniform_every`` iterations reset the amplitudes and widths to their medians (only the atoms
+            within ``uniform_window`` x median when given).
+        species_reset_every : int
+            Every ``species_reset_every`` iterations a HARD reset of every atom's amplitude and width to the
+            medians (single species), independent of the windowed reset; 0 disables.
+        pose_l1 : (float, float)
+            L1 penalty on the learned pose corrections, added to the loss while poses are learned:
+            ``w_shift * mean_k |shift_k|_1`` (pixels) ``+ w_angle * mean_k (|z1_k| + |z3_k| + |dtilt_k|)`` (degrees).
         """
         if reset:
             self.obj_model.reset()
@@ -496,6 +730,7 @@ class TomographySplat(TomographyOpt, TomographyBase):
         if self.obj_model.constraints.repulsion > 0:
             self.obj_model.refresh_neighbors()
 
+        track_grad = densify is not None and densify.every > 0 and densify.clone_grad_k > 0
         pbar = tqdm(range(num_iter), disable=not self.verbose)
         for a0 in pbar:
             it = self.num_epochs
@@ -515,8 +750,14 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 data_loss = loss_func(pred, target)
                 soft = self.obj_model.apply_soft_constraints(ReconstructionContext(pred=pred))
                 soft = soft + self.dset.apply_soft_constraints()
+                if learn_pose and (pose_l1[0] > 0 or pose_l1[1] > 0):
+                    sh, z1, z3, dt = self.dset.forward(None)
+                    soft = soft + float(pose_l1[0]) * sh.abs().sum(dim=-1).mean()
+                    soft = soft + float(pose_l1[1]) * (z1.abs() + z3.abs() + dt.abs()).mean()
                 loss = data_loss + soft
                 loss.backward()
+                if track_grad:
+                    self._accumulate_position_grad()
                 if grad_clip is not None:
                     params = list(self.obj_model.params) + [p for p in self.dset.parameters()]
                     torch.nn.utils.clip_grad_norm_(params, max_norm=float(grad_clip))
@@ -556,6 +797,9 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 changes = self._densify(
                     it, densify, image_shape, sampling, window_sigmas, tilt_chunk
                 )
+                if not hasattr(self, "_densify_history"):
+                    self._densify_history = []
+                self._densify_history.append({"iteration": it, "n_atoms": self.obj_model.num_atoms, **changes})
                 if any(changes.values()):
                     self.set_optimizers() if self.obj_model.optimizer is None else None
                     if self.obj_model.constraints.repulsion > 0:
@@ -570,7 +814,9 @@ class TomographySplat(TomographyOpt, TomographyBase):
             ):
                 t, lam_raw = prior_schedule.at(it, schedule_total or num_iter, prior)
                 x = self.obj_model._positions.detach()
-                x_hat = prior.clean_estimate(x, t=t).to(x)
+                x_hat = prior.clean_estimate(
+                    x, t=t, **({"noise_scale": prior_schedule.noise_scale} if hasattr(prior, "t_of_sigma") else {})
+                ).to(x)
                 pull = (x_hat - x).norm(dim=-1)
                 if prior_schedule.mode == "proximal":
                     with torch.no_grad():
@@ -605,11 +851,14 @@ class TomographySplat(TomographyOpt, TomographyBase):
 
             if prior is not None and prior_schedule is not None and it == prior_schedule.stop:
                 self.obj_model.set_prior_target(None, 0.0)
-            if uniform_every and (it + 1) % uniform_every == 0:
+            if (uniform_every and (it + 1) % uniform_every == 0) or (
+                species_reset_every and (it + 1) % species_reset_every == 0
+            ):
                 with torch.no_grad():  # single species: one amplitude and one width for every atom
                     la, ls = self.obj_model._log_amplitudes, self.obj_model._log_sigmas
                     ma, ms = float(la.median()), float(ls.median())
-                    if uniform_window is None:
+                    hard = bool(species_reset_every) and (it + 1) % species_reset_every == 0
+                    if uniform_window is None or hard:
                         la.fill_(ma)
                         ls.fill_(ms)
                     else:  # leave the outliers alone so spurious atoms can still decay and be pruned

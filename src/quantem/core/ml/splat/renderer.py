@@ -23,11 +23,19 @@ Each Gaussian is stamped into a ``(2 r + 1)^2`` pixel window around its rounded 
 centre; the window *indices* are detached while the Gaussian is evaluated at the continuous
 centre, so gradients reach the positions, amplitudes, widths, rotations and shifts (the
 pattern of :func:`quantem.tomography.atom_trace.render_isotropic`). Memory is
-``O(T N (2 r + 1)^2)`` per chunk of tilts; this function is the contract for a future fused
-CUDA kernel in ``quantem-cuda``.
+``O(T N (2 r + 1)^2)`` per chunk of tilts (and the autograd graph keeps every chunk), which is
+what the fused ``quantem.cuda.core.ml.splat_stamp`` kernel removes: ``render_projections``
+takes ``backend="torch" | "cuda"`` (default from the environment variable
+``SPLAT_RENDER_BACKEND``, else ``"torch"``); the CUDA backend does the projection, the unit
+conversion and the background in torch and only the 2D stamping in the kernel, with the same
+pixel-centre, rounding and clipping conventions, fp32 only.
 """
 
+import importlib
 import math
+import os
+import sys
+import warnings
 from typing import TYPE_CHECKING
 
 from quantem.core import config
@@ -95,6 +103,116 @@ def _stamp_offsets(window_radius: int, device) -> "torch.Tensor":
     return torch.stack((o0.reshape(-1), o1.reshape(-1)), dim=1)  # (W2, 2)
 
 
+BACKENDS = ("torch", "cuda")
+BACKEND_ENV = "SPLAT_RENDER_BACKEND"
+_cuda_fallback_warned = False
+
+
+def _cuda_stamp_or_none():
+    """The ``quantem.cuda`` stamp op, or ``None`` (with a one-time warning) when ``quantem.cuda``
+    is not importable or is an older wheel without ``splat_stamp``."""
+    global _cuda_fallback_warned
+    reason = None
+    try:
+        cuda_ml = importlib.import_module("quantem.cuda.core.ml")
+    except ImportError as exc:
+        reason = f"quantem.cuda is not importable ({exc})"
+        fn = None
+    else:
+        fn = getattr(cuda_ml, "splat_stamp", None)
+        if fn is None:
+            version = getattr(sys.modules.get("quantem.cuda"), "__version__", "?")
+            reason = (
+                f"quantem.cuda {version} ({getattr(cuda_ml, '__file__', '?')}) has no "
+                "splat_stamp op (an older wheel is on the path)"
+            )
+    if fn is None and not _cuda_fallback_warned:
+        _cuda_fallback_warned = True
+        warnings.warn(
+            f"render_projections: backend='cuda' requested but {reason}; falling back to the "
+            "torch backend for this process.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return fn
+
+
+def _cuda_inputs_ok(*tensors) -> bool:
+    return all(t.dtype == torch.float32 and t.is_cuda for t in tensors)
+
+
+def resolve_backend(backend: str | None = None, tensors=()):
+    """``(name, stamp_fn)`` for ``backend`` (keyword, else ``$SPLAT_RENDER_BACKEND``, else
+    ``"torch"``); ``stamp_fn`` is ``None`` for the torch path.
+
+    The environment variable states a preference: with ``"cuda"`` from the environment, inputs
+    the kernel cannot take (CPU or non-fp32 ``tensors``) silently use the torch path, so CPU
+    tests and fp64 checks keep working under a project-wide default. The keyword is a demand:
+    ``backend="cuda"`` with such inputs raises in the CUDA path.
+    """
+    explicit = backend is not None
+    name = backend if explicit else os.environ.get(BACKEND_ENV, "torch")
+    name = str(name).strip().lower()
+    if name not in BACKENDS:
+        raise ValueError(f"unknown splat backend {name!r}; expected one of {BACKENDS}")
+    if name == "cuda":
+        if not explicit and tensors and not _cuda_inputs_ok(*tensors):
+            return "torch", None
+        fn = _cuda_stamp_or_none()
+        if fn is not None:
+            return "cuda", fn
+    return "torch", None
+
+
+def _render_projections_cuda(
+    stamp,
+    positions: "torch.Tensor",
+    amplitudes: "torch.Tensor",
+    sigmas: "torch.Tensor",
+    rotations: "torch.Tensor",
+    shifts: "torch.Tensor",
+    sampling: float,
+    image_shape: tuple[int, int],
+    window_radius: int,
+    background: "torch.Tensor | None",
+    tilt_chunk: int | None,
+) -> "torch.Tensor":
+    """The fused path: projection (torch) -> pixel-unit stamp (kernel) -> background (torch)."""
+    H, W = (int(v) for v in image_shape)
+    T = int(rotations.shape[0])
+    N = int(positions.shape[0])
+    for name, t in (("positions", positions), ("amplitudes", amplitudes), ("sigmas", sigmas)):
+        if t.dtype != torch.float32:
+            raise TypeError(
+                f"render_projections backend='cuda' is fp32-only ({name} is {t.dtype})"
+            )
+        if not t.is_cuda:
+            raise ValueError(
+                f"render_projections backend='cuda' needs CUDA tensors ({name} on {t.device})"
+            )
+    device, dtype = positions.device, positions.dtype
+    sig = sigmas.reshape(-1)
+    if sig.shape[0] == 1 and N != 1:
+        sig = sig.expand(N)
+    if N == 0:
+        out = torch.zeros(T, H, W, device=device, dtype=dtype)
+        return out if background is None else out + background.reshape(T, 1, 1)
+    s = float(sampling)
+    sig_px = sig / s  # widths in pixels
+    amp_px = amplitudes / (s * s)  # pixel-integrated mass
+    r = int(window_radius)
+    n_chunk = T if tilt_chunk is None else max(1, int(tilt_chunk))
+    parts = []
+    for t0 in range(0, T, n_chunk):
+        t1 = min(T, t0 + n_chunk)
+        centers = project_positions(positions, rotations[t0:t1], shifts[t0:t1], s, (H, W))
+        parts.append(stamp(centers.to(torch.float32), amp_px, sig_px, (H, W), r))
+    out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+    if background is not None:
+        out = out + background.reshape(T, 1, 1).to(dtype)
+    return out
+
+
 def render_projections(
     positions: "torch.Tensor",
     amplitudes: "torch.Tensor",
@@ -106,6 +224,7 @@ def render_projections(
     window_radius: int,
     background: "torch.Tensor | None" = None,
     tilt_chunk: int | None = None,
+    backend: str | None = None,
 ) -> "torch.Tensor":
     """Render tilt images of a set of isotropic Gaussians (differentiable in every tensor).
 
@@ -131,12 +250,33 @@ def render_projections(
         ``(T,)`` constant added to each image.
     tilt_chunk : int, optional
         Number of tilts rendered per pass (bounds memory); default all.
+    backend : str, optional
+        ``"torch"`` (this module) or ``"cuda"`` (the fused ``quantem.cuda`` stamp kernel; needs
+        fp32 CUDA tensors; falls back to torch with a one-time warning when ``quantem.cuda`` is
+        missing or lacks the op). Default: the environment variable ``SPLAT_RENDER_BACKEND``
+        read at call time, else ``"torch"``; from the environment, ``"cuda"`` is a preference
+        and CPU or non-fp32 inputs silently take the torch path.
 
     Returns
     -------
     Tensor
         ``(T, H, W)`` images.
     """
+    name, stamp = resolve_backend(backend, (positions, amplitudes, sigmas))
+    if name == "cuda":
+        return _render_projections_cuda(
+            stamp,
+            positions,
+            amplitudes,
+            sigmas,
+            rotations,
+            shifts,
+            sampling,
+            image_shape,
+            window_radius,
+            background,
+            tilt_chunk,
+        )
     H, W = (int(v) for v in image_shape)
     T = int(rotations.shape[0])
     N = int(positions.shape[0])
