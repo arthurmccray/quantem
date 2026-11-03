@@ -364,6 +364,20 @@ class TestObjectGaussianSplat:
         assert float(obj.apply_soft_constraints()) == pytest.approx(2.0 * 0.09, rel=1e-5)
         with pytest.raises(ValueError):
             obj.set_prior_target(torch.zeros(2, 3), 1.0)
+        # constant-gradient prior term (the energy prior, round 5): value 0 in the loss, gradient = the stored
+        # lam * dE/dx, "prior" soft loss logged as lam * E; it replaces the quadratic target and is cleared with it
+        g = torch.randn(obj._positions.shape, generator=torch.Generator().manual_seed(0))
+        obj.set_prior_gradient(g, value=-7.5)
+        assert obj._prior_target is None
+        loss = obj.apply_soft_constraints()
+        assert float(loss) == 0.0
+        (grad,) = torch.autograd.grad(loss, obj._positions)
+        assert torch.allclose(grad, g.to(grad), atol=1e-7)
+        assert float(obj.soft_constraint_loss["prior"]) == -7.5
+        with pytest.raises(ValueError):
+            obj.set_prior_gradient(torch.zeros(2, 3))
+        obj.set_prior_target(None, 0.0)
+        assert obj._prior_grad is None and float(obj.apply_soft_constraints()) == 0.0
 
     def test_obj_view_sum_matches_zero_tilt_render(self):
         obj = self._obj()

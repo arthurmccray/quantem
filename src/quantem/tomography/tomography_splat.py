@@ -9,6 +9,7 @@ runs on one device (CPU or a single GPU).
 """
 
 import math
+import time
 import warnings
 from dataclasses import dataclass, replace
 from typing import Callable, Literal, Protocol, Self
@@ -88,6 +89,17 @@ class PriorSchedule:
     lam_mode : {"relative", "relative_live", "absolute"}
     anneal_frac : float
         Fraction of ``num_iter`` over which tuple schedules anneal (then held).
+    lam_fade_start : float or None
+        If given, a tuple ``lam = (a, b)`` is held at ``a`` until this fraction of the run and then
+        anneals linearly to ``b`` at the end of the run (a late fade, e.g. ``(lam, 0)`` with 2/3 fades
+        the prior out over the last third), instead of annealing over the first ``anneal_frac``
+        like every other tuple schedule. ``None`` (the default) keeps the old behaviour.
+    sigma_mode : {"clock", "pull"}
+        "clock" (default): ``sigma`` follows the iteration clock. "pull": sigma_t is set at every call from the
+        previous call's measured pull, ``clamp(sigma_pull_scale * pull_rms_coord, min(sigma), max(sigma))``
+        (first call ``max(sigma)``); see ``sigma_at``.
+    sigma_pull_scale : float
+        The factor ``c`` of the "pull" mode (the pull underestimates the true error of a conservative denoiser).
     """
 
     every: int = 10
@@ -100,23 +112,65 @@ class PriorSchedule:
     stop: int = (
         10**9
     )  # no prior from this iteration on (data-only fine-tune, "three-stage" schedules)
-    mode: Literal["loss", "proximal"] = (
+    mode: Literal["loss", "proximal", "energy"] = (
         "loss"  # "proximal": move the atoms a fraction ``alpha`` of the
     )
-    # way to x̂ at every refresh (plug-and-play / RED style) instead of adding a loss term; ``lam`` unused
+    # way to x̂ at every refresh (plug-and-play / RED style) instead of adding a loss term; ``lam`` unused.
+    # "energy" (round 5 step 2, 2026-10-29): the prior is an energy (``prior.energy_and_forces(x)``, e.g.
+    # :class:`quantem.tomography.energy_prior.EnergyPrior`); ``lam * E(x)`` enters the loss as the constant
+    # gradient ``-lam * F(x)`` on the positions, refreshed every ``every`` iterations and held in between
+    # (as x̂ is held in "loss" mode). ``lam_mode`` as in "loss" mode: "relative" fixes lam once so that
+    # ``||lam * dE/dx|| = lam_rel * ||grad L_data||`` at the first application.
     alpha: float = 0.3
     # noise added to the current positions before each prior call, as a multiple of sigma_t (the
     # training corruption; 1.0 = the behaviour since chapter 01). 0.0 treats the positions as the
     # noisy state x_t themselves (round 4 step 6, 2026-10-28: the fresh noise sets a ~0.03 A floor).
     noise_scale: float = 1.0
+    # round 5 step 1 (2026-10-29): late fade of a tuple ``lam`` over [lam_fade_start * num_iter, num_iter]
+    lam_fade_start: float | None = None
+    # round 6 step 4 (2026-11-02): where sigma_t comes from. "clock" (the default): the tuple ``sigma`` anneals over
+    # ``anneal_frac`` of the run like every other tuple schedule. "pull": sigma_t is measured, not scheduled —
+    # ``sigma_t = clamp(sigma_pull_scale * e, min(sigma), max(sigma))`` with ``e`` the per-coordinate RMS of the
+    # prior's own pull at the PREVIOUS call (``rms over atoms of ||x_hat - x|| / sqrt(3)``, ``pull_rms_coord`` in the
+    # history); the first call (no previous pull) uses ``max(sigma)``. Needs a tuple ``sigma``; lam / fade / stop untouched.
+    sigma_mode: Literal["clock", "pull"] = "clock"
+    sigma_pull_scale: float = 1.0
+
+    def sigma_at(
+        self, it: int, num_iter: int, last_pull_rms_coord: float | None = None
+    ) -> float | None:
+        """The noise level sigma_t (Angstrom) for iteration ``it``; ``None`` when the schedule is given as ``t``."""
+        if self.sigma is None:
+            return None
+        if self.sigma_mode == "clock":
+            return _schedule_value(self.sigma, it, num_iter, self.anneal_frac)
+        if self.sigma_mode != "pull":
+            raise ValueError(f"sigma_mode must be 'clock' or 'pull', got {self.sigma_mode!r}")
+        if not isinstance(self.sigma, tuple):
+            raise ValueError("sigma_mode='pull' needs sigma=(s_max, s_min): the clamp range of the measured sigma_t")
+        lo, hi = min(self.sigma), max(self.sigma)
+        if last_pull_rms_coord is None:
+            return float(hi)
+        return float(min(max(self.sigma_pull_scale * float(last_pull_rms_coord), lo), hi))
 
     def at(
-        self, it: int, num_iter: int, prior: AtomPrior | None = None
+        self,
+        it: int,
+        num_iter: int,
+        prior: AtomPrior | None = None,
+        last_pull_rms_coord: float | None = None,
     ) -> tuple[float | None, float]:
-        """``(t, lam_raw)`` for iteration ``it`` (``lam_raw`` before the relative scaling)."""
-        lam = _schedule_value(self.lam, it, num_iter, self.anneal_frac)
+        """``(t, lam_raw)`` for iteration ``it`` (``lam_raw`` before the relative scaling); ``last_pull_rms_coord``
+        (the previous call's ``pull_rms_coord``) is used only by ``sigma_mode="pull"``."""
+        if self.lam_fade_start is not None and isinstance(self.lam, tuple):
+            a, b = self.lam
+            n0 = int(round(self.lam_fade_start * num_iter))
+            f = 0.0 if it <= n0 else min(1.0, (it - n0) / max(1, num_iter - n0))
+            lam = float(a + (b - a) * f)
+        else:
+            lam = _schedule_value(self.lam, it, num_iter, self.anneal_frac)
         if self.sigma is not None and prior is not None and hasattr(prior, "t_of_sigma"):
-            s = _schedule_value(self.sigma, it, num_iter, self.anneal_frac)
+            s = self.sigma_at(it, num_iter, last_pull_rms_coord)
             return float(prior.t_of_sigma(s)), lam  # type: ignore[attr-defined]
         if self.t is None:
             return None, lam
@@ -184,6 +238,27 @@ class DensifyParams:
     # variance and the whitened add then floods vacuum during the fill-in; chapter 06 round 3, S3vm 1e8); "max_smooth" =
     # the same with the image smoothed by a Gaussian of ``variance_blur_px`` pixels (no shot-noise bias at low dose)
     variance_blur_px: float = 1.5
+    # --- round 5 step 3 (chapter 07, 2026-10-29): the per-atom energy as the remove and add-vetting signal. Everything
+    # below is inert while ``energy_prior`` is None (every earlier run is reproduced unchanged). ---
+    energy_prior: object | None = None  # anything with ``per_atom_energy(x) -> (N,)`` in eV at positions ``x`` (N, 3) in
+    # Angstrom, e.g. :class:`quantem.tomography.energy_prior.EnergyPrior` (MACE); evaluated once per pass after the
+    # prune and merge steps at the current fitted positions, and once more on the residual add candidates
+    energy_prune_above: float = -2.4  # eV; an atom whose per-atom energy is above this is "unbound" (less bound than a
+    # CN-5 Au corner atom, -2.5 eV; step 2 §F.5: 99.5 % of the extra atoms of the S4bm 1e8 refit lie above it, 0.2 % of
+    # the matched atoms)
+    energy_prune_require_low_amp: bool = True  # AND with "low data support" = amplitude below
+    # ``energy_prune_amp_frac`` x the prune reference of this pass (the median amplitude, or its running maximum with
+    # prune_reference="max_median"): a splat the data do not hold decays between the uniformity resets, a held atom
+    # stays at the median. False = remove on the energy alone.
+    energy_prune_amp_frac: float = 0.9
+    energy_prune_max_frac: float | None = 0.2  # cap of the energy removals per pass (highest energies go first)
+    energy_vet_add: bool = True  # reject residual add candidates whose per-atom energy, evaluated in place with the
+    # candidates inserted among the current atoms (one forward per ``energy_vet_chunk`` candidates), is above the threshold
+    energy_vet_chunk: int = 4000
+    energy_start: int = 0  # first iteration at which the energy rule (prune and vet) applies; passes before it run as plain
+    # v1. A blind start fills its particle in during the first ~300 iterations, and on an incomplete particle the true atoms
+    # at the growing front read as unbound (the step-3 probe: every candidate the vet rejected at iteration 9-19 sat on a true
+    # site), so the rule is meant for the complete structure (the driver starts it at 500 by default).
 
     @classmethod
     def v2(cls, **kwargs) -> "DensifyParams":
@@ -240,6 +315,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
         self._prior_history: list[dict[str, float]] = []
         self._snapshots: list[dict] = []
         self._lam_scale: float | None = None
+        self._energy_term_history: list[dict[str, float]] = []  # round 5 step 4: the energy term beside the prior
+        self._lam_scale_energy: float | None = None
         return self
 
     # region --- properties ---
@@ -266,6 +343,17 @@ class TomographySplat(TomographyOpt, TomographyBase):
     @property
     def prior_history(self) -> list[dict[str, float]]:
         return self._prior_history
+
+    @property
+    def energy_term_history(self) -> list[dict[str, float]]:
+        """Round 5 step 4: one record per refresh of the energy term given to :meth:`reconstruct` as
+        ``energy_prior`` / ``energy_schedule`` (the second prior term, beside ``prior``)."""
+        return getattr(self, "_energy_term_history", [])
+
+    @property
+    def energy_history(self) -> list[dict]:
+        """Round 5 step 3: one record per energy prune pass ("prune") and per add-vetting call ("vet")."""
+        return list(getattr(self, "_energy_history", []))
 
     @property
     def snapshots(self) -> list[dict]:
@@ -295,6 +383,52 @@ class TomographySplat(TomographyOpt, TomographyBase):
         data_loss = loss_func(pred, target)
         (g,) = torch.autograd.grad(data_loss, self.obj_model._positions, allow_unused=True)
         return 0.0 if g is None else float(g.norm())
+
+    def _apply_energy_prior(
+        self,
+        prior,
+        prior_schedule: "PriorSchedule",
+        it: int,
+        lam_raw: float,
+        x: torch.Tensor,
+        grad_args,
+        second_term: bool = False,
+    ) -> None:
+        """``mode="energy"``: one ``energy_and_forces`` call, ``lam * dE/dx`` stored as a constant gradient.
+        ``second_term`` (round 5 step 4): the energy runs beside the quadratic prior target, which is kept; its
+        relative-lam scale and history are its own (``_lam_scale_energy``, ``energy_term_history``)."""
+        if not hasattr(prior, "energy_and_forces"):
+            raise TypeError(
+                f"PriorSchedule(mode='energy') needs a prior with energy_and_forces(x); got {type(prior).__name__}"
+            )
+        e_total, e_atom, forces = prior.energy_and_forces(x)
+        forces = forces.to(x)
+        g_prior_unit = float(forces.norm())  # ||dE/dx|| at lam = 1
+        scale_attr = "_lam_scale_energy" if second_term else "_lam_scale"
+        if prior_schedule.lam_mode in ("relative", "relative_live"):
+            if getattr(self, scale_attr, None) is None or prior_schedule.lam_mode == "relative_live":
+                g_data = self._positions_grad_norm_data(*grad_args)
+                setattr(self, scale_attr, g_data / g_prior_unit if g_prior_unit > 0 else 1.0)
+            lam = lam_raw * getattr(self, scale_attr)
+        else:
+            lam = lam_raw
+        self.obj_model.set_prior_gradient(-lam * forces, lam * float(e_total), keep_target=second_term)
+        fnorm = forces.norm(dim=-1)
+        if second_term and not hasattr(self, "_energy_term_history"):
+            self._energy_term_history = []
+        (self._energy_term_history if second_term else self._prior_history).append(
+            {
+                "iteration": it,
+                "t": -1.0,
+                "lam": float(lam),
+                "energy": float(e_total),
+                "energy_per_atom": float(e_total) / max(x.shape[0], 1),
+                "fmax": float(fnorm.max()) if fnorm.numel() else 0.0,
+                "force_rms": float(fnorm.pow(2).mean().sqrt()) if fnorm.numel() else 0.0,
+                "grad_norm_prior": float(lam * g_prior_unit),
+            }
+        )
+        self._last_energy_per_atom = e_atom.detach()
 
     def _snapshot(self, it: int) -> dict:
         shifts, z1, z3, dtilt = (v.detach().cpu().numpy() for v in self.dset.forward(None))
@@ -389,6 +523,13 @@ class TomographySplat(TomographyOpt, TomographyBase):
         if params.merge_distance:
             out["merged"] = obj.merge(float(params.merge_distance), params.merge_amplitude)
             if out["merged"] and need_render:
+                target, rot, shifts, pred = render()
+        energy_on = params.energy_prior is not None and it >= params.energy_start
+        if energy_on:
+            # round 5 step 3: remove unbound atoms (per-atom energy above the threshold, AND low amplitude unless disabled)
+            out["removed_energy"] = self._energy_prune(it, params) if obj.num_atoms > 1 else 0
+            out["rejected_energy"] = 0
+            if out["removed_energy"] and need_render:
                 target, rot, shifts, pred = render()
         if params.add_from_residual or params.remove_whitened_sigmas > 0:
             v = float(params.voxel_size) if params.voxel_size else 2.0 * sampling
@@ -501,6 +642,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
                     if params.max_add_frac is not None and obj.num_atoms:
                         cap = max(1, int(params.max_add_frac * obj.num_atoms))
                         pos = pos[:cap]  # seed_peaks returns peaks strongest first
+                    if energy_on and params.energy_vet_add and pos.shape[0] and obj.num_atoms:
+                        pos, out["rejected_energy"] = self._energy_vet_candidates(it, params, pos)
                     out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
                     if params.split_from_residual and rejected.shape[0]:
                         out["split"] = self._split_fat_atoms(rejected, rejected_nn, params)
@@ -508,6 +651,84 @@ class TomographySplat(TomographyOpt, TomographyBase):
             out["cloned"] = self._clone_atoms(*clone_sel, params)
         self._reset_grad_accumulators()
         return out
+
+    # --- per-atom energy as the remove / add-vetting signal (round 5 step 3, chapter 07) ---
+    _ENERGY_HIST_EDGES = (-4.0, 2.0, 120)  # eV: min, max, bins of the per-pass energy histogram kept in the history
+
+    def _energy_history_append(self, rec: dict) -> None:
+        if not hasattr(self, "_energy_history"):
+            self._energy_history: list[dict] = []
+        self._energy_history.append(rec)
+
+    @torch.no_grad()
+    def _energy_prune(self, it: int, params: DensifyParams) -> int:
+        """Remove the atoms whose per-atom energy at the current positions is above ``params.energy_prune_above`` (eV)
+        and, unless ``energy_prune_require_low_amp`` is False, whose amplitude is below ``energy_prune_amp_frac`` x the
+        CURRENT median amplitude (not the prune step's running-maximum reference: early in a blind start every amplitude
+        decays from a too-bright init, and only an atom weaker than its peers lacks data support); at most
+        ``energy_prune_max_frac`` of the atoms per pass, highest energies first. Logs the count, the energies, the
+        relative amplitudes and the positions of the removed atoms and a histogram of all energies to
+        ``self._energy_history``. Returns the number removed."""
+        obj = self.obj_model
+        x = obj._positions.detach()
+        amp = obj.amplitudes.detach()
+        amp_ref = float(amp.median())
+        t0 = time.perf_counter()
+        e = params.energy_prior.per_atom_energy(x).detach().to(device=x.device, dtype=torch.float32).reshape(-1)  # type: ignore[attr-defined]
+        mace_s = time.perf_counter() - t0
+        if e.shape[0] != x.shape[0]:
+            raise ValueError(f"per_atom_energy returned {e.shape[0]} values for {x.shape[0]} atoms")
+        high = e > params.energy_prune_above
+        low_amp = amp < params.energy_prune_amp_frac * amp_ref
+        marked = (high & low_amp) if params.energy_prune_require_low_amp else high
+        keep = self._cap_removals(~marked, -e, params.energy_prune_max_frac)
+        removed = ~keep
+        lo, hi, nb = self._ENERGY_HIST_EDGES
+        rel = amp / amp_ref
+        rec = {
+            "kind": "prune", "iteration": it, "n_atoms": int(x.shape[0]), "threshold_eV": float(params.energy_prune_above),
+            "require_low_amp": bool(params.energy_prune_require_low_amp), "amp_frac": float(params.energy_prune_amp_frac),
+            "amp_ref": float(amp_ref), "n_above": int(high.sum()), "n_above_low_amp": int((high & low_amp).sum()),
+            "n_marked": int(marked.sum()), "n_removed": int(removed.sum()), "capped": bool(int(removed.sum()) < int(marked.sum())),
+            "energies_removed_eV": [round(v, 4) for v in e[removed].tolist()],
+            "amp_rel_removed": [round(v, 3) for v in rel[removed].tolist()],
+            "amp_rel_above_kept": [round(v, 3) for v in rel[high & keep].tolist()],
+            "positions_removed_A": [[round(c, 3) for c in row] for row in x[removed].tolist()],
+            "hist_all_edges_eV": [lo, hi, nb],
+            "hist_all": [int(v) for v in torch.histc(e.clamp(lo, hi), bins=nb, min=lo, max=hi).tolist()],
+            "e_p50_eV": float(e.median()), "mace_s": mace_s,
+        }  # fmt: skip
+        self._energy_history_append(rec)
+        return obj.prune(keep)
+
+    @torch.no_grad()
+    def _energy_vet_candidates(self, it: int, params: DensifyParams, cand: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Per-atom energy of every residual add candidate evaluated in place (the candidates inserted among the current
+        atoms, ``energy_vet_chunk`` candidates per forward; candidates of one chunk see each other); candidates above
+        ``energy_prune_above`` are rejected. Returns ``(accepted candidates, number rejected)``."""
+        obj = self.obj_model
+        x = obj._positions.detach()
+        n = int(x.shape[0])
+        c_dev = cand.to(x)
+        t0 = time.perf_counter()
+        es = []
+        for i0 in range(0, int(c_dev.shape[0]), max(1, int(params.energy_vet_chunk))):
+            chunk = c_dev[i0 : i0 + max(1, int(params.energy_vet_chunk))]
+            e = params.energy_prior.per_atom_energy(torch.cat([x, chunk], dim=0))  # type: ignore[attr-defined]
+            es.append(e.detach().to(device=x.device, dtype=torch.float32).reshape(-1)[n:])
+        e = torch.cat(es)
+        mace_s = time.perf_counter() - t0
+        ok = (e <= params.energy_prune_above).to(cand.device)
+        rec = {
+            "kind": "vet", "iteration": it, "n_atoms": n, "threshold_eV": float(params.energy_prune_above),
+            "n_candidates": int(cand.shape[0]), "n_rejected": int((~ok).sum()),
+            "energies_rejected_eV": [round(v, 4) for v in e[~ok.to(e.device)].tolist()],
+            "energies_accepted_eV": [round(v, 4) for v in e[ok.to(e.device)].tolist()],
+            "positions_rejected_A": [[round(c, 3) for c in row] for row in cand[~ok].tolist()],
+            "mace_s": mace_s,
+        }  # fmt: skip
+        self._energy_history_append(rec)
+        return cand[ok], int((~ok).sum())
 
     # --- gradient-clone add rule (chapter 06 round 3) ---
     def _reset_grad_accumulators(self) -> None:
@@ -660,6 +881,8 @@ class TomographySplat(TomographyOpt, TomographyBase):
         uniform_window: tuple[float, float] | None = None,
         species_reset_every: int = 0,
         pose_l1: tuple[float, float] = (0.0, 0.0),
+        energy_prior=None,
+        energy_schedule: PriorSchedule | None = None,
     ) -> Self:
         """
         Fit the atoms (and poses) to the tilt series.
@@ -689,6 +912,13 @@ class TomographySplat(TomographyOpt, TomographyBase):
         pose_l1 : (float, float)
             L1 penalty on the learned pose corrections, added to the loss while poses are learned:
             ``w_shift * mean_k |shift_k|_1`` (pixels) ``+ w_angle * mean_k (|z1_k| + |z3_k| + |dtilt_k|)`` (degrees).
+        energy_prior, energy_schedule
+            Round 5 step 4: a second prior term, an energy (``energy_and_forces(x)``, e.g.
+            :class:`~quantem.tomography.energy_prior.EnergyPrior`) with its own :class:`PriorSchedule`
+            (``mode`` is taken as "energy"), applied beside ``prior`` (typically the learned denoiser in
+            "loss" mode): ``lam * E(x)`` enters the loss as a constant gradient refreshed every
+            ``energy_schedule.every`` iterations, and the quadratic target of ``prior`` is kept. ``None``
+            (the default) = no second term. Records in :attr:`energy_term_history`.
         """
         if reset:
             self.obj_model.reset()
@@ -812,45 +1042,79 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 and prior_schedule.start <= it < prior_schedule.stop
                 and ((it - prior_schedule.start) % max(1, prior_schedule.every) == 0)
             ):
-                t, lam_raw = prior_schedule.at(it, schedule_total or num_iter, prior)
-                x = self.obj_model._positions.detach()
-                x_hat = prior.clean_estimate(
-                    x, t=t, **({"noise_scale": prior_schedule.noise_scale} if hasattr(prior, "t_of_sigma") else {})
-                ).to(x)
-                pull = (x_hat - x).norm(dim=-1)
-                if prior_schedule.mode == "proximal":
-                    with torch.no_grad():
-                        self.obj_model._positions.add_(prior_schedule.alpha * (x_hat - x))
-                    self.obj_model.set_prior_target(None, 0.0)
-                    lam = 0.0
-                elif prior_schedule.lam_mode in ("relative", "relative_live"):
-                    # "relative": the data/prior gradient-norm ratio is measured once, at the first
-                    # application; "relative_live": re-measured at every application, so lam_rel keeps
-                    # its meaning when the prior starts late on an already-converged fit
-                    if self._lam_scale is None or prior_schedule.lam_mode == "relative_live":
-                        g_data = self._positions_grad_norm_data(
-                            loss_func, image_shape, sampling, window_sigmas, tilt_chunk
-                        )
-                        g_prior_unit = 2.0 * float(pull.norm()) / max(x.shape[0], 1)
-                        self._lam_scale = g_data / g_prior_unit if g_prior_unit > 0 else 1.0
-                    lam = lam_raw * self._lam_scale
-                else:
-                    lam = lam_raw
-                if prior_schedule.mode != "proximal":
-                    self.obj_model.set_prior_target(x_hat, lam)
-                self._prior_history.append(
-                    {
-                        "iteration": it,
-                        "t": -1.0 if t is None else float(t),
-                        "lam": float(lam),
-                        "pull_mean": float(pull.mean()),
-                        "pull_max": float(pull.max()),
-                        "pull_frac_gt_0p5": float((pull > 0.5).float().mean()),
-                    }
+                # round 6 step 4: sigma_mode="pull" reads the previous call's per-coordinate RMS pull (None at the first call)
+                last_pull_rms = getattr(self, "_last_pull_rms_coord", None)
+                t, lam_raw = prior_schedule.at(it, schedule_total or num_iter, prior, last_pull_rms)
+                sigma_t = (
+                    prior_schedule.sigma_at(it, schedule_total or num_iter, last_pull_rms)
+                    if prior_schedule.sigma is not None and hasattr(prior, "t_of_sigma")
+                    else None
                 )
+                x = self.obj_model._positions.detach()
+                if prior_schedule.mode == "energy":
+                    self._apply_energy_prior(
+                        prior, prior_schedule, it, lam_raw, x,
+                        (loss_func, image_shape, sampling, window_sigmas, tilt_chunk),
+                    )
+                else:
+                    x_hat = prior.clean_estimate(
+                        x, t=t, **({"noise_scale": prior_schedule.noise_scale} if hasattr(prior, "t_of_sigma") else {})
+                    ).to(x)
+                    pull = (x_hat - x).norm(dim=-1)
+                    if prior_schedule.mode == "proximal":
+                        with torch.no_grad():
+                            self.obj_model._positions.add_(prior_schedule.alpha * (x_hat - x))
+                        self.obj_model.clear_prior_target(keep_gradient=energy_prior is not None)
+                        lam = 0.0
+                    elif prior_schedule.lam_mode in ("relative", "relative_live"):
+                        # "relative": the data/prior gradient-norm ratio is measured once, at the first
+                        # application; "relative_live": re-measured at every application, so lam_rel keeps
+                        # its meaning when the prior starts late on an already-converged fit
+                        if self._lam_scale is None or prior_schedule.lam_mode == "relative_live":
+                            g_data = self._positions_grad_norm_data(
+                                loss_func, image_shape, sampling, window_sigmas, tilt_chunk
+                            )
+                            g_prior_unit = 2.0 * float(pull.norm()) / max(x.shape[0], 1)
+                            self._lam_scale = g_data / g_prior_unit if g_prior_unit > 0 else 1.0
+                        lam = lam_raw * self._lam_scale
+                    else:
+                        lam = lam_raw
+                    if prior_schedule.mode != "proximal":
+                        self.obj_model.set_prior_target(x_hat, lam)
+                    # per-coordinate RMS of the pull (rms over atoms of ||x_hat - x|| / sqrt(3)): the error measure of
+                    # sigma_mode="pull" at the next call, recorded in every mode (round 6 step 4)
+                    pull_rms_coord = float(pull.pow(2).mean().sqrt() / math.sqrt(3.0))
+                    self._last_pull_rms_coord = pull_rms_coord
+                    self._prior_history.append(
+                        {
+                            "iteration": it,
+                            "t": -1.0 if t is None else float(t),
+                            "sigma": -1.0 if sigma_t is None else float(sigma_t),
+                            "lam": float(lam),
+                            "pull_mean": float(pull.mean()),
+                            "pull_max": float(pull.max()),
+                            "pull_rms_coord": pull_rms_coord,
+                            "pull_frac_gt_0p5": float((pull > 0.5).float().mean()),
+                        }
+                    )
 
             if prior is not None and prior_schedule is not None and it == prior_schedule.stop:
-                self.obj_model.set_prior_target(None, 0.0)
+                self.obj_model.clear_prior_target(keep_gradient=energy_prior is not None)
+
+            # --- the energy term beside the prior (round 5 step 4) ---
+            if (
+                energy_prior is not None
+                and energy_schedule is not None
+                and energy_schedule.start <= it < energy_schedule.stop
+                and ((it - energy_schedule.start) % max(1, energy_schedule.every) == 0)
+            ):
+                _, lam_raw_e = energy_schedule.at(it, schedule_total or num_iter, None)
+                self._apply_energy_prior(
+                    energy_prior, energy_schedule, it, lam_raw_e, self.obj_model._positions.detach(),
+                    (loss_func, image_shape, sampling, window_sigmas, tilt_chunk), second_term=True,
+                )
+            if energy_prior is not None and energy_schedule is not None and it == energy_schedule.stop:
+                self.obj_model.set_prior_gradient(None, keep_target=True)
             if (uniform_every and (it + 1) % uniform_every == 0) or (
                 species_reset_every and (it + 1) % species_reset_every == 0
             ):

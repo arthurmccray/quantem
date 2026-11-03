@@ -1145,6 +1145,10 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._init_state: dict[str, torch.Tensor | None] = {}
         self._prior_target: torch.Tensor | None = None
         self._prior_lambda: float = 0.0
+        # round 5 step 2 (2026-10-29): a constant gradient on the positions (the energy prior, ``lam * dE/dx``
+        # held between MACE calls) and the value ``lam * E`` it stands for, logged as the "prior" soft loss
+        self._prior_grad: torch.Tensor | None = None
+        self._prior_grad_value: float = 0.0
         self._pair_idx: torch.Tensor | None = None
         self._l1_ref: float | None = None
 
@@ -1527,6 +1531,16 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             )
             self.add_soft_constraint_loss("prior", term)
             loss = loss + term
+        if self._prior_grad is not None:
+            # linear term whose gradient is the stored ``lam * dE/dx``; its value is 0 by construction so the
+            # loss history stays comparable with runs without the energy term (``lam * E`` is logged instead;
+            # as "energy" when it runs beside a quadratic target, round 5 step 4)
+            g = self._prior_grad
+            term = (g * (self._positions - self._positions.detach())).sum()
+            self.add_soft_constraint_loss(
+                "prior" if self._prior_target is None else "energy", float(self._prior_grad_value)
+            )
+            loss = loss + term
         return loss
 
     def get_tv_loss(self, ctx: ReconstructionContext) -> torch.Tensor:
@@ -1535,8 +1549,7 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
     def set_prior_target(self, target: torch.Tensor | None, lam: float) -> None:
         """Store a detached clean-position estimate ``x_hat`` and its weight (``None`` clears it)."""
         if target is None:
-            self._prior_target = None
-            self._prior_lambda = 0.0
+            self.clear_prior_target()
             return
         if target.shape != self._positions.shape:
             raise ValueError(
@@ -1545,9 +1558,35 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._prior_target = target.detach().to(self._positions)
         self._prior_lambda = float(lam)
 
-    def clear_prior_target(self) -> None:
+    def clear_prior_target(self, keep_gradient: bool = False) -> None:
+        """Clear the quadratic target; also the stored energy gradient unless ``keep_gradient`` (round 5 step 4:
+        the two terms may run side by side)."""
         self._prior_target = None
         self._prior_lambda = 0.0
+        if not keep_gradient:
+            self._prior_grad = None
+            self._prior_grad_value = 0.0
+
+    def set_prior_gradient(
+        self, grad: torch.Tensor | None, value: float = 0.0, keep_target: bool = False
+    ) -> None:
+        """Store a constant gradient ``lam * dE/dx`` ``(N, 3)`` on the positions (the energy prior; ``None``
+        clears it) and the value ``lam * E`` it belongs to (logged as the "prior" soft loss). The quadratic
+        target of :meth:`set_prior_target` is cleared unless ``keep_target`` (round 5 step 4: the energy term
+        beside the learned prior); by default the two are alternative prior terms."""
+        if not keep_target:
+            self._prior_target = None
+            self._prior_lambda = 0.0
+        if grad is None:
+            self._prior_grad = None
+            self._prior_grad_value = 0.0
+            return
+        if grad.shape != self._positions.shape:
+            raise ValueError(
+                f"prior gradient shape {tuple(grad.shape)} != {tuple(self._positions.shape)}"
+            )
+        self._prior_grad = grad.detach().to(self._positions)
+        self._prior_grad_value = float(value)
 
     def refresh_neighbors(self, min_distance: float | None = None) -> None:
         """Cache the atom pairs closer than ``min_distance`` (default: the constraint value)."""
@@ -1591,6 +1630,7 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             remap_optimizer_state(self.optimizer, old, new, keep_idx, n_new)
         self._positions, self._log_amplitudes, self._log_sigmas = p_new, a_new, s_new
         self._prior_target = None
+        self._prior_grad = None
         self._pair_idx = None
 
     def prune(self, keep_mask: torch.Tensor) -> int:
@@ -1676,6 +1716,8 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._box_half = self._box_half.to(dev)
         if self._prior_target is not None:
             self._prior_target = self._prior_target.to(dev)
+        if self._prior_grad is not None:
+            self._prior_grad = self._prior_grad.to(dev)
         if self._pair_idx is not None:
             self._pair_idx = self._pair_idx.to(dev)
         self._rng_to_device(dev)
