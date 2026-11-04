@@ -650,3 +650,187 @@ def test_pose_l1_penalty_holds_the_learned_shift_at_zero(five_atom_series):
         learned[w] = float(rec.dset.forward(None)[0][0, 0].detach())
     assert learned[0.0] > 0.5, f"without the penalty the shift must follow the data, got {learned[0.0]:.3f} px"
     assert abs(learned[1.0]) < 0.3 * learned[0.0], f"the L1 penalty must hold the shift near 0, got {learned[1.0]:.3f} px"
+
+
+# --- chapter 10 step 4: the candidate classifiers in the densify pass (stub models, no checkpoints) ---
+_A_FCC = 4.0729  # first-shell distance 2.88 A
+
+
+@pytest.fixture(scope="module")
+def cubocta_series():
+    """A 13-atom cuboctahedron (a centre and its 12 first-shell neighbours), 7 tilts of 32 x 32 px."""
+    h = _A_FCC / 2
+    shell = [(sx * h, sy * h, 0.0) for sx in (-1, 1) for sy in (-1, 1)]
+    shell += [(sx * h, 0.0, sz * h) for sx in (-1, 1) for sz in (-1, 1)]
+    shell += [(0.0, sy * h, sz * h) for sy in (-1, 1) for sz in (-1, 1)]
+    gt = torch.tensor([(0.0, 0.0, 0.0)] + shell)
+    tilts = np.arange(-60.0, 61.0, 20.0)
+    rot = pose_to_rotations(
+        torch.tensor(tilts, dtype=torch.float32), torch.zeros(len(tilts)), torch.zeros(len(tilts))
+    )
+    imgs = render_projections(gt, torch.full((13,), 1.7e-3), torch.full((13,), SIGMA), rot,
+                              torch.zeros(len(tilts), 2), SAMPLING, (32, 32),
+                              window_radius_for(SIGMA, SAMPLING)).numpy()  # fmt: skip
+    return gt, tilts, imgs
+
+
+class _StubAddModel:
+    """Add classifier stand-in: p = 1 for candidates within 0.5 A of ``sites``, 0 elsewhere."""
+
+    d1 = 2.88
+
+    def __init__(self, sites):
+        self.sites = torch.as_tensor(np.asarray(sites), dtype=torch.float32).reshape(-1, 3)
+        self.calls = []
+
+    def score_candidates(self, atoms, candidates, d1=None):
+        self.calls.append(int(candidates.shape[0]))
+        d = torch.cdist(candidates.float(), self.sites.to(candidates.device)).min(dim=1).values
+        return (d < 0.5).float()
+
+
+class _StubRemoveModel:
+    """Remove classifier stand-in: p_real = ``p`` for atoms within 0.3 A of ``sites[k]``, 0.9 elsewhere."""
+
+    d1 = 2.88
+
+    def __init__(self, sites, p):
+        self.sites = torch.as_tensor(np.asarray(sites), dtype=torch.float32).reshape(-1, 3)
+        self.p = torch.as_tensor(p, dtype=torch.float32)
+
+    def score_atoms(self, atoms, d1=None):
+        d, k = torch.cdist(atoms.float(), self.sites.to(atoms.device)).min(dim=1)
+        return torch.where(d < 0.3, self.p.to(atoms.device)[k], torch.full_like(d, 0.9))
+
+
+class _NeverCalled:
+    d1 = 2.88
+
+    def score_candidates(self, *a, **k):
+        raise AssertionError("the add model must not be called")
+
+    def score_atoms(self, *a, **k):
+        raise AssertionError("the remove model must not be called")
+
+
+def _cls_params(**kw):
+    base = dict(every=1, start=0, prune_amplitude_frac=0.0, voxel_size=SAMPLING, cand_start=0)
+    return DensifyParams.v1(**{**base, **kw})
+
+
+def test_classifier_add_inserts_a_weak_tagged_atom_only_where_the_model_says(cubocta_series):
+    gt, tilts, imgs = cubocta_series
+    site = gt[1].numpy()  # a shell atom, removed
+    rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=np.delete(gt.numpy(), 1, 0), sigma_init=SIGMA,
+                                           device="cpu", rng=0)  # fmt: skip
+    stub = _StubAddModel(site)
+    rec.reconstruct(num_iter=1, learn_pose=False,
+                    densify=_cls_params(add_from_residual=True, add_method="classifier", cand_add_model=stub))  # fmt: skip
+    obj = rec.obj_model
+    assert len(stub.calls) == 1 and stub.calls[0] >= 10, f"the generator must propose more than the one site: {stub.calls}"
+    assert obj.num_atoms == 13, "exactly the one site with p = 1 must be added"
+    assert np.linalg.norm(obj.positions[-1] - site) < 0.5
+    amps, sig = obj.amplitudes.detach(), obj.sigmas.detach()
+    assert float(amps[-1]) == pytest.approx(0.3 * float(amps[:12].median()), rel=1e-5)
+    assert float(sig[-1]) == pytest.approx(float(sig[:12].median()), rel=1e-5)
+    assert obj._atom_tags.tolist() == [-1] * 12 + [0], "the added atom is tagged with its add iteration"
+    h, c = rec._densify_history[-1], rec.cand_history[-1]
+    assert h["added"] == 0 and h["added_classifier"] == 1, "the residual add is replaced, not run beside"
+    assert c["n_candidates"] == stub.calls[0] and c["n_accepted"] == 1 and c["n_added"] == 1
+    # below the amplitude-prune bar before it is judged: the amplitude prune leaves it to the data confirmation
+    with torch.no_grad():
+        obj._log_amplitudes[-1] -= 5.0
+    rec.reconstruct(num_iter=1, learn_pose=False,
+                    densify=_cls_params(add_from_residual=True, add_method="classifier", cand_add_model=stub,
+                                        prune_amplitude_frac=0.2))  # fmt: skip
+    c = rec.cand_history[-1]
+    assert obj.num_atoms == 13 and obj._atom_tags.tolist() == [-1] * 12 + [0], "an unjudged add must not be pruned"
+    assert (c["n_prune_exempt_unjudged"], c["n_pruned_unjudged"], c["n_added"]) == (1, 0, 0)
+
+
+def test_data_confirmation_judges_added_atoms_and_the_uniform_reset_leaves_them_alone(cubocta_series):
+    gt, tilts, imgs = cubocta_series
+    site_a, site_b = gt[1].numpy(), gt[4].numpy()  # opposite shell atoms, both removed
+    rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=np.delete(gt.numpy(), [1, 4], 0), sigma_init=SIGMA,
+                                           device="cpu", rng=0)  # fmt: skip
+    params = _cls_params(add_from_residual=True, add_method="classifier", cand_add_model=_StubAddModel([site_a, site_b]),
+                         cand_confirm_iters=2)  # fmt: skip
+    rec.reconstruct(num_iter=1, learn_pose=False, densify=params)
+    obj = rec.obj_model
+    assert obj.num_atoms == 13 and obj._atom_tags.tolist() == [-1] * 11 + [0, 0]
+    ia = 11 + int(np.linalg.norm(obj.positions[11:] - site_a, axis=1).argmin())
+    with torch.no_grad():  # site a: inside the uniform window (0.5-2) but below the bar 0.6; site b: above the bar
+        med = float(obj._log_amplitudes[:11].median())
+        obj._log_amplitudes[ia] = med + np.log(0.55)
+        obj._log_amplitudes[23 - ia] = med + np.log(0.9)
+    rec.reconstruct(num_iter=1, learn_pose=False, densify=params, uniform_every=1, uniform_window=(0.5, 2.0))
+    amps = obj.amplitudes.detach()
+    rel_a = float(amps[ia] / amps[:11].median())
+    assert 0.5 < rel_a < 0.6, f"the uniform reset must not lift an unconfirmed atom (rel amplitude {rel_a:.3f})"
+    assert rec.cand_history[-1]["n_confirmed"] == 0 and obj.num_atoms == 13, "not judged before cand_confirm_iters"
+    rec.reconstruct(num_iter=1, learn_pose=False, densify=params, uniform_every=1, uniform_window=(0.5, 2.0))
+    c, pos = rec.cand_history[-1], obj.positions
+    assert (c["n_confirmed"], c["n_rejected_data"], c["added_at_judged"]) == (1, 1, [0])
+    assert obj.num_atoms == 12 and obj._atom_tags.tolist() == [-1] * 12
+    assert np.linalg.norm(pos - site_a, axis=1).min() > 1.0, "the weak atom is rejected by the data"
+    assert np.linalg.norm(pos - site_b, axis=1).min() < 0.5, "the strong atom is confirmed"
+    assert c["n_blocked"] >= 1 and c["n_added"] == 0, "the rejected site must not be proposed again"
+    amps = obj.amplitudes_np
+    assert np.ptp(amps) < 1e-6 * amps.mean(), "a confirmed atom takes part in the uniform reset again"
+
+
+def test_classifier_remove_needs_low_p_and_low_amplitude_and_respects_the_cap(cubocta_series):
+    gt, tilts, imgs = cubocta_series
+    s1, s2 = np.array([0.0, 0.0, 5.0]), np.array([5.0, 0.0, 0.0])  # two off-lattice splats
+    init = np.vstack([gt.numpy(), s1, s2])  # 15 atoms; atom 1 (real, p_real 0.9) is weak in every case
+    stub = _StubRemoveModel([s1, s2], [0.05, 0.2])
+    for case, s2_weak, max_frac, s2_tag, kept in (
+        ("both spurious atoms weak: both removed", True, None, False, [False, False]),
+        ("s2 at the median amplitude: kept", False, None, False, [False, True]),
+        ("cap 10 % of 15 = 1 removal, lowest p first", True, 0.1, False, [False, True]),
+        ("an unconfirmed classifier add is left to the data", True, None, True, [False, True]),
+    ):
+        rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=init, sigma_init=SIGMA, device="cpu", rng=0)
+        obj = rec.obj_model
+        with torch.no_grad():
+            for i in [1, 13] + ([14] if s2_weak else []):
+                obj._log_amplitudes[i] -= 1.0  # 0.37 x the median
+        if s2_tag:
+            obj._atom_tags = torch.tensor([-1] * 14 + [0])
+        rec.reconstruct(num_iter=1, learn_pose=False,
+                        densify=_cls_params(prune_method="classifier", cand_rm_model=stub, cand_rm_max_frac=max_frac))  # fmt: skip
+        pos = obj.positions
+        got = [bool(np.linalg.norm(pos - s, axis=1).min() < 0.3) for s in (s1, s2)]
+        assert got == kept, case
+        assert obj.num_atoms == 13 + sum(kept), case
+        assert np.linalg.norm(pos - gt.numpy()[1], axis=1).min() < 0.3, f"{case}: a weak real atom is kept"
+        c = rec.cand_history[-1]
+        assert c["n_removed_classifier"] == 2 - sum(kept) and c["rm_capped"] == (max_frac is not None), case
+
+
+def test_classifier_options_at_their_defaults_reproduce_the_residual_bookkeeping(cubocta_series):
+    """Defaults (and the classifier methods before cand_start) must give the chapter-09 densify pass exactly."""
+    gt, tilts, imgs = cubocta_series
+    init = np.vstack([np.delete(gt.numpy(), 1, 0), [[0.0, 0.0, 5.0]]])  # one site missing, one vacuum splat
+    out = {}
+    for case, kw in (
+        ("chapter 09", {}),
+        ("explicit defaults with models present", dict(add_method="residual", prune_method="amplitude",
+                                                       cand_add_model=_NeverCalled(), cand_rm_model=_NeverCalled())),
+        ("classifier methods before cand_start", dict(add_method="classifier", prune_method="classifier", cand_start=10,
+                                                      cand_add_model=_NeverCalled(), cand_rm_model=_NeverCalled())),
+    ):  # fmt: skip
+        rec = TomographyLiteSplat.from_dataset(imgs, tilts, SAMPLING, init=init, sigma_init=SIGMA, device="cpu", rng=0)
+        with torch.no_grad():
+            rec.obj_model._log_amplitudes[-1] -= 2.0
+        base = dict(every=1, start=0, prune_amplitude_frac=0.2, merge_distance=1.5, add_from_residual=True,
+                    split_from_residual=True, max_add_frac=0.5, voxel_size=SAMPLING)  # fmt: skip
+        rec.reconstruct(num_iter=3, learn_pose=False, densify=DensifyParams.v1(**{**base, **kw}),
+                        uniform_every=1, uniform_window=(0.5, 2.0))  # fmt: skip
+        o = rec.obj_model
+        out[case] = (o._positions.detach().clone(), o._log_amplitudes.detach().clone(), rec._densify_history)
+        assert rec.cand_history == [] and o._atom_tags is None, case
+    ref = out["chapter 09"]
+    assert ref[0].shape[0] == 13 and sum(h["added"] for h in ref[2]) == 1 and sum(h["pruned"] for h in ref[2]) == 1
+    for case, (p, a, h) in out.items():
+        assert torch.equal(p, ref[0]) and torch.equal(a, ref[1]) and h == ref[2], case

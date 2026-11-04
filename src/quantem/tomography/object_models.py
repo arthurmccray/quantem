@@ -1151,6 +1151,11 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
         self._prior_grad_value: float = 0.0
         self._pair_idx: torch.Tensor | None = None
         self._l1_ref: float | None = None
+        # chapter 10 (2026-11-03): an optional per-atom integer tag (N,) that follows the atoms through every
+        # re-indexing (prune, merge, add, split, clone all go through ``_rebuild``; kept rows keep their tag, new
+        # rows get -1). None (the default) = no tags, nothing tracked. The candidate-classifier bookkeeping stores
+        # the add iteration of every unconfirmed classifier-added atom here.
+        self._atom_tags: torch.Tensor | None = None
 
     # region --- factories ---
     @classmethod
@@ -1628,6 +1633,12 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             (self._log_sigmas, s_new),
         ):
             remap_optimizer_state(self.optimizer, old, new, keep_idx, n_new)
+        tags = getattr(self, "_atom_tags", None)
+        if tags is not None:
+            kept_tags = tags if keep_idx is None else tags[keep_idx.to(tags.device)]
+            self._atom_tags = torch.cat(
+                (kept_tags, torch.full((n_new,), -1, dtype=tags.dtype, device=tags.device))
+            )
         self._positions, self._log_amplitudes, self._log_sigmas = p_new, a_new, s_new
         self._prior_target = None
         self._prior_grad = None
@@ -1703,6 +1714,7 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             self._background = nn.Parameter(st["background"].to(dev).clone())
         self.clear_prior_target()
         self._pair_idx = None
+        self._atom_tags = None
         if self.optimizer is not None:
             self.set_optimizer(self.optimizer_params)
 
@@ -1720,6 +1732,8 @@ class ObjectGaussianSplat(BaseConstraints[ObjConstraintParams.ObjSplatConstraint
             self._prior_grad = self._prior_grad.to(dev)
         if self._pair_idx is not None:
             self._pair_idx = self._pair_idx.to(dev)
+        if getattr(self, "_atom_tags", None) is not None:
+            self._atom_tags = self._atom_tags.to(dev)
         self._rng_to_device(dev)
         self.reconnect_optimizer_to_parameters()
         return self

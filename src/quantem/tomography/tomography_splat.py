@@ -259,6 +259,37 @@ class DensifyParams:
     # v1. A blind start fills its particle in during the first ~300 iterations, and on an incomplete particle the true atoms
     # at the growing front read as unbound (the step-3 probe: every candidate the vet rejected at iteration 9-19 sat on a true
     # site), so the rule is meant for the complete structure (the driver starts it at 500 by default).
+    # --- chapter 10 step 4 (2026-11-03): the candidate classifiers as the add / remove signals. Everything below is
+    # inert at its default (add_method="residual", prune_method="amplitude": every earlier run is reproduced). ---
+    add_method: Literal["residual", "classifier"] = "residual"  # "classifier": from ``cand_start`` on, the residual add is
+    # replaced by the add classifier: residual peaks above ``cand_residual_frac`` x the usual add threshold become extra
+    # candidates of :func:`~quantem.tomography.candidate_sites.generate_candidate_sites` (lattice continuation of the atoms),
+    # ``cand_add_model.score_candidates`` scores every candidate and those with p > ``cand_p_add`` are added as weak atoms
+    # (``cand_add_amp_frac`` x the median amplitude, median width; at most ``max_add_frac`` of the atoms, highest p first),
+    # without the energy vet. Before ``cand_start`` the residual add runs as usual (a half-built particle implies every site).
+    prune_method: Literal["amplitude", "classifier"] = "amplitude"  # "classifier": from ``cand_start`` on, an extra removal
+    # step after the merge (before the energy prune): atoms with ``cand_rm_model.score_atoms`` p_real < ``cand_p_rm`` AND
+    # amplitude < ``cand_rm_amp_frac`` x the current median are removed, at most ``cand_rm_max_frac`` per pass, lowest p first.
+    # "amplitude" = no extra step (the amplitude prune runs in both cases).
+    cand_add_model: object | None = None  # :class:`~quantem.tomography.candidate_classifier.CandidateClassifier` kind "add"
+    # (or anything with ``score_candidates(atoms, candidates) -> p`` and ``.d1``)
+    cand_rm_model: object | None = None  # kind "remove" (``score_atoms(atoms) -> p_real``)
+    cand_start: int = 500  # first iteration of the classifier add / remove
+    cand_p_add: float = 0.5
+    cand_p_rm: float = 0.5
+    cand_add_amp_frac: float = 0.3  # amplitude of a classifier-added atom / the median amplitude
+    cand_confirm_iters: int = 100  # a classifier-added atom is judged by the data this many iterations after its addition:
+    cand_confirm_amp_frac: float = 0.6  # removed ("rejected by the data") if its amplitude is then below this x the median,
+    # else confirmed (an ordinary atom from then on). Until judged it is exempt from the uniformity reset, the amplitude
+    # prune, the classifier removal and the energy prune (the out-of-box prune and the merge still apply).
+    cand_rm_amp_frac: float = 0.9
+    cand_rm_max_frac: float | None = 0.2
+    cand_residual_frac: float = 0.5  # residual peaks above this x the usual add threshold become candidates
+    cand_add_stop: int = 10**9  # no classifier adds from this iteration on (so every add is judged before the run ends;
+    # the driver sets num_iter - cand_confirm_iters); the residual add does not resume after it
+    cand_block_radius: float = 1.0  # Angstrom; a candidate this close to a site the data rejected (an add judged too weak,
+    # or one that left the box before it was judged) is not proposed again (otherwise the add model re-adds the same
+    # rejected site every pass); 0 disables
 
     @classmethod
     def v2(cls, **kwargs) -> "DensifyParams":
@@ -354,6 +385,12 @@ class TomographySplat(TomographyOpt, TomographyBase):
     def energy_history(self) -> list[dict]:
         """Round 5 step 3: one record per energy prune pass ("prune") and per add-vetting call ("vet")."""
         return list(getattr(self, "_energy_history", []))
+
+    @property
+    def cand_history(self) -> list[dict]:
+        """Chapter 10 step 4: one record per densify pass with the candidate classifiers on (``add_method`` or
+        ``prune_method`` "classifier", from ``cand_start``)."""
+        return list(getattr(self, "_cand_history", []))
 
     @property
     def snapshots(self) -> list[dict]:
@@ -492,6 +529,19 @@ class TomographySplat(TomographyOpt, TomographyBase):
             med = sel.median()
             return 1.4826 * float((sel - med).abs().median())
 
+        # chapter 10 step 4: the candidate classifiers (inert unless add_method / prune_method is "classifier")
+        cls_replace = params.add_method == "classifier" and it >= params.cand_start  # the residual add is replaced
+        cls_add = cls_replace and it < params.cand_add_stop
+        cls_rm = params.prune_method == "classifier" and it >= params.cand_start
+        crec, cand_extra = None, None
+        if cls_replace or cls_rm or getattr(obj, "_atom_tags", None) is not None:
+            crec = {"iteration": it, "n_atoms_start": obj.num_atoms}
+            t_cls = time.perf_counter()
+            self._cand_confirm(it, params, crec)  # judge the classifier-added atoms that are due (before any prune)
+            out["confirmed"] = crec["n_confirmed"]
+            out["rejected_data"] = crec["n_rejected_data"]
+            n_tagged = self._n_unconfirmed()
+            t_cls = time.perf_counter() - t_cls
         if params.prune_amplitude_frac > 0 and obj.num_atoms > 1:
             amp = obj.amplitudes.detach()
             ref = float(amp.median())
@@ -504,6 +554,19 @@ class TomographySplat(TomographyOpt, TomographyBase):
                 float(params.prune_amplitude_frac * ref),
                 obj.box_half if params.prune_outside_box else None,
             )
+            tags = getattr(obj, "_atom_tags", None)
+            if crec is not None and tags is not None:
+                # chapter 10: an unjudged classifier add starts at cand_add_amp_frac x the median, which can be at or below
+                # the prune bar (prune_reference="max_median" remembers the early, brighter median): the amplitude prune
+                # leaves it to the data confirmation; leaving the box still removes it (and blocks the site)
+                unj = (tags >= 0).to(keep.device)
+                in_box = prune_mask(amp, obj._positions.detach(), -math.inf,
+                                    obj.box_half if params.prune_outside_box else None)  # fmt: skip
+                crec["n_prune_exempt_unjudged"] = int((unj & ~keep & in_box).sum())
+                keep = keep | (unj & in_box)
+                lost = ~keep & unj
+                crec["n_pruned_unjudged"] = int(lost.sum())
+                self._remember_rejected(obj._positions.detach()[lost])
             out["pruned"] = obj.prune(keep)
         if need_render:
             target, rot, shifts, pred = render()
@@ -524,10 +587,18 @@ class TomographySplat(TomographyOpt, TomographyBase):
             out["merged"] = obj.merge(float(params.merge_distance), params.merge_amplitude)
             if out["merged"] and need_render:
                 target, rot, shifts, pred = render()
+        if cls_rm:
+            t0 = time.perf_counter()
+            out["removed_classifier"] = self._classifier_remove(it, params, crec) if obj.num_atoms > 1 else 0
+            t_cls += time.perf_counter() - t0
+            if out["removed_classifier"] and need_render:
+                target, rot, shifts, pred = render()
         energy_on = params.energy_prior is not None and it >= params.energy_start
         if energy_on:
             # round 5 step 3: remove unbound atoms (per-atom energy above the threshold, AND low amplitude unless disabled)
-            out["removed_energy"] = self._energy_prune(it, params) if obj.num_atoms > 1 else 0
+            tags = getattr(obj, "_atom_tags", None)
+            exempt = None if tags is None else tags >= 0  # chapter 10: unconfirmed classifier adds are judged by the data
+            out["removed_energy"] = self._energy_prune(it, params, exempt) if obj.num_atoms > 1 else 0
             out["rejected_energy"] = 0
             if out["removed_energy"] and need_render:
                 target, rot, shifts, pred = render()
@@ -604,27 +675,34 @@ class TomographySplat(TomographyOpt, TomographyBase):
                     noise = noise_of(bs_filter(vol.cpu()))
                     self._last_add_noise = noise
                     thr = max(thr or 0.0, params.add_noise_sigmas * noise)
-                peaks, _ = seed_peaks(
-                    vol.cpu(),
-                    blur_sigmas=params.add_blur_sigmas,
-                    threshold=thr,
-                    threshold_fraction=params.add_threshold_fraction,
-                    min_distance=params.add_min_distance / v,
-                    max_peaks=params.max_add,
-                )
-                if peaks.shape[0] and params.add_chi2_min > 0:
-                    # multi-view inconsistency gate: chi^2 per view at the candidate (1 = consistent model)
-                    bs = params.add_blur_sigmas
-                    chi2 = gaussian_blur3d(
-                        backproject_images(resid_w * resid_w, rot, shifts, sampling, vol_shape, v).cpu(),
-                        float(bs[0] if isinstance(bs, (tuple, list)) else bs),
+                chi2_vol: list[torch.Tensor] = []  # the chi^2 gate's volume, computed once per pass when needed
+
+                def residual_peaks(threshold, record: bool = True) -> torch.Tensor:
+                    """Residual peaks above ``threshold`` (strongest first) after the chi^2 gate, (M, 3) Angstrom."""
+                    peaks, _ = seed_peaks(
+                        vol.cpu(),
+                        blur_sigmas=params.add_blur_sigmas,
+                        threshold=threshold,
+                        threshold_fraction=params.add_threshold_fraction,
+                        min_distance=params.add_min_distance / v,
+                        max_peaks=params.max_add,
                     )
-                    pk = [peaks[:, k].round().long().clamp(0, vol_shape[k] - 1) for k in range(3)]
-                    ok = chi2[pk[0], pk[1], pk[2]] >= params.add_chi2_min
-                    self._last_chi2_rejected = int((~ok).sum())
-                    peaks = peaks[ok]
-                if peaks.shape[0]:
-                    pos = torch.stack(
+                    if peaks.shape[0] and params.add_chi2_min > 0:
+                        # multi-view inconsistency gate: chi^2 per view at the candidate (1 = consistent model)
+                        if not chi2_vol:
+                            bs = params.add_blur_sigmas
+                            chi2_vol.append(
+                                gaussian_blur3d(
+                                    backproject_images(resid_w * resid_w, rot, shifts, sampling, vol_shape, v).cpu(),
+                                    float(bs[0] if isinstance(bs, (tuple, list)) else bs),
+                                )
+                            )
+                        pk = [peaks[:, k].round().long().clamp(0, vol_shape[k] - 1) for k in range(3)]
+                        ok = chi2_vol[0][pk[0], pk[1], pk[2]] >= params.add_chi2_min
+                        if record:
+                            self._last_chi2_rejected = int((~ok).sum())
+                        peaks = peaks[ok]
+                    return torch.stack(
                         (
                             (peaks[:, 2].double() - (vol_shape[2] - 1) / 2) * v,
                             (peaks[:, 1].double() - (vol_shape[1] - 1) / 2) * v,
@@ -632,6 +710,9 @@ class TomographySplat(TomographyOpt, TomographyBase):
                         ),
                         dim=1,
                     ).float()
+
+                pos = residual_peaks(thr)
+                if pos.shape[0]:
                     rejected = pos[:0]
                     rejected_nn = torch.zeros(0, dtype=torch.long)
                     if obj.num_atoms:
@@ -639,14 +720,41 @@ class TomographySplat(TomographyOpt, TomographyBase):
                         accept = d > params.add_min_distance
                         rejected, rejected_nn = pos[~accept], nn[~accept]
                         pos = pos[accept]
-                    if params.max_add_frac is not None and obj.num_atoms:
-                        cap = max(1, int(params.max_add_frac * obj.num_atoms))
-                        pos = pos[:cap]  # seed_peaks returns peaks strongest first
-                    if energy_on and params.energy_vet_add and pos.shape[0] and obj.num_atoms:
-                        pos, out["rejected_energy"] = self._energy_vet_candidates(it, params, pos)
-                    out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
+                    if not cls_replace:  # chapter 10: from cand_start on the classifier add replaces the residual add
+                        if params.max_add_frac is not None and obj.num_atoms:
+                            cap = max(1, int(params.max_add_frac * obj.num_atoms))
+                            pos = pos[:cap]  # seed_peaks returns peaks strongest first
+                        if energy_on and params.energy_vet_add and pos.shape[0] and obj.num_atoms:
+                            pos, out["rejected_energy"] = self._energy_vet_candidates(it, params, pos)
+                        out["added"] = obj.add_atoms(pos)  # appends, so ``rejected_nn`` indices stay valid
                     if params.split_from_residual and rejected.shape[0]:
                         out["split"] = self._split_fat_atoms(rejected, rejected_nn, params)
+                if cls_add:
+                    # the weaker residual peaks (cand_residual_frac x the add threshold) away from the atoms (after the
+                    # split) become extra candidates of the generator
+                    t0 = time.perf_counter()
+                    cand_extra = residual_peaks(
+                        None if thr is None else params.cand_residual_frac * thr, record=False
+                    )
+                    if cand_extra.shape[0] and obj.num_atoms:
+                        d = torch.cdist(cand_extra, obj._positions.detach().cpu()).min(dim=1).values
+                        cand_extra = cand_extra[d > params.add_min_distance]
+                    crec["residual_peaks_s"] = time.perf_counter() - t0
+                    t_cls += crec["residual_peaks_s"]
+        if cls_add:
+            t0 = time.perf_counter()
+            out["added_classifier"] = self._classifier_add(it, params, cand_extra, crec)
+            t_cls += time.perf_counter() - t0
+        if crec is not None:
+            n_unc = self._n_unconfirmed()
+            crec["n_lost_unjudged"] = n_tagged - (n_unc - crec.get("n_added", 0))  # amplitude prune (blocked) + merge
+            crec.setdefault("n_pruned_unjudged", 0)
+            crec["n_unconfirmed"] = n_unc
+            crec["n_atoms_end"] = obj.num_atoms
+            crec["classifier_s"] = t_cls  # confirmation + residual peaks for the candidates + generator + both models
+            if not hasattr(self, "_cand_history"):
+                self._cand_history: list[dict] = []
+            self._cand_history.append(crec)
         if clone_sel is not None:
             out["cloned"] = self._clone_atoms(*clone_sel, params)
         self._reset_grad_accumulators()
@@ -661,14 +769,15 @@ class TomographySplat(TomographyOpt, TomographyBase):
         self._energy_history.append(rec)
 
     @torch.no_grad()
-    def _energy_prune(self, it: int, params: DensifyParams) -> int:
+    def _energy_prune(self, it: int, params: DensifyParams, exempt: torch.Tensor | None = None) -> int:
         """Remove the atoms whose per-atom energy at the current positions is above ``params.energy_prune_above`` (eV)
         and, unless ``energy_prune_require_low_amp`` is False, whose amplitude is below ``energy_prune_amp_frac`` x the
         CURRENT median amplitude (not the prune step's running-maximum reference: early in a blind start every amplitude
         decays from a too-bright init, and only an atom weaker than its peers lacks data support); at most
         ``energy_prune_max_frac`` of the atoms per pass, highest energies first. Logs the count, the energies, the
         relative amplitudes and the positions of the removed atoms and a histogram of all energies to
-        ``self._energy_history``. Returns the number removed."""
+        ``self._energy_history``. ``exempt`` (N,) bool (chapter 10): atoms never removed in this pass (the unconfirmed
+        classifier-added atoms). Returns the number removed."""
         obj = self.obj_model
         x = obj._positions.detach()
         amp = obj.amplitudes.detach()
@@ -681,6 +790,10 @@ class TomographySplat(TomographyOpt, TomographyBase):
         high = e > params.energy_prune_above
         low_amp = amp < params.energy_prune_amp_frac * amp_ref
         marked = (high & low_amp) if params.energy_prune_require_low_amp else high
+        n_exempt = 0
+        if exempt is not None:
+            n_exempt = int((marked & exempt.to(marked.device)).sum())
+            marked = marked & ~exempt.to(marked.device)
         keep = self._cap_removals(~marked, -e, params.energy_prune_max_frac)
         removed = ~keep
         lo, hi, nb = self._ENERGY_HIST_EDGES
@@ -698,7 +811,171 @@ class TomographySplat(TomographyOpt, TomographyBase):
             "hist_all": [int(v) for v in torch.histc(e.clamp(lo, hi), bins=nb, min=lo, max=hi).tolist()],
             "e_p50_eV": float(e.median()), "mace_s": mace_s,
         }  # fmt: skip
+        if exempt is not None:
+            rec["n_exempt_unconfirmed"] = n_exempt  # marked, but unconfirmed classifier adds (left to the data)
         self._energy_history_append(rec)
+        return obj.prune(keep)
+
+    # --- the candidate classifiers as the add / remove signals (chapter 10 step 4) ---
+    def _n_unconfirmed(self) -> int:
+        tags = getattr(self.obj_model, "_atom_tags", None)
+        return 0 if tags is None else int((tags >= 0).sum())
+
+    def _established_mask(self) -> torch.Tensor | None:
+        """(N,) bool: atoms that are not unconfirmed classifier adds, or None when there are no unconfirmed adds."""
+        tags = getattr(self.obj_model, "_atom_tags", None)
+        if tags is None or not bool((tags >= 0).any()):
+            return None
+        return tags < 0
+
+    def _established_median(self, values: torch.Tensor) -> torch.Tensor:
+        """Median of ``values`` (N,) over the established atoms (all atoms when every atom is established), so the
+        weak unconfirmed adds do not lower the reference they are judged against."""
+        est = self._established_mask()
+        if est is None or not bool(est.any()):
+            return values.median()
+        return values[est.to(values.device)].median()
+
+    @staticmethod
+    def _short(v: torch.Tensor, nd: int = 3, n_max: int = 200) -> list:
+        """A rounded python list of at most ``n_max`` values (the history stays small)."""
+        return [round(float(a), nd) for a in v.reshape(-1)[:n_max].tolist()]
+
+    @torch.no_grad()
+    def _cand_confirm(self, it: int, params: DensifyParams, crec: dict) -> None:
+        """Judge the classifier-added atoms added ``cand_confirm_iters`` or more iterations ago: below
+        ``cand_confirm_amp_frac`` x the established median amplitude they are removed (rejected by the data), else
+        confirmed (their tag is cleared and they are ordinary atoms from then on)."""
+        obj = self.obj_model
+        tags = getattr(obj, "_atom_tags", None)
+        crec.update({"n_confirmed": 0, "n_rejected_data": 0, "amp_rel_confirmed": [], "amp_rel_rejected": []})
+        if tags is None:
+            return
+        due = (tags >= 0) & (it - tags >= int(params.cand_confirm_iters))
+        if not bool(due.any()):
+            return
+        amp = obj.amplitudes.detach()
+        rel = amp / self._established_median(amp)
+        reject = due & (rel < params.cand_confirm_amp_frac)
+        confirm = due & ~reject
+        crec.update(
+            {
+                "n_confirmed": int(confirm.sum()),
+                "n_rejected_data": int(reject.sum()),
+                "amp_rel_confirmed": self._short(rel[confirm]),
+                "amp_rel_rejected": self._short(rel[reject]),
+                "added_at_judged": sorted({int(t) for t in tags[due].tolist()}),
+                "positions_rejected_A": [[round(c, 3) for c in row] for row in obj._positions.detach()[reject][:200].tolist()],
+            }
+        )
+        tags[confirm] = -1
+        self._remember_rejected(obj._positions.detach()[reject])
+        obj.prune(~reject)
+
+    def _remember_rejected(self, pos: torch.Tensor) -> None:
+        """Sites the data rejected (judged too weak, or pruned before judged), so the add model does not propose them
+        again (``cand_block_radius``)."""
+        if pos.shape[0] == 0:
+            return
+        prev = getattr(self, "_cand_rejected_sites", None)
+        new = pos.detach().float().cpu()
+        self._cand_rejected_sites = new if prev is None else torch.cat([prev, new])
+
+    @torch.no_grad()
+    def _classifier_add(self, it: int, params: DensifyParams, extra: torch.Tensor | None, crec: dict) -> int:
+        """The candidate generator (lattice continuation of the current atoms + ``extra`` residual peaks) proposes, the
+        add model scores, candidates with p > ``cand_p_add`` are added (highest p first, at most ``max_add_frac`` of the
+        atoms) as weak atoms (``cand_add_amp_frac`` x the established median amplitude, median width) tagged with
+        this iteration. No energy vet. Returns the number added."""
+        from quantem.tomography.candidate_sites import generate_candidate_sites
+
+        obj, model = self.obj_model, params.cand_add_model
+        if model is None:
+            raise ValueError("add_method='classifier' needs cand_add_model")
+        n_extra = 0 if extra is None else int(extra.shape[0])
+        crec.update({"n_residual_peaks": n_extra, "n_candidates": 0, "n_from_residual": 0, "n_accepted": 0, "n_added": 0})
+        if obj.num_atoms < 2:
+            return 0
+        x = obj._positions.detach()
+        sync = torch.cuda.synchronize if x.is_cuda else (lambda: None)
+        t0 = time.perf_counter()
+        cs = generate_candidate_sites(x, extra=None if not n_extra else extra.to(x), d1=float(model.d1))
+        sync()
+        t1 = time.perf_counter()
+        cpos, from_res = cs.positions, cs.from_residual
+        crec.update({"n_candidates": int(cpos.shape[0]), "n_from_residual": int(from_res.sum()),
+                     "n_under": int(cs.n_under), "generator_s": t1 - t0, "n_blocked": 0})  # fmt: skip
+        blocked = getattr(self, "_cand_rejected_sites", None)
+        if blocked is not None and params.cand_block_radius > 0 and cpos.shape[0]:
+            ok = torch.cdist(cpos.float(), blocked.to(cpos.device)).min(dim=1).values > params.cand_block_radius
+            crec["n_blocked"] = int((~ok).sum())
+            cpos, from_res = cpos[ok], from_res[ok]
+        if cpos.shape[0] == 0:
+            crec["add_score_s"] = 0.0
+            return 0
+        p = model.score_candidates(x, cpos).reshape(-1).to(x.device)
+        sync()
+        crec["add_score_s"] = time.perf_counter() - t1
+        acc = torch.nonzero(p > params.cand_p_add).reshape(-1)
+        acc = acc[torch.argsort(p[acc], descending=True)]
+        crec["n_accepted"] = int(acc.numel())
+        if params.max_add_frac is not None:
+            acc = acc[: max(1, int(params.max_add_frac * obj.num_atoms))]
+        crec["p_hist_edges"] = [0.0, 1.0, 10]
+        crec["p_hist_candidates"] = [int(v) for v in torch.histc(p.float(), bins=10, min=0.0, max=1.0).tolist()]
+        crec["p_added"] = self._short(p[acc])
+        crec["from_residual_added"] = int(from_res.to(p.device)[acc].sum())
+        if acc.numel() == 0:
+            return 0
+        amp = float(params.cand_add_amp_frac * self._established_median(obj.amplitudes.detach()))
+        sig = float(self._established_median(obj.sigmas.detach()))
+        n0 = obj.num_atoms
+        if getattr(obj, "_atom_tags", None) is None:
+            obj._atom_tags = torch.full((n0,), -1, dtype=torch.long, device=x.device)
+        crec["positions_added_A"] = [[round(c, 3) for c in row] for row in cpos[acc][:200].tolist()]
+        n = obj.add_atoms(cpos[acc], amplitude=amp, sigma=sig)
+        obj._atom_tags[n0:] = it
+        crec["n_added"] = n
+        crec["amp_added"] = amp
+        return n
+
+    @torch.no_grad()
+    def _classifier_remove(self, it: int, params: DensifyParams, crec: dict) -> int:
+        """Remove the atoms the remove model calls spurious (p_real < ``cand_p_rm``) AND that the data hold weakly
+        (amplitude < ``cand_rm_amp_frac`` x the established median), at most ``cand_rm_max_frac`` of the atoms per pass,
+        lowest p first; unconfirmed classifier adds are left to the data. Returns the number removed."""
+        obj, model = self.obj_model, params.cand_rm_model
+        if model is None:
+            raise ValueError("prune_method='classifier' needs cand_rm_model")
+        x = obj._positions.detach()
+        amp = obj.amplitudes.detach()
+        sync = torch.cuda.synchronize if x.is_cuda else (lambda: None)
+        t0 = time.perf_counter()
+        p = model.score_atoms(x).reshape(-1).to(x.device)
+        sync()
+        rel = amp / self._established_median(amp)
+        low_p = p < params.cand_p_rm
+        low_amp = rel < params.cand_rm_amp_frac
+        marked = low_p & low_amp
+        est = self._established_mask()
+        if est is not None:
+            marked = marked & est.to(marked.device)
+        keep = self._cap_removals(~marked, p, params.cand_rm_max_frac)
+        removed = ~keep
+        crec.update(
+            {
+                "rm_score_s": time.perf_counter() - t0,
+                "n_scored": int(x.shape[0]),
+                "n_low_p": int(low_p.sum()),
+                "n_low_p_high_amp": int((low_p & ~low_amp).sum()),  # spurious by geometry, but the data hold them: kept
+                "n_rm_marked": int(marked.sum()),
+                "n_removed_classifier": int(removed.sum()),
+                "rm_capped": bool(int(removed.sum()) < int(marked.sum())),
+                "p_removed": self._short(p[removed]),
+                "amp_rel_removed": self._short(rel[removed]),
+                "positions_removed_A": [[round(c, 3) for c in row] for row in x[removed][:200].tolist()],
+            }
+        )
         return obj.prune(keep)
 
     @torch.no_grad()
@@ -1120,14 +1397,25 @@ class TomographySplat(TomographyOpt, TomographyBase):
             ):
                 with torch.no_grad():  # single species: one amplitude and one width for every atom
                     la, ls = self.obj_model._log_amplitudes, self.obj_model._log_sigmas
-                    ma, ms = float(la.median()), float(ls.median())
                     hard = bool(species_reset_every) and (it + 1) % species_reset_every == 0
-                    if uniform_window is None or hard:
-                        la.fill_(ma)
-                        ls.fill_(ms)
-                    else:  # leave the outliers alone so spurious atoms can still decay and be pruned
-                        lo, hi = math.log(uniform_window[0]), math.log(uniform_window[1])
-                        sel = (la - ma >= lo) & (la - ma <= hi)
+                    est = self._established_mask()
+                    if est is None:
+                        ma, ms = float(la.median()), float(ls.median())
+                        if uniform_window is None or hard:
+                            la.fill_(ma)
+                            ls.fill_(ms)
+                        else:  # leave the outliers alone so spurious atoms can still decay and be pruned
+                            lo, hi = math.log(uniform_window[0]), math.log(uniform_window[1])
+                            sel = (la - ma >= lo) & (la - ma <= hi)
+                            la[sel] = ma
+                            ls[sel] = ms
+                    else:  # chapter 10: unconfirmed classifier adds keep their own amplitude and width until judged
+                        est = est.to(la.device)
+                        ma, ms = float(la[est].median()), float(ls[est].median())
+                        sel = est.clone()
+                        if uniform_window is not None and not hard:
+                            lo, hi = math.log(uniform_window[0]), math.log(uniform_window[1])
+                            sel &= (la - ma >= lo) & (la - ma <= hi)
                         la[sel] = ma
                         ls[sel] = ms
             if store_snapshots_every and (it + 1) % store_snapshots_every == 0:
