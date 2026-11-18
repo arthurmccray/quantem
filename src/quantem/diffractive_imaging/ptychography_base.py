@@ -123,7 +123,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # initializing default attributes
         self._multi_gpu_devices: list[int] | None = None
         self._preprocessed: bool = False
-        self._obj_padding_force_power2_level: int = 3
         self._store_snapshots: bool = False
         self._store_snapshot_every: int = 1
         self._iter_losses: list[float] = []
@@ -361,8 +360,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         """
         obj = self._to_numpy(self.obj_model.obj)
         if self.obj_type == "complex":
-            ph = np.angle(obj)
-            obj = np.abs(obj) * np.exp(1j * (ph - ph.mean()))
+            obj = remove_global_phase(obj)
         return obj
 
     @property
@@ -371,7 +369,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @obj_padding_px.setter
     def obj_padding_px(self, pad: np.ndarray | tuple[int, int]):
-        p2 = self._to_numpy(
+        self._obj_padding_px = self._to_numpy(
             validate_array(
                 validate_np_len(pad, 2, name="obj_padding_px"),
                 dtype="int16",
@@ -379,13 +377,6 @@ class PtychographyBase(RNGMixin, AutoSerialize):
                 name="obj_padding_px",
             )
         )
-        if self._obj_padding_force_power2_level > 0:
-            p2 = adjust_padding_power2(
-                p2,
-                self.dset._obj_shape_full_2d((0, 0)),
-                self._obj_padding_force_power2_level,
-            )
-        self._obj_padding_px = p2
         self.obj_model._initialize_obj(shape=self.obj_shape_full, sampling=self.sampling)
         self.dset._set_initial_scan_positions_px(self.obj_padding_px)
         self.dset._set_patch_indices(self.obj_padding_px)
@@ -534,8 +525,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             # carries phase inside a complex tensor); pure_phase and potential
             # are already real and recentered upstream.
             if self.obj_type == "complex":
-                ph = np.angle(cropped_obj)
-                cropped_obj = np.abs(cropped_obj) * np.exp(1j * (ph - ph.mean()))
+                cropped_obj = remove_global_phase(cropped_obj)
             snp2["obj"] = cropped_obj
             return snp2
         else:
@@ -699,17 +689,16 @@ class PtychographyBase(RNGMixin, AutoSerialize):
     def obj_cropped(self) -> np.ndarray:
         """Cropped + FOV-rotated object, in its native representation.
 
-        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)); phase is
-          recentered to zero mean here as a defensive duplicate of
-          ``ObjectConstraints._apply_hard_complex``.
+        - ``obj_type="complex"`` → complex array (amp * exp(1j*phase)), rotated so that the
+          mean over the cropped field of view is real (``remove_global_phase``); the object
+          model fixes the same gauge over the full, padded object.
         - ``obj_type="pure_phase"`` → real array of phase values (already
           recentered upstream by ``_apply_hard_pure_phase``).
         - ``obj_type="potential"`` → real array of potential values.
         """
         cropped = self._crop_rotate_obj_fov(self.obj, padding=self.obj_padding_px)
         if self.obj_type == "complex":
-            ph = np.angle(cropped)
-            cropped = np.abs(cropped) * np.exp(1j * (ph - ph.mean()))
+            cropped = remove_global_phase(cropped)
         return cropped
 
     @property  # FIXME depend on ptychodataset
@@ -1183,18 +1172,14 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 # misc helpers to maybe move elsewhere
 
 
-def adjust_padding_power2(pad, shape, power2_level):
-    """
-    Adjusts pad so that (shape + 2*pad) is divisible by 2**power2_level.
-    """
-    div = 2**power2_level
-    rem0 = (shape[-2] + 2 * pad[-2]) % div
-    rem1 = (shape[-1] + 2 * pad[-1]) % div
-    if rem0 != 0:
-        pad[-2] += (div - rem0) // 2
-    if rem1 != 0:
-        pad[-1] += (div - rem1) // 2
+def remove_global_phase(obj: np.ndarray) -> np.ndarray:
+    """Rotate a complex object so that its mean is real and positive.
 
-    if ((shape[-2] + 2 * pad[-2]) % div != 0) or ((shape[-1] + 2 * pad[-1]) % div != 0):
-        raise ValueError(f"Adjustment failed to achieve divisibility by {div}")
-    return pad
+    This is the display counterpart of ``ObjectConstraints.gauge_phasor``: the circular mean of
+    the phase, which unlike the mean of the wrapped angles does not jump when a pixel crosses
+    the branch cut.
+    """
+    m = obj.mean()
+    if np.abs(m) == 0:
+        return obj
+    return obj * (np.conj(m) / np.abs(m))

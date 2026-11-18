@@ -160,7 +160,7 @@ class TomographyDatasetBase(AutoSerialize, OptimizerMixin, nn.Module):
     _token = object()
 
     DEFAULT_LRS = {
-        "pose_lr": 5e-2,
+        "pose": 5e-2,
     }
 
     def __init__(
@@ -408,7 +408,7 @@ class TomographyPixDataset(TomographyDatasetConstraints):
     ):
         super().__init__(
             tilt_stack=tilt_stack,
-            tilt_angles=-tilt_angles,  # TODO: Flip the tilt angles to be negative to match the convention of INR.
+            tilt_angles=tilt_angles,
             learn_shift=learn_shift,
             learn_tilt_axis=learn_tilt_axis,
             norm_quantile=norm_quantile,
@@ -508,32 +508,35 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
     def get_coords(
         self, batch: dict[str, torch.Tensor], N: int, num_samples_per_ray: int
     ) -> torch.Tensor:
-        pixel_i = batch["pixel_i"].float().to(self.device, non_blocking=True)
-        pixel_j = batch["pixel_j"].float().to(self.device, non_blocking=True)
-        # target_values = batch["target_value"].to(self.device, non_blocking=True)
-        phis = batch["phi"].to(self.device, non_blocking=True)
-        projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
-        with torch.no_grad():
-            batch_ray_coords = self.create_batch_rays(pixel_i, pixel_j, N, num_samples_per_ray)
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            pixel_i = batch["pixel_i"].to(
+                self.device, dtype=torch.float32, non_blocking=True
+            )
+            pixel_j = batch["pixel_j"].to(
+                self.device, dtype=torch.float32, non_blocking=True
+            )
+            phis = batch["phi"].to(self.device, dtype=torch.float32, non_blocking=True)
+            projection_indices = batch["projection_idx"].to(self.device, non_blocking=True)
+            with torch.no_grad():
+                batch_ray_coords = self.create_batch_rays(
+                    pixel_i, pixel_j, N, num_samples_per_ray
+                )
 
-        shifts, z1_params, z3_params = self.forward(None)
-        batch_shifts = torch.index_select(shifts, 0, projection_indices)
-        batch_z1 = torch.index_select(z1_params, 0, projection_indices)
-        batch_z3 = torch.index_select(z3_params, 0, projection_indices)
+            shifts, z1_params, z3_params = self.forward(None)
+            batch_shifts = torch.index_select(shifts.float(), 0, projection_indices)
+            batch_z1 = torch.index_select(z1_params.float(), 0, projection_indices)
+            batch_z3 = torch.index_select(z3_params.float(), 0, projection_indices)
 
-        transformed_rays = self.transform_batch_rays(
-            batch_ray_coords,
-            z1=batch_z1,
-            x=phis,
-            z3=batch_z3,
-            shifts=batch_shifts,
-            N=N,
-            sampling_rate=1.0,
-        )
-        all_coords = transformed_rays.view(-1, 3)
-
-        all_coords = all_coords.to(self.device, dtype=torch.float32, non_blocking=True)
-        return all_coords
+            transformed_rays = self.transform_batch_rays(
+                batch_ray_coords,
+                z1=batch_z1,
+                x=phis,
+                z3=batch_z3,
+                shifts=batch_shifts,
+                N=N,
+                sampling_rate=1.0,
+            )
+            return transformed_rays.reshape(-1, 3)
 
     @staticmethod
     def create_batch_rays(
@@ -542,9 +545,17 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
         batch_size = len(pixel_i)
         x_coords = (pixel_j / (N - 1)) * 2 - 1
         y_coords = (pixel_i / (N - 1)) * 2 - 1
-        z_coords = torch.linspace(-1, 1, num_samples_per_ray, device=pixel_i.device)
+        z_coords = torch.linspace(
+            -1, 1, num_samples_per_ray, device=pixel_i.device, dtype=torch.float32
+        )
 
-        rays = torch.zeros(batch_size, num_samples_per_ray, 3, device=pixel_i.device)
+        rays = torch.zeros(
+            batch_size,
+            num_samples_per_ray,
+            3,
+            device=pixel_i.device,
+            dtype=torch.float32,
+        )
 
         rays[:, :, 0] = x_coords.unsqueeze(1)
         rays[:, :, 1] = y_coords.unsqueeze(1)
@@ -687,6 +698,10 @@ class TomographyINRDataset(TomographyDatasetConstraints, Dataset):
 class TomographyINRPretrainDataset(Dataset):
     """
     Dataset class for pretraining INR models.
+
+    `pretrain_target` must be in the reconstruction (`obj_view`, SIRT / FBP) layout
+    [C, X, Z, Y]. A [C, Z, Y, X] volume, such as a phantom, is misoriented unless it is
+    permuted first, ``vol.permute(0, 3, 1, 2)``.
     """
 
     def __init__(
@@ -706,8 +721,8 @@ class TomographyINRPretrainDataset(Dataset):
             data_quantile = torch.quantile(data, 0.95)
 
         data = data / data_quantile
-        data = torch.permute(data, (0, 3, 2, 1))
-        # data = torch.flip(data, dims=(2,))
+        # pretrain_target is in the obj_view layout [C, X, Z, Y]; the coordinates are (x, y, z).
+        data = torch.permute(data, (0, 1, 3, 2))
 
         self.volume = data.cpu()
         self.N = pretrain_target.shape[1]  # Assumes cubic volume.
@@ -716,7 +731,8 @@ class TomographyINRPretrainDataset(Dataset):
         coords_1d = torch.linspace(-1, 1, self.N)
         x, y, z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
         self.coords = torch.stack([x, y, z], dim=-1).reshape(-1, 3).cpu()
-        self.targets = self.volume.reshape(-1).cpu()
+        # (N^3,) for one channel, (N^3, C) otherwise
+        self.targets = self.volume.reshape(self.volume.shape[0], -1).T.squeeze(-1).cpu()
 
     def __len__(self):
         return self.total_samples

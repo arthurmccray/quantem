@@ -83,7 +83,7 @@ def render_isotropic(
     intensities: Tensor,
     sigmas: Tensor | float,
     volume_shape: tuple[int, int, int],
-    window_radius: int,
+    window_radius: int | Tensor,
 ) -> Tensor:
     """Render a sum of isotropic 3D Gaussians into a dense volume by local splatting.
 
@@ -105,8 +105,10 @@ def render_isotropic(
         atoms; otherwise shape ``(N,)``.
     volume_shape : tuple[int, int, int]
         Output volume shape ``(D0, D1, D2)``.
-    window_radius : int
-        Half-width (in voxels) of the cubic splat window per atom.
+    window_radius : int or Tensor
+        Half-width (in voxels) of the cubic splat window, one for all atoms or
+        ``(N,)`` per atom.  Atoms are rendered in groups of equal radius, so a
+        few wide atoms do not enlarge every window.
 
     Returns
     -------
@@ -128,32 +130,41 @@ def render_isotropic(
     if sigmas.shape[0] == 1:
         sigmas = sigmas.expand(n_atoms)
 
-    # Integer window centers -- detached so they carry no gradient.
-    centers = torch.round(positions.detach()).long()  # (N, 3)
-
-    # Cubic window offsets, (W**3, 3).
-    rng = torch.arange(-window_radius, window_radius + 1, device=device)
-    o0, o1, o2 = torch.meshgrid(rng, rng, rng, indexing="ij")
-    offsets = torch.stack((o0.reshape(-1), o1.reshape(-1), o2.reshape(-1)), dim=1)
-
-    # Integer voxel coordinates for every (atom, window-voxel): (N, W**3, 3).
-    vox = centers[:, None, :] + offsets[None, :, :]
-
-    # Continuous displacement from the (sub-voxel) atom center to each voxel.
-    diff = vox.to(dtype) - positions[:, None, :]  # (N, W**3, 3)
-    r2 = (diff * diff).sum(dim=-1)  # (N, W**3)
-    val = intensities[:, None] * torch.exp(-0.5 * r2 / (sigmas[:, None] ** 2))
-
-    # Zero out-of-bounds contributions; clamp their indices to a valid slot so the
-    # scatter is safe (those entries add 0.0).
-    shape_t = torch.tensor(volume_shape, device=device)
-    valid = ((vox >= 0) & (vox < shape_t)).all(dim=-1)  # (N, W**3)
-    val = val * valid.to(dtype)
-    vox = torch.minimum(torch.maximum(vox, torch.zeros_like(shape_t)), shape_t - 1)
-
-    flat_idx = (vox[..., 0] * (d1 * d2) + vox[..., 1] * d2 + vox[..., 2]).reshape(-1)
     out = torch.zeros(d0 * d1 * d2, device=device, dtype=dtype)
-    out = out.scatter_add(0, flat_idx, val.reshape(-1))
+    if isinstance(window_radius, Tensor):
+        radii = window_radius.to(device).reshape(-1)
+        groups = [(radii == r, int(r)) for r in torch.unique(radii).tolist()]
+    else:
+        groups = [(slice(None), int(window_radius))]
+    for sel, radius in groups:
+        pos, inten, sig = positions[sel], intensities[sel], sigmas[sel]
+        # Integer window centers -- detached so they carry no gradient.
+        centers = torch.round(pos.detach()).long()  # (n, 3)
+        rng = torch.arange(-radius, radius + 1, device=device)
+
+        # The isotropic Gaussian is separable: build one (n, W) factor and index
+        # row per axis.  Out-of-bounds voxels get a zero factor and a clamped
+        # index, so the scatter is safe (those entries add 0.0).
+        factors, indices = [], []
+        for a, size in enumerate(volume_shape):
+            vox = centers[:, a, None] + rng[None, :]  # (n, W)
+            diff = vox.to(dtype) - pos[:, a, None]
+            g = torch.exp(-0.5 * diff * diff / (sig[:, None] ** 2))
+            factors.append(g * ((vox >= 0) & (vox < size)).to(dtype))
+            indices.append(vox.clamp(0, size - 1))
+
+        val = (
+            inten[:, None, None, None]
+            * factors[0][:, :, None, None]
+            * factors[1][:, None, :, None]
+            * factors[2][:, None, None, :]
+        )  # (n, W, W, W)
+        flat_idx = (
+            indices[0][:, :, None, None] * (d1 * d2)
+            + indices[1][:, None, :, None] * d2
+            + indices[2][:, None, None, :]
+        )
+        out = out.index_add(0, flat_idx.reshape(-1), val.reshape(-1))
     return out.reshape(volume_shape)
 
 
@@ -613,9 +624,9 @@ class Atoms(AutoSerialize):
     def _background_control(self) -> Tensor | None:
         return None if not self._has_background else F.softplus(self._raw_background)
 
-    def _window_radius(self) -> int:
-        smax = self._sigma_init if self.num_sites == 0 else float(self._sigma.detach().max())
-        return max(1, int(math.ceil(self._sigma_cutoff * smax)))
+    def _window_radius(self) -> Tensor:
+        """Per-site splat half-width, ``ceil(sigma_cutoff * sigma)`` voxels."""
+        return torch.ceil(self._sigma_cutoff * self._sigma.detach()).clamp(min=1).long()
 
     # ------------------------------------------------------------------ #
     # State
@@ -684,7 +695,9 @@ class Atoms(AutoSerialize):
         ax.plot(radii[1 : r_hi + 1], radial[1 : r_hi + 1], color="0.2", lw=1.2)
         ax.axvline(spacing, color="tab:red", ls="--", label=f"NN spacing = {spacing:.1f} voxels")
         ax.axvline(
-            0.75 * spacing, color="tab:blue", ls=":",
+            0.75 * spacing,
+            color="tab:blue",
+            ls=":",
             label=f"min_distance = {0.75 * spacing:.2f} voxels",
         )
         ax.set_xlabel("radius (voxels)")
@@ -827,12 +840,14 @@ class Atoms(AutoSerialize):
             0 to disable.
         isolation_radius : float or None
             Neighbor-search radius (voxels) for ``min_neighbors``.  Default
-            ``1.5 *`` the estimated nearest-neighbor spacing.
+            ``1.5 *`` the estimated nearest-neighbor spacing, or the median
+            nearest-neighbor distance of the sites if that estimate fails.
         update_every : int
             Apply the add/remove/merge maintenance every this many iterations.
         min_distance : float or None
-            Minimum site spacing for merge/add, in voxels.  Default
-            ``2 * sigma_init``.
+            Minimum site spacing for merge/add, in voxels.  Default ``0.75 *``
+            the estimated nearest-neighbor spacing, or ``2 * sigma_init`` if
+            that estimate fails.
         progress : bool
             Show a tqdm progress bar (loss and site count).
         """
@@ -841,11 +856,14 @@ class Atoms(AutoSerialize):
         if loss not in ("huber", "mse"):
             raise ValueError("loss must be 'huber' or 'mse'.")
         sig_lo, sig_hi = sigma_bounds or (0.5 * self._sigma_init, 2.0 * self._sigma_init)
+        try:
+            spacing = self.estimate_spacing()
+        except RuntimeError:
+            spacing = None
         if min_distance is None:
-            try:
-                min_distance = 0.75 * self.estimate_spacing()
-            except RuntimeError:
-                min_distance = 2.0 * self._sigma_init
+            min_distance = 2.0 * self._sigma_init if spacing is None else 0.75 * spacing
+        if isolation_radius is None and min_neighbors > 0:
+            isolation_radius = 1.5 * (self._site_spacing() if spacing is None else spacing)
         self._intensity_scale = float(self._intensity.detach().median().clamp(min=1e-3))
         if intensity_min is None:
             intensity_min = 0.1 * self._intensity_scale
@@ -974,7 +992,8 @@ class Atoms(AutoSerialize):
         ----------
         radius : float or None
             Neighbor-search radius in voxels.  Default ``1.5 *`` the estimated
-            nearest-neighbor spacing (:meth:`estimate_spacing`).
+            nearest-neighbor spacing (:meth:`estimate_spacing`), or the median
+            nearest-neighbor distance of the sites if that estimate fails.
         min_neighbors : int, default 3
             Minimum neighbors within ``radius`` required to keep a site.
 
@@ -986,7 +1005,10 @@ class Atoms(AutoSerialize):
         if self.num_sites < 2:
             return False
         if radius is None:
-            radius = 1.5 * self.estimate_spacing()
+            try:
+                radius = 1.5 * self.estimate_spacing()
+            except RuntimeError:
+                radius = 1.5 * self._site_spacing()
         from scipy.spatial import cKDTree
 
         pts = self._positions.detach().cpu().numpy()
@@ -999,6 +1021,13 @@ class Atoms(AutoSerialize):
         self._raw_intensity = self._raw_intensity.detach()[keep_t]
         self._raw_sigma = self._raw_sigma.detach()[keep_t]
         return True
+
+    def _site_spacing(self) -> float:
+        """Median nearest-neighbor distance between the current sites, in voxels."""
+        from scipy.spatial import cKDTree
+
+        pts = self._positions.detach().cpu().numpy()
+        return float(np.median(cKDTree(pts).query(pts, k=2)[0][:, 1]))
 
     def add_sites(
         self, min_distance: float, threshold_fraction: float = 0.999, max_add: int | None = None
@@ -1052,7 +1081,9 @@ class Atoms(AutoSerialize):
             new_int.to(device=self.device, dtype=self._dtype).clamp(min=1e-6)
         )
         new_raw_sig = _inverse_softplus(
-            torch.full((new_pos.shape[0],), self._sigma_init, dtype=self._dtype, device=self.device)
+            torch.full(
+                (new_pos.shape[0],), self._sigma_init, dtype=self._dtype, device=self.device
+            )
         )
         self._positions = torch.cat([self._positions.detach(), new_pos], dim=0)
         self._raw_intensity = torch.cat([self._raw_intensity.detach(), new_raw_int], dim=0)
@@ -1123,7 +1154,13 @@ class Atoms(AutoSerialize):
         the mean sampling).
         """
         fields = ["x", "y", "z", "intensity", "sigma"]
-        units = [self._units[0], self._units[1], self._units[2], self._signal_units, self._units[0]]
+        units = [
+            self._units[0],
+            self._units[1],
+            self._units[2],
+            self._signal_units,
+            self._units[0],
+        ]
         v = Vector.from_shape(shape=(), fields=fields, units=units, name="atoms")
         n = self.num_sites
         if n == 0:
@@ -1140,30 +1177,15 @@ class Atoms(AutoSerialize):
     # Interactive 3D widget
     # ------------------------------------------------------------------ #
     def show_3d_atoms(self, **kwargs):
-        """Open the interactive 3D slice + atom-overlay widget.
+        """Open the traced sites in the interactive 3D viewer.
 
-        Renders an orthogonal slice (xy / xz / yz) through the volume with the
-        atomic sites overlaid (marker size scaled by intensity, opacity fading
-        with distance from the slice).  Sites are passed in voxel coordinates so
-        they register with the volume.  Requires the ``quantem.widget`` package;
-        keyword arguments are forwarded to :class:`quantem.widget.Show3DAtoms`.
+        Converts the sites with :meth:`quantem.atoms.AtomicModel.from_atoms` and
+        calls :meth:`~quantem.atoms.AtomicModel.show`; keyword arguments are
+        forwarded to ``quantem.widget.ShowAtoms3D``.
         """
-        from quantem.widget import Show3DAtoms
+        from quantem.atoms import AtomicModel
 
-        if self.num_sites:
-            sites = np.column_stack(
-                [
-                    self._positions.detach().to("cpu").numpy(),
-                    self._intensity.detach().to("cpu").numpy(),
-                    self._sigma.detach().to("cpu").numpy(),
-                ]
-            ).astype(np.float32)
-        else:
-            sites = np.zeros((0, 5), dtype=np.float32)
-        volume = self._volume.detach().to("cpu").numpy().astype(np.float32)
-        kwargs.setdefault("title", str(self._source.name))
-        kwargs.setdefault("sampling", tuple(float(s) for s in self._sampling))
-        return Show3DAtoms(volume, sites=sites, **kwargs)
+        return AtomicModel.from_atoms(self).show(**kwargs)
 
     def __repr__(self) -> str:
         return (
