@@ -3,7 +3,7 @@ Tensor Decomposition Methods for INR-based reconstructions
 """
 
 import itertools
-from typing import Callable, Literal, Sequence
+from typing import Callable, Literal, Sequence, cast
 
 # import tinycudann as tcnn
 import torch

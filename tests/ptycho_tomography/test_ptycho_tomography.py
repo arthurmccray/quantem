@@ -172,7 +172,8 @@ class TestWiring:
         assert pt.dset.implicit_object is True
         full2d = pt.dset._obj_shape_full_2d(pt.obj_padding_px)
         assert obj.volume_shape == (NUM_Z_VOX, int(full2d[0]), int(full2d[1]))
-        assert (full2d % 8 == 0).all()  # power-of-2 padding adjustment applied
+        # (the forced power-of-2 padding adjustment was removed upstream, e7a11bad: the padding
+        # is now exactly what was asked for, so the full shape is no longer a multiple of 8)
         assert pt.propagators.shape == (NUM_SLICES - 1, N, N)
         assert np.allclose(pt.obj_fov_mask, 1.0)
         h_z, h_y, h_x = obj._box_half_extents
