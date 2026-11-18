@@ -1197,3 +1197,80 @@ class TestScanCenterVerify:
         path2 = tmp_path / "new_cache.zip"
         w2.save(path2, mode="o")
         autoserialize_load(path2).verify_scan_center("positions")
+
+
+class TestScanPositions:
+    """2026-11: per-dataset loaded scan positions and learned per-position corrections."""
+
+    @staticmethod
+    def _perturbed(w: PtychoTomoDatasetRaster) -> list[torch.Tensor]:
+        pos = w.nominal_scan_positions_A
+        pos[0][3] += torch.tensor([0.4, -0.3])
+        pos[2][0] += torch.tensor([-0.2, 0.5])
+        return pos
+
+    def test_load_is_exact_survives_repadding_and_reset_and_keeps_the_pivot(self):
+        w = _pose_wrapper()
+        before = w.scan_positions_px.detach().clone()
+        pivot = w.scan_center_px_for_mode("positions")
+        w.set_scan_positions_init(w.nominal_scan_positions_A)
+        assert torch.equal(w.scan_positions_px.detach(), before), "regular grid in != out"
+        loaded = self._perturbed(w)
+        w.set_scan_positions_init([loaded[0], None, loaded[2]])
+        assert w.scan_positions_loaded == [True, False, True]
+        for t in range(3):
+            target = loaded[t] if t != 1 else w.nominal_scan_positions_A[1]
+            assert torch.allclose(w.scan_positions_init_A[t], target, atol=1e-5), t
+        assert torch.equal(w.scan_center_px_for_mode("positions"), pivot)
+        # the padding setter re-derives the positions: the load is re-applied on top
+        w._set_initial_scan_positions_px((10, 10))
+        assert torch.allclose(w.scan_positions_init_A[0], loaded[0], atol=1e-5)
+        assert torch.allclose(w.scan_center_px_for_mode("positions"), pivot + 2.0)
+        with torch.no_grad():
+            w.scan_positions_px.add_(0.3)
+        w.reset()
+        assert torch.allclose(w.scan_positions_A[2], loaded[2], atol=1e-5)
+        with pytest.raises(ValueError, match="shape"):
+            w.set_scan_positions_init([np.zeros((3, 2)), None, None])
+        with pytest.raises(ValueError, match="datasets"):
+            w.set_scan_positions_init([None, None])
+
+    def test_learn_flag_builds_the_group_and_the_projection_fixes_the_gauge(self):
+        w = _pose_wrapper()
+        w.set_learn_scan_positions(True, max_displacement_A=0.3)
+        assert w._scan_positions_px.requires_grad
+        assert list(w.get_optimization_parameters()) == ["scan_positions"]
+        w.set_optimizer(OptimizerParams.SGD(lr=1.0))
+        g = torch.zeros_like(w._scan_positions_px)
+        g[:N_PER] = torch.linspace(-1.0, 2.0, N_PER)[:, None]  # nonzero mean on dataset 0
+        g[N_PER + 2] = torch.tensor([5.0, 0.0])
+        w._scan_positions_px.grad = g  # pyright: ignore[reportAttributeAccessIssue] -- fake grad
+        w.step_optimizer()
+        disp = w.scan_displacements_A
+        for t in range(3):
+            assert disp[t].mean(dim=0).abs().max() < 1e-5, f"dataset {t} mean not removed"
+        # clipped to 0.3 Å first, so the mean removal can add at most the clipped mean (0.3)
+        assert float(torch.cat(disp).norm(dim=-1).max()) < 0.6 + 1e-5
+        lone = float(disp[1].norm(dim=-1).max())  # one 6.25 Å step, clipped to 0.3 Å
+        assert 0.25 < lone < 0.3 + 1e-5, lone
+        w.set_learn_scan_positions(False)
+        assert not w._scan_positions_px.requires_grad and not w.has_optimizer()
+
+    def test_positions_step_every_batch_while_the_pose_accumulates(self):
+        w = _pose_wrapper()
+        w.set_learn_pose_shifts(True)
+        w.set_learn_scan_positions(True, remove_mean_displacement=False)
+        w.set_optimizer(OptimizerParams.SGD(lr=0.5))
+        w.set_pose_accum(steps_per_iter=1, batches_per_epoch=3)  # M = 3
+        p0 = w.scan_positions_px.detach().clone()
+        for k in range(2):
+            _set_grad(w, torch.ones(3, 2))
+            g = torch.zeros_like(w._scan_positions_px)
+            g[k] = 1.0
+            w._scan_positions_px.grad = g  # pyright: ignore[reportAttributeAccessIssue]
+            w.step_optimizer()
+        moved = (w.scan_positions_px.detach() - p0).abs().sum(dim=1)
+        assert torch.allclose(moved[:2], torch.ones(2)), "each batch's positions take a step"
+        assert torch.equal(moved[2:], torch.zeros(len(moved) - 2))
+        assert torch.equal(w.pose_shifts_A, torch.zeros(3, 2)), "pose waits for M batches"
+        assert w._pose_shifts_accum.abs().sum() > 0

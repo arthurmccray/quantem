@@ -184,3 +184,52 @@ class PtychoTomoPatchData:
     tilt_indices: torch.Tensor
     shifts_A: torch.Tensor | None = None
     window_dz_A: torch.Tensor | None = None
+
+
+def whole_pixel_patch_indices(
+    positions_px: torch.Tensor,
+    roi_shape: tuple[int, int],
+    obj_shape_2d: tuple[int, int],
+) -> torch.Tensor:
+    """Flat object-grid indices ``(B, Hroi, Wroi)`` of the patches at whole-pixel positions.
+
+    The same formula as ``PtychographyDatasetBase._set_patch_indices`` (single-scan
+    ptychography), evaluated per batch instead of stored for every position: the patch of
+    position ``(r0, c0)`` covers rows ``r0 + fftfreq(Hroi) * Hroi`` (FFT order, so the probe's
+    corner-centred layout lines up) and wraps around the object grid (modulo).
+    """
+    h, w = int(roi_shape[0]), int(roi_shape[1])
+    oh, ow = int(obj_shape_2d[0]), int(obj_shape_2d[1])
+    dev = positions_px.device
+    r_ind = torch.fft.fftfreq(h, d=1 / h, device=dev).round().long()
+    c_ind = torch.fft.fftfreq(w, d=1 / w, device=dev).round().long()
+    r0 = positions_px[:, 0].long()
+    c0 = positions_px[:, 1].long()
+    rows = (r0[:, None, None] + r_ind[None, :, None]) % oh
+    cols = (c0[:, None, None] + c_ind[None, None, :]) % ow
+    return rows * ow + cols
+
+
+@dataclass
+class PtychoTomoStackPatchData:
+    """Object-query payload for the stack backend (``ObjectStackTomo``, 2026-11).
+
+    Attributes
+    ----------
+    positions_px:
+        ``(B, 2)`` long: the whole-pixel (rounded) object-grid position of each pattern, pose
+        shift included; the object gathers its patches there (``whole_pixel_patch_indices``).
+        The sub-pixel remainder is applied to the probe by the reconstruction loop.
+    tilt_indices:
+        ``(B,)`` long tensor mapping each batch element to its dataset.
+    roi_shape:
+        ``(Hroi, Wroi)`` patch size.
+    tilt_tan:
+        Optional ``(B, 2)`` small-tilt vector ``(tan_r, tan_c)`` per pattern (diagnostics; the
+        forward operator takes it from the dataset stash). None when every tilt is zero.
+    """
+
+    positions_px: torch.Tensor
+    tilt_indices: torch.Tensor
+    roi_shape: tuple[int, int]
+    tilt_tan: torch.Tensor | None = None

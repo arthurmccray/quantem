@@ -13,14 +13,18 @@ from typing import Any, cast
 import numpy as np
 import pytest
 import torch
+
 from quantem.core import config
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
+from quantem.diffractive_imaging.object_models import ObjectDIP, ObjectPixelated
 from quantem.diffractive_imaging.probe_models import ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
-from quantem.ptycho_tomography.object_models import ObjectVoxelTomo
+from quantem.ptycho_tomography.geometry import PtychoTomoPatchData
+from quantem.ptycho_tomography.object_models import ObjectStackTomo, ObjectVoxelTomo
 from quantem.ptycho_tomography.ptycho_tomography import PtychoTomography
 
 if config.NUM_DEVICES > 0:
@@ -1046,3 +1050,477 @@ class TestPoseDefocus:
         }
         assert torch.equal(rec["shifts_A"], torch.zeros(len(TILTS), 2))
         assert rec["defocus_A"][dset.reference_tilt_idx].item() != 0.0  # reference learned too
+
+
+class TestScanPositionsEndToEnd:
+    """2026-11: loaded and learned per-position corrections through the rotating backend."""
+
+    def test_loaded_offset_equals_the_opposite_pose_shift(self, inverse_crime_setup):
+        """Loading positions moved by +d (Å) on one dataset queries the object exactly where a
+        pose shift of -d does (the pose shift is subtracted from the query, the loaded
+        displacement adds to it)."""
+        arrays, gt = inverse_crime_setup
+        n_per = int(np.prod(SCAN_GPTS))
+        d = torch.tensor([0.7, -0.45])
+        idx = torch.arange(0, n_per)  # tilt 0 (-60 deg), not the reference
+        outs = []
+        for mode in ("load", "shift", "none"):
+            pt = _make_ptycho(_make_wrapper(arrays))
+            obj = pt.obj_model
+            assert isinstance(obj, ObjectVoxelTomo)
+            obj.set_volume(gt)
+            dset = pt.dset
+            assert isinstance(dset, PtychoTomoDatasetRaster)
+            if mode == "load":
+                pos = dset.nominal_scan_positions_A
+                pos[0] = pos[0] + d
+                dset.set_scan_positions_init(pos)
+            elif mode == "shift":
+                table = torch.zeros(len(TILTS), 2)
+                table[0] = -d
+                dset.set_pose_shift_init(table)
+            with torch.no_grad():
+                outs.append(obj.forward(cast("Any", dset.forward(idx, pt.obj_padding_px)[0])))
+        assert torch.allclose(outs[0], outs[1], atol=1e-5)
+        assert (outs[0] - outs[2]).abs().max() > 1e-2
+
+    def test_perturbed_positions_walk_back_with_the_object_frozen(self, inverse_crime_setup):
+        arrays, gt = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        obj = pt.obj_model
+        assert isinstance(obj, ObjectVoxelTomo)
+        obj.set_volume(gt)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        tilt, rows = 3, [8, 15]  # +30 deg; opposite displacements: zero mean (the gauge)
+        truth = dset.nominal_scan_positions_A
+        start = [p.clone() for p in truth]
+        start[tilt][rows[0]] += torch.tensor([0.5, -0.3])
+        start[tilt][rows[1]] -= torch.tensor([0.5, -0.3])
+        dset.set_scan_positions_init(start)
+        dset.set_learn_scan_positions(True)
+        pt.dset._set_targets("amplitude")
+        loss0 = _eval_data_loss(pt)
+
+        def err() -> float:
+            return float(
+                (dset.scan_positions_A[tilt][rows] - truth[tilt][rows]).norm(dim=-1).mean()
+            )
+
+        e0 = err()
+        pt.reconstruct(
+            num_iters=12,
+            optimizer_params={"dataset": {"name": "adam", "lr": 0.05}},
+            batch_size=180,
+        )
+        assert not obj.has_optimizer()  # the object stayed frozen at the truth
+        assert err() < 0.5 * e0, f"position error {e0:.3f} -> {err():.3f} Å"
+        assert pt.iter_losses[-1] < 0.5 * loss0
+        mean_disp = [float(v.mean(dim=0).abs().max()) for v in dset.scan_displacements_A]
+        assert max(mean_disp) < 1e-5, mean_disp
+        assert pt.pose_history[-1]["scan_disp_max_A"] > 0.1
+
+    def test_loaded_and_learned_positions_survive_save_from_file(
+        self, inverse_crime_setup, tmp_path
+    ):
+        arrays, _ = inverse_crime_setup
+        pt = _make_ptycho(_make_wrapper(arrays))
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        start = dset.nominal_scan_positions_A
+        start[1][2] += torch.tensor([0.3, 0.2])
+        dset.set_scan_positions_init([None, start[1], None, None, None])
+        dset.set_learn_scan_positions(True, remove_mean_displacement=False, max_displacement_A=0.8)
+        pt.reconstruct(
+            num_iters=1,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-2},
+                "dataset": {"name": "adam", "lr": 0.05},
+            },
+            batch_size=64,
+        )
+        learned = dset.scan_positions_px.detach().clone()
+        assert not torch.equal(learned, dset.initial_scan_positions_px.to(learned.device))
+        path = tmp_path / "positions.zip"
+        pt.save(path, mode="o")
+        wrapper2 = _make_wrapper(arrays)
+        wrapper2.preprocess(obj_padding_px=(PAD, PAD))
+        d2 = PtychoTomography.from_file(path, dset=wrapper2).dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        assert d2.learn_scan_positions and d2._scan_positions_px.requires_grad
+        assert d2.scan_position_constraints == {
+            "remove_mean_displacement": False,
+            "max_displacement_A": 0.8,
+        }
+        assert d2.scan_positions_loaded == [False, True, False, False, False]
+        assert torch.allclose(d2.scan_positions_init_A[1], start[1], atol=1e-5)
+        assert torch.equal(d2.scan_positions_px.detach().cpu(), learned.cpu())
+
+
+# --- stack backend (2026-11) -------------------------------------------------------------
+ST_PAD = 12  # object grid 34 px >= the 32 px probe window
+ST_SLICES = 4
+ST_DZ = 3.0
+N_SCAN = int(np.prod(SCAN_GPTS))
+
+
+def _stack_wrapper(
+    tilts: list[float], arrays: "list[np.ndarray] | None" = None, grid_pivot: bool = False
+) -> PtychoTomoDatasetRaster:
+    if arrays is None:
+        rng = np.random.default_rng(1)
+        arrays = [rng.uniform(0.5, 1.0, size=(*SCAN_GPTS, N, N)) for _ in tilts]
+    recip = 2 * Q_MAX / N
+    dsets = [
+        Dataset4dstem.from_array(
+            array=np.asarray(a, dtype=np.float32),
+            sampling=(SCAN_STEP_A, SCAN_STEP_A, recip, recip),
+            units=("A", "A", "A^-1", "A^-1"),
+        )
+        for a in arrays
+    ]
+    w = PtychoTomoDatasetRaster.from_dataset4dstem_list(dsets, tilts, verbose=0)
+    if grid_pivot:
+        w.set_scan_center_mode("grid")
+    return w
+
+
+def _stack_pt(
+    wrapper: PtychoTomoDatasetRaster, inner: "Any" = None, dz: float = ST_DZ
+) -> PtychoTomography:
+    obj = (
+        ObjectStackTomo.from_uniform(ST_SLICES, dz, "potential")
+        if inner is None
+        else ObjectStackTomo.from_pixelated(inner)
+    )
+    pt = PtychoTomography.from_models(
+        dset=wrapper,
+        obj_model=obj,
+        probe_model=_make_probe(),
+        detector_model=DetectorPixelated(),
+        rng=0,
+        verbose=False,
+    )
+    # "no_shift": the stack's own (centred) predictions are taken as data unchanged, so the
+    # truth fits exactly (the default CoM re-centring moves them by a fraction of a pixel)
+    pt.preprocess(obj_padding_px=(ST_PAD, ST_PAD), com_fit_function="no_shift")
+    return pt
+
+
+def _smooth_stack(shape: tuple[int, ...], seed: int) -> torch.Tensor:
+    """Band-limited (hence periodic, Fourier-shiftable) positive random stack, rad/slice."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(shape, generator=g)
+    k2 = torch.fft.fftfreq(shape[-2])[:, None] ** 2 + torch.fft.fftfreq(shape[-1])[None] ** 2
+    x = torch.fft.ifft2(torch.fft.fft2(x) * torch.exp(-k2 / (2 * 0.06**2))).real
+    return 0.5 + 0.12 * x / x.std()
+
+
+def _set_stack(pt: PtychoTomography, stack: torch.Tensor) -> None:
+    inner = cast("Any", pt.obj_model).inner
+    with torch.no_grad():
+        inner._obj.copy_(stack.to(inner._obj.device))
+
+
+def _fourier_shift(img: torch.Tensor, d: "tuple[float, float]") -> torch.Tensor:
+    k_r = torch.fft.fftfreq(img.shape[-2])[:, None]
+    k_c = torch.fft.fftfreq(img.shape[-1])[None]
+    ramp = torch.exp(-2j * torch.pi * (k_r * d[0] + k_c * d[1]))
+    return torch.fft.ifft2(torch.fft.fft2(img) * ramp).real
+
+
+def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float((a - b).norm() / b.norm())
+
+
+def _batch_loss_grad(m: Any, param: torch.Tensor, idx: torch.Tensor):
+    targets = m.dset.targets[idx].to(m._single_device)
+    patch_data, _pos, frac, descan = m.dset.forward(idx, m.obj_padding_px)
+    probes = m.probe_model.forward(frac)
+    patches = m.obj_model.forward(patch_data)
+    _, overlap = m.forward_operator(patches, probes, descan)
+    pred = m.detector_model.forward(overlap)
+    loss = m.error_estimate(pred, targets=targets, global_n=m.dset.num_gpts)
+    (g,) = torch.autograd.grad(loss, param)
+    return loss.detach(), g
+
+
+def _stack_data(
+    tilts: list[float], stack: torch.Tensor, setup=None
+) -> tuple[list[np.ndarray], torch.Tensor]:
+    """Inverse-crime data from the stack backend at a known truth (``setup`` sets the pose),
+    with the probe that made them (the probe is rescaled to each dataset's mean intensity, so
+    a model must be given this probe for the truth to fit exactly)."""
+    pt = _stack_pt(_stack_wrapper(tilts))
+    _set_stack(pt, stack)
+    if setup is not None:
+        setup(pt.dset)
+    preds = _forward_all(pt).numpy()
+    arrays = [
+        preds[i * N_SCAN : (i + 1) * N_SCAN].reshape((*SCAN_GPTS, N, N)) for i in range(len(tilts))
+    ]
+    return arrays, pt.probe_model.probe.detach().clone()
+
+
+def _stack_model(
+    tilts: list[float],
+    arrays: list[np.ndarray],
+    probe: torch.Tensor,
+    stack: torch.Tensor,
+    inner=None,
+) -> PtychoTomography:
+    pt = _stack_pt(_stack_wrapper(tilts, arrays), inner=inner)
+    if inner is None:
+        _set_stack(pt, stack)
+    probe_param = cast("Any", pt.probe_model)._probe
+    with torch.no_grad():
+        probe_param.copy_(probe.to(probe_param.device))
+    return pt
+
+
+@pytest.fixture(scope="module")
+def stack_truth() -> torch.Tensor:
+    pt = _stack_pt(_stack_wrapper([0.0]))
+    return _smooth_stack(tuple(pt.obj_model.obj.shape), seed=3)
+
+
+class TestStackBackend:
+    """``ObjectStackTomo``: whole-pixel gathers + per-dataset tilted propagator."""
+
+    def test_one_dataset_matches_plain_ptychography(self, stack_truth):
+        """One dataset, zero tilt / defocus / shift: the same loss (bit for bit) and object
+        gradient as single-scan ``Ptychography`` with the wrapped ``ObjectPixelated``."""
+        rng = np.random.default_rng(0)
+        arr = rng.uniform(0.5, 1.0, size=(*SCAN_GPTS, N, N)).astype(np.float32)
+        pt = _stack_pt(_stack_wrapper([0.0], [arr]))
+        _set_stack(pt, stack_truth)
+        recip = 2 * Q_MAX / N
+        d4 = Dataset4dstem.from_array(
+            array=arr,
+            sampling=(SCAN_STEP_A, SCAN_STEP_A, recip, recip),
+            units=("A", "A", "A^-1", "A^-1"),
+        )
+        ds = PtychographyDatasetRaster.from_dataset4dstem(
+            d4, verbose=False, learn_descan=False, learn_scan_positions=False
+        )
+        pix = ObjectPixelated.from_array(stack_truth.clone(), ST_DZ, obj_type="potential")
+        ref = Ptychography.from_models(ds, pix, _make_probe(), DetectorPixelated(), rng=0)
+        ref.verbose = 0
+        ref.preprocess(
+            obj_padding_px=(ST_PAD, ST_PAD),
+            com_fit_function="no_shift",
+            force_com_rotation=0.0,
+            force_com_transpose=False,
+            plot_rotation=False,
+            plot_com=False,
+        )
+        idx = torch.arange(N_SCAN)
+        loss, grad = _batch_loss_grad(pt, cast("Any", pt.obj_model).inner._obj, idx)
+        loss_ref, grad_ref = _batch_loss_grad(ref, pix._obj, idx)
+        assert torch.equal(loss, loss_ref)
+        assert torch.allclose(grad, grad_ref, rtol=1e-5, atol=1e-7 * float(grad_ref.abs().max()))
+        assert pt.dset._last_tilt_tan is None  # zero tilt: the plain multislice path
+
+    def test_tilt_shears_the_deeper_slices_and_mixed_batches_match(self, stack_truth):
+        """At a pure tilt +theta about the scan columns the data equal the zero-tilt data of a
+        stack whose slice at depth z (from the middle of the stack) is moved by
+        +z*tan(theta) along the rows: the beam walks toward NEGATIVE rows as it goes deeper,
+        so the deeper slices are seen moved toward POSITIVE rows. The opposite shear is far
+        worse. Mixed two-dataset batches give exactly the per-dataset results."""
+        theta = 4.0
+        pt = _stack_pt(_stack_wrapper([0.0, theta]))
+        _set_stack(pt, stack_truth)
+        preds = _forward_all(pt)  # batches of 64 mix the two datasets (36 patterns each)
+        dset = pt.dset
+        with torch.no_grad():
+            idx = torch.arange(N_SCAN, 2 * N_SCAN)
+            patch_data, _pos, frac, descan = dset.forward(idx, pt.obj_padding_px)
+            probes = pt.probe_model.forward(frac)
+            _, ov = pt.forward_operator(pt.obj_model.forward(patch_data), probes, descan)
+            alone = pt.detector_model.forward(ov).cpu()
+        assert torch.allclose(preds[N_SCAN:], alone, rtol=1e-6, atol=1e-6)
+        tan = float(np.tan(np.deg2rad(theta)))
+        z_mid = (ST_SLICES - 1) * ST_DZ / 2
+        errs = {}
+        for sign in (+1.0, -1.0):
+            sheared = torch.stack(
+                [
+                    _fourier_shift(stack_truth[s], (sign * (s * ST_DZ - z_mid) * tan, 0.0))
+                    for s in range(ST_SLICES)
+                ]
+            )
+            _set_stack(pt, sheared)
+            errs[sign] = _rel(preds[N_SCAN:], _forward_all(pt)[:N_SCAN])
+        unsheared = _rel(preds[N_SCAN:], preds[:N_SCAN])
+        assert errs[1.0] < 0.15 * unsheared, (errs, unsheared)
+        assert errs[-1.0] > unsheared, (errs, unsheared)
+
+    def test_agrees_with_the_voxel_backend(self):
+        """Same object, same pose table: a pose shift at zero tilt, a pure tilt, and a tilt
+        about a turned axis (z1 = -z3) give the voxel backend's intensities to within its
+        interpolation error, far closer than the unmoved / mirrored predictions."""
+        n = N_SCAN
+        cases = (
+            ("shift", [0.0, 0.0], (0.0, 0.0), (0.6, -0.4)),
+            ("tilt", [0.0, 5.0], (0.0, 0.0), (0.0, 0.0)),
+            ("turned axis", [0.0, 5.0], (35.0, -35.0), (0.0, 0.0)),
+        )
+        for name, tilts, (z1, z3), shift in cases:
+            wv = _stack_wrapper(tilts, grid_pivot=True)  # pivot on the grid centre: same pixels
+            voxel = ObjectVoxelTomo.from_uniform(
+                thickness_A=ST_SLICES * ST_DZ, num_slices=ST_SLICES
+            )
+            ptv = PtychoTomography.from_models(
+                wv, voxel, _make_probe(), DetectorPixelated(), rng=0, verbose=False
+            )
+            with pytest.warns(DeprecationWarning):
+                ptv.preprocess(obj_padding_px=(ST_PAD, ST_PAD))
+            vol = 0.4 * _gt_volume(voxel)
+            voxel.set_volume(vol)
+            d, hh, ww = voxel.volume_shape
+            rows = torch.arange(hh, dtype=torch.float32) - (hh - 1) / 2
+            cols = torch.arange(ww, dtype=torch.float32) - (ww - 1) / 2
+            grid = torch.stack(torch.meshgrid(rows, cols, indexing="ij"), dim=-1)[None]
+            flat = PtychoTomoPatchData(
+                coords_yx_A=grid.to(voxel.device),
+                rotations=torch.eye(3)[None].to(voxel.device),
+                tilt_indices=torch.zeros(1, dtype=torch.long),
+            )
+            with torch.no_grad():  # the voxel backend's own zero-tilt slab phases
+                phases = torch.angle(voxel.forward(flat))[:, 0].cpu()
+            pts = _stack_pt(_stack_wrapper(tilts), dz=voxel.slab_thickness_A)
+            assert tuple(pts.obj_model.obj.shape) == tuple(phases.shape), name
+            _set_stack(pts, phases)
+            unmoved = _forward_all(ptv)[:n]
+            for w in (wv, cast("Any", pts.dset)):
+                w.set_pose_angle_init([0.0, z1], [0.0, z3])
+                w.set_pose_shift_init([[0.0, 0.0], list(shift)])
+            p_vox = _forward_all(ptv)[n:]
+            p_stack = _forward_all(pts)[n:]
+            wv.set_pose_angle_init([0.0, -z1], [0.0, -z3])
+            wv.set_pose_shift_init([[0.0, 0.0], [-shift[0], -shift[1]]])
+            wv._pose_dtheta.data[1] = -2.0 * tilts[1]  # mirrored tilt for the tilt cases
+            mirrored = _forward_all(ptv)[n:]
+            err = _rel(p_stack, p_vox)
+            assert err < 0.5 * _rel(p_vox, unmoved), (name, err, _rel(p_vox, unmoved))
+            assert err < 0.5 * _rel(p_stack, mirrored), (name, err, _rel(p_stack, mirrored))
+
+    def test_tilt_gradients_via_dtheta_and_z1(self, stack_truth):
+        """d loss / d dtheta is nonzero at zero tilt and points to the truth; so does
+        d loss / d z1 at a nonzero tilt (at zero tilt z1 cannot act on a stack: the beam
+        direction does not depend on it). Both match finite differences."""
+        for name, tilts, truth, model, h in (
+            ("dtheta", [0.0, 0.0], ("tilt", 1.5), ("tilt", 0.0), 0.1),
+            ("z1", [0.0, 3.0], ("z1", 40.0), ("z1", 0.0), 2.0),
+        ):
+
+            def apply(w: PtychoTomoDatasetRaster, which: str, val: float) -> None:
+                if which == "tilt":
+                    w.set_pose_tilt_init([0.0, val])
+                else:
+                    w.set_pose_angle_init([0.0, val], [0.0, 0.0])
+
+            arrays, probe = _stack_data(tilts, stack_truth, lambda w: apply(w, *truth))
+            pt = _stack_model(tilts, arrays, probe, stack_truth)
+            dset = pt.dset
+            assert isinstance(dset, PtychoTomoDatasetRaster)
+            apply(dset, *model)
+            param = dset._pose_dtheta if name == "dtheta" else dset._pose_z1
+            if name == "dtheta":
+                dset.set_learn_pose_tilt(True)
+            else:
+                dset.set_learn_pose_angles(True)
+            idx = torch.arange(N_SCAN, 2 * N_SCAN)
+            _loss, g = _batch_loss_grad(pt, param, idx)
+            analytic = float(g[1])
+            assert analytic < 0, f"{name}: the loss must fall toward the truth ({analytic})"
+            vals = []
+            for sgn in (1.0, -1.0):
+                apply(dset, model[0], model[1] + sgn * h)
+                with torch.no_grad():
+                    vals.append(TestPoseShifts._batch_loss(pt, idx).item())
+            fd = (vals[0] - vals[1]) / (2 * h)
+            assert analytic == pytest.approx(fd, rel=0.1), name
+
+    def test_dip_model_trains_and_positions_get_a_gradient(self, stack_truth):
+        """An ``ObjectDIP`` stack trains for a few steps (loss falls, shapes right), and a
+        loaded position error gets a gradient through the probe shift that points back."""
+        tilts = [0.0, 2.0]
+        arrays, probe = _stack_data(tilts, stack_truth)
+        s, hh, ww = stack_truth.shape
+        torch.manual_seed(0)
+        net = torch.nn.Conv2d(s, s, 3, padding=1)
+        dip = ObjectDIP.from_model(
+            model=net,
+            model_input=stack_truth[None].clone(),
+            num_slices=s,
+            slice_thicknesses=ST_DZ,
+            input_noise_std=0.0,
+            obj_type="potential",
+        )
+        pt = _stack_model(tilts, arrays, probe, stack_truth, inner=dip)
+        assert tuple(pt.obj_model.obj.shape) == (s, hh, ww)
+        pt.reconstruct(
+            num_iters=4, optimizer_params={"object": {"name": "adam", "lr": 1e-3}}, batch_size=36
+        )
+        losses = pt.iter_losses
+        assert losses[-1] < losses[0], losses
+        # scan positions through the stack: two opposite errors, gradient points back
+        pt2 = _stack_model(tilts, arrays, probe, stack_truth)
+        dset = pt2.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        start = dset.nominal_scan_positions_A
+        d = torch.tensor([0.4, -0.3])
+        start[1][9] += d
+        start[1][20] -= d
+        dset.set_scan_positions_init(start)
+        dset.set_learn_scan_positions(True)
+        _loss, g = _batch_loss_grad(pt2, dset._scan_positions_px, torch.arange(N_SCAN, 2 * N_SCAN))
+        g = g.cpu()
+        assert float(g[N_SCAN + 9] @ d) > 0 and float(g[N_SCAN + 20] @ -d) > 0
+        assert float(g[N_SCAN + 9].norm()) > 10 * float(g[N_SCAN + 3].norm())
+
+    def test_intensity_scale_and_save_from_file(self, stack_truth, tmp_path):
+        tilts = [0.0, 1.0]
+        arrays, _probe = _stack_data(tilts, stack_truth)
+        arrays[1] = arrays[1] * 3.0  # a 3x dose dataset
+        pt = _stack_pt(_stack_wrapper(tilts, arrays))
+        _set_stack(pt, stack_truth)
+        dset = pt.dset
+        assert isinstance(dset, PtychoTomoDatasetRaster)
+        base = _forward_all(pt)
+        dset.set_intensity_scale([1.0, 4.0])
+        scaled = _forward_all(pt)
+        assert torch.equal(scaled[:N_SCAN], base[:N_SCAN])
+        assert torch.allclose(scaled[N_SCAN:], 4.0 * base[N_SCAN:], rtol=1e-5)
+        dset.set_intensity_scale("auto")
+        assert torch.allclose(dset.intensity_scale, torch.tensor([0.5, 1.5]), rtol=1e-3)
+        # save / resume: object, tilt, positions, flags and the scale come back
+        dset.set_learn_pose_tilt(True)
+        dset.set_learn_scan_positions(True)
+        pt.reconstruct(
+            num_iters=2,
+            optimizer_params={
+                "object": {"name": "adam", "lr": 1e-3},
+                "dataset": {
+                    "scan_positions": {"name": "adam", "lr": 0.02},
+                    "pose_tilt": {"name": "adam", "lr": 0.05},
+                },
+            },
+            batch_size=36,
+        )
+        assert dset.pose_dtheta_deg[0].item() == 0.0  # reference row pinned
+        assert dset.pose_dtheta_deg[1].item() != 0.0
+        before = _forward_all(pt)
+        path = tmp_path / "stack.zip"
+        pt.save(path, mode="o")
+        wrapper2 = _stack_wrapper(tilts, arrays)
+        wrapper2.preprocess(obj_padding_px=(ST_PAD, ST_PAD))
+        loaded = PtychoTomography.from_file(path, dset=wrapper2)
+        d2 = loaded.dset
+        assert isinstance(d2, PtychoTomoDatasetRaster)
+        assert d2.gathers_whole_pixels and not d2.implicit_object
+        assert d2.learn_pose_tilt and d2.learn_scan_positions
+        assert torch.equal(d2.pose_dtheta_deg, dset.pose_dtheta_deg.cpu())
+        assert torch.allclose(d2.intensity_scale, dset.intensity_scale.cpu())
+        assert torch.allclose(_forward_all(loaded), before, rtol=1e-5, atol=1e-6)

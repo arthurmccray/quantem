@@ -21,7 +21,7 @@ patch-index path through a rotated volume.
 
 import warnings
 from dataclasses import replace
-from typing import Any, Literal
+from typing import Any, Literal, Sequence, cast
 
 import numpy as np
 import torch
@@ -35,7 +35,12 @@ from quantem.diffractive_imaging.dataset_models import (
     DatasetConstraints,
     PtychographyDatasetRaster,
 )
-from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, rot_beam_to_spec
+from quantem.ptycho_tomography.geometry import (
+    PtychoTomoPatchData,
+    PtychoTomoStackPatchData,
+    rot_beam_to_spec,
+    whole_pixel_patch_indices,
+)
 
 
 class PtychoTomoDatasetRaster(DatasetConstraints):
@@ -46,7 +51,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     the inherited storage, so ``num_gpts = sum(per-tilt scan points)`` and all per-position
     parameters/targets are flat-indexed. ``_tilt_offsets`` maps flat indices to tilts.
 
-    Scope: known tilt angles, no descan / scan-position learning. Every tilt must share the
+    Scope: known tilt angles, no descan learning. Per-scan-position correction (2026-11) is
+    opt-in: ``set_scan_positions_init`` loads measured positions per dataset and
+    ``set_learn_scan_positions`` learns them (see the scan-position region). Every tilt must share the
     detector geometry (``roi_shape``, ``detector_sampling``); the scan grid (``gpts``,
     ``scan_sampling``) MAY differ per tilt (2026-09-09, plan-view step 02: the scan across the
     layers widens with tilt). ASSUMPTION BAKED IN: the object grid, the lateral FOV and the scan
@@ -86,11 +93,39 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     _defocus_offset_A: nn.Parameter
     _defocus_offset_init_A: torch.Tensor
     _defocus_offset_accum: torch.Tensor
+    # lazily registered buffers (2026-11; see _ensure_pose_tilt_state /
+    # _ensure_scan_position_state / set_intensity_scale)
+    _pose_dtheta_init: torch.Tensor
+    _pose_dtheta_accum: torch.Tensor
+    _scan_pos_load_A: torch.Tensor
+    _scan_pos_loaded: torch.Tensor
+    _intensity_scale: torch.Tensor
     # class-level defaults so a wrapper deserialized from a pre-defocus cache (which bypasses
     # ``__init__``) reads them in ``forward`` without any per-call guard; the parameter and
     # buffers themselves are materialised lazily by ``_ensure_defocus_state``
     _learn_defocus: bool = False
     _defocus_active: bool = False
+    # per-scan-position correction (2026-11), same lazy pattern: the load buffers
+    # (``_scan_pos_load_A`` / ``_scan_pos_loaded``) exist only once positions were loaded, and
+    # the plain geometry attributes below are rebuilt by every ``_set_initial_scan_positions_px``
+    _scan_pos_remove_mean: bool = True
+    _scan_pos_max_disp_A: float | None = None
+    # (num_tilts, 2) px: where each dataset's Å origin (its nominal anchor) sits in the flat grid
+    _scan_block_origin_px: torch.Tensor | None = None
+    # (num_gpts, 2) px: the regular (nominal) grid after centring -- the pivot is taken from it
+    _scan_nominal_px: torch.Tensor | None = None
+    # learnable small-tilt offset ``_pose_dtheta`` (2026-11, stack backend); lazy like the above
+    _learn_pose_tilt: bool = False
+    # stack backend (whole-pixel gathers + tilted propagator) instead of the rotated query
+    _whole_pixel_object: bool = False
+    # transient per-batch stashes for PtychoTomography.forward_operator (consumed once, like
+    # ``_last_probe_dz_A``): the per-pattern small-tilt vector ``(tan_r, tan_c)`` of the stack
+    # backend and the per-pattern probe amplitude factor sqrt(intensity scale)
+    _last_tilt_tan: torch.Tensor | None = None
+    _last_amp_scale: torch.Tensor | None = None
+    _stack_tilt_active: bool | None = None  # None = recompute on the next stack forward
+    _intensity_scale_active: bool = False
+    _pose_last_tilt_grad_max: float = 0.0
 
     def __init__(
         self,
@@ -343,8 +378,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     def set_learn_pose_shifts(self, enabled: bool) -> None:
         """Make the per-tilt shifts learnable (adds the ``pose_shifts`` optimizer group).
 
-        ``_pose_dtheta`` is re-frozen here unconditionally (never learned); the z1 / z3 slots are
-        owned by ``set_learn_pose_angles``. Disabling with an optimizer attached removes it when
+        ``_pose_dtheta`` is owned by ``set_learn_pose_tilt`` (frozen unless that is on); the
+        z1 / z3 slots are owned by ``set_learn_pose_angles``. Disabling with an optimizer attached removes it when
         nothing else is learned, otherwise the dataset optimizer is rebuilt without the group
         (a learned table stays applied either way).
         """
@@ -352,7 +387,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         changed = enabled != self._learn_pose_shifts
         self._learn_pose_shifts = enabled
         self._pose_shifts.requires_grad_(enabled)
-        self._pose_dtheta.requires_grad_(False)
+        self._pose_dtheta.requires_grad_(self.learn_pose_tilt)
         self._refresh_pose_shifts_active()
         self._sync_pose_optimizer(changed)
 
@@ -362,17 +397,18 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def set_learn_pose_angles(self, enabled: bool) -> None:
         """Make the per-tilt tilt-axis angles z1 and z3 learnable (one ``pose_angles`` optimizer
-        group, LR in deg/step). ``_pose_dtheta`` stays frozen. The angle path needs no forward
-        change: ``rotations()`` already feeds both parameters into ``rot_beam_to_spec``, and the
-        autograd graph through it is only built while ``requires_grad`` is set (the no-pose path
-        stays bit-identical)."""
+        group, LR in deg/step). ``_pose_dtheta`` is left to ``set_learn_pose_tilt``. The angle
+        path needs no forward change: ``rotations()`` already feeds both parameters into
+        ``rot_beam_to_spec``, and the autograd graph through it is only built while
+        ``requires_grad`` is set (the no-pose path stays bit-identical)."""
         self._ensure_pose_angle_state()
         enabled = bool(enabled)
         changed = enabled != self._learn_pose_angles
         self._learn_pose_angles = enabled
         self._pose_z1.requires_grad_(enabled)
         self._pose_z3.requires_grad_(enabled)
-        self._pose_dtheta.requires_grad_(False)
+        self._pose_dtheta.requires_grad_(self.learn_pose_tilt)
+        self._stack_tilt_active = None
         self._sync_pose_optimizer(changed)
 
     @property
@@ -391,6 +427,87 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         self._defocus_offset_A.requires_grad_(enabled)
         self._refresh_defocus_active()
         self._sync_pose_optimizer(changed)
+
+    @property
+    def learn_pose_tilt(self) -> bool:
+        return bool(getattr(self, "_learn_pose_tilt", False))
+
+    def set_learn_pose_tilt(self, enabled: bool) -> None:
+        """Make the per-dataset tilt-angle offset ``_pose_dtheta`` learnable (one ``pose_tilt``
+        optimizer group, LR in deg/step; 2026-11, written for the stack backend, where it sets
+        the size of the per-slice wave shift). ``rotations()`` already adds it to the tilt
+        angle, so it also works with the rotating backends. The reference dataset's row is the
+        gauge (a common tilt of every dataset is a shear of the object) and is pinned like the
+        shift and angle rows. Independent of ``set_learn_pose_angles`` (z1 / z3)."""
+        self._ensure_pose_tilt_state()
+        enabled = bool(enabled)
+        changed = enabled != self.learn_pose_tilt
+        self._learn_pose_tilt = enabled
+        self._pose_dtheta.requires_grad_(enabled)
+        self._stack_tilt_active = None
+        self._sync_pose_optimizer(changed)
+
+    def _has_pose_tilt_state(self) -> bool:
+        return "_pose_dtheta_init" in self._buffers
+
+    def _ensure_pose_tilt_state(self) -> None:
+        """Materialise the tilt-offset baseline / accumulator buffers (zeros = today's state:
+        ``_pose_dtheta`` frozen at zero). Lazy so that wrappers that never learn the tilt keep
+        exactly their old state dict."""
+        if self._has_pose_tilt_state():
+            return
+        ref = self._pose_dtheta.detach()
+        self.register_buffer("_pose_dtheta_init", torch.zeros_like(ref))
+        self.register_buffer("_pose_dtheta_accum", torch.zeros_like(ref))
+
+    def _zero_pose_tilt_accum(self) -> None:
+        if self._has_pose_tilt_state():
+            self._pose_dtheta_accum.zero_()
+
+    def set_pose_tilt_init(
+        self, dtheta_deg: "float | np.ndarray | torch.Tensor | list[Any]"
+    ) -> None:
+        """Set the per-dataset tilt-offset baseline ``(num_tilts,)`` in degrees (a scalar
+        broadcasts) and start ``_pose_dtheta`` there; ``reset()`` returns to it. The reference
+        dataset's entry is forced to zero (gauge)."""
+        self._ensure_pose_tilt_state()
+        p = self._pose_dtheta
+        t = torch.as_tensor(np.asarray(dtheta_deg, dtype=float), dtype=p.dtype, device=p.device)
+        if t.ndim == 0:
+            t = t.expand(self.num_tilts).clone()
+        if t.shape != (self.num_tilts,):
+            raise ValueError(
+                f"dtheta_deg must be a scalar or have shape ({self.num_tilts},), got "
+                f"{tuple(t.shape)}"
+            )
+        ref = self._reference_tilt_idx
+        if bool((t[ref] != 0).item()):
+            warnings.warn(
+                f"reference tilt {ref} tilt-offset init {float(t[ref])} deg ignored (gauge: "
+                "zeroed)",
+                stacklevel=2,
+            )
+            t = t.clone()
+            t[ref] = 0.0
+        with torch.no_grad():
+            self._pose_dtheta_init.copy_(t)
+            p.copy_(t)
+            self._pose_shifts_accum.zero_()
+            self._zero_pose_angle_accum()
+            self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
+        self._pose_accum_count = 0
+        self._stack_tilt_active = None
+
+    @property
+    def pose_dtheta_deg(self) -> torch.Tensor:
+        """Detached copy of the live per-dataset tilt offset, ``(num_tilts,)`` degrees."""
+        return self._pose_dtheta.detach().clone()
+
+    @property
+    def pose_dtheta_init_deg(self) -> torch.Tensor:
+        self._ensure_pose_tilt_state()
+        return self._pose_dtheta_init.detach().clone()
 
     def _sync_pose_optimizer(self, changed: bool) -> None:
         """Keep an attached dataset optimizer consistent with the learn flags.
@@ -532,6 +649,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
             self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
         self._pose_accum_count = 0
         self._refresh_pose_shifts_active()
 
@@ -589,7 +707,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
             self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
         self._pose_accum_count = 0
+        self._stack_tilt_active = None
 
     def set_defocus_init(self, offsets_A: "float | np.ndarray | torch.Tensor | list[Any]") -> None:
         """Set the per-dataset defocus-offset baseline ``(num_tilts,)`` in Å (a scalar
@@ -613,6 +733,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
             self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
         self._pose_accum_count = 0
         self._refresh_defocus_active()
 
@@ -678,6 +799,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
             self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
 
     @property
     def pose_accum_steps(self) -> int:
@@ -759,6 +881,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 return float(pg["lr"])
         return 0.0
 
+    # dataset groups that are not pose groups: they step with the normal per-batch optimizer
+    # step and are left out of the pose LR schedule (warm-up / hold / decay)
+    _NON_POSE_GROUPS: tuple[str, ...] = ("descan", "scan_positions")
+
     def _pose_lr_before_step(self) -> None:
         """Warm-up: LR for pose step k (1-based) = base * min(1, k / warmup), per group."""
         if self._optimizer is None or self._pose_lr_warmup <= 0:
@@ -768,6 +894,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         k = self._pose_step_count + 1
         if k <= self._pose_lr_warmup:
             for name, pg in self._pose_param_groups():
+                if name in self._NON_POSE_GROUPS:
+                    continue
                 pg["lr"] = self._pose_lr_base[name] * k / float(self._pose_lr_warmup)
 
     def _pose_lr_step(self) -> None:
@@ -777,23 +905,38 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             return
         floors = {
             "pose_angles": self._pose_angle_lr_floor,
+            "pose_tilt": self._pose_angle_lr_floor,  # deg/step like the angles
             "pose_defocus": getattr(self, "_pose_defocus_lr_floor", 0.0),
         }
         for name, pg in self._pose_param_groups():
+            if name in self._NON_POSE_GROUPS:
+                continue
             floor = floors.get(name, self._pose_lr_floor)
             pg["lr"] = max(floor, float(pg["lr"]) * self._pose_lr_decay)
+
+    def _learning_pose(self) -> bool:
+        return (
+            self._learn_pose_shifts
+            or self.learn_pose_angles
+            or self.learn_defocus
+            or self.learn_pose_tilt
+        )
 
     def step_optimizer(self) -> None:
         """Optimizer step with optional gradient accumulation and the reference-tilt gauge.
 
         Called once per batch AFTER the DDP all-reduce, so every rank accumulates the identical
         rank-averaged gradient and takes the identical step (no extra collective needed).
+        Learned scan positions (``set_learn_scan_positions``) are NOT accumulated: each batch
+        holds the gradient of its own positions only, so they take the normal step on every
+        batch (between pose steps the pose gradients are set aside so only the positions
+        move), followed by the scan-position projection (``_project_scan_positions``).
         """
         if self._optimizer is None:
             return
-        learning = self._learn_pose_shifts or self.learn_pose_angles or self.learn_defocus
-        if not learning or self._pose_accum_steps <= 1:
+        if not self._learning_pose() or self._pose_accum_steps <= 1:
             self._pose_step(mean_of=None)
+            self._project_scan_positions()
             return
         g = self._pose_shifts.grad
         if g is not None:
@@ -807,16 +950,33 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         if self.learn_defocus and self._defocus_offset_A.grad is not None:
             with torch.no_grad():
                 self._defocus_offset_accum.add_(self._defocus_offset_A.grad)
+        if self.learn_pose_tilt and self._pose_dtheta.grad is not None:
+            with torch.no_grad():
+                self._pose_dtheta_accum.add_(self._pose_dtheta.grad)
         self._pose_accum_count += 1
         if self._pose_accum_count >= self._pose_accum_steps:
             self._pose_step(mean_of=self._pose_accum_count)
+        elif self.learn_scan_positions:
+            # positions-only step: optimizers skip parameters whose grad is None, so the pose
+            # slots (already accumulated above) stay put and keep their Adam state
+            for p in self._pose_parameters():
+                p.grad = None
+            self._optimizer.step()
+        self._project_scan_positions()
+
+    def _pose_parameters(self) -> list[nn.Parameter]:
+        params = [self._pose_shifts, self._pose_z1, self._pose_z3, self._pose_dtheta]
+        if self._has_defocus_state():
+            params.append(self._defocus_offset_A)
+        return params
 
     def _pose_step(self, mean_of: int | None) -> None:
         if self._optimizer is None:
             return
         angles = self.learn_pose_angles
         defocus = self.learn_defocus
-        learning = self._learn_pose_shifts or angles or defocus
+        tilt = self.learn_pose_tilt
+        learning = self._learning_pose()
         if mean_of is not None:
             self._pose_shifts.grad = self._pose_shifts_accum / float(max(1, mean_of))
             if angles:
@@ -824,6 +984,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                     p.grad = acc / float(max(1, mean_of))
             if defocus:
                 self._defocus_offset_A.grad = self._defocus_offset_accum / float(max(1, mean_of))
+            if tilt:
+                self._pose_dtheta.grad = self._pose_dtheta_accum / float(max(1, mean_of))
         ref = self._reference_tilt_idx
         if self._learn_pose_shifts and self._pose_shifts.grad is not None:
             self._pose_shifts.grad[ref] = 0.0  # gauge: after the all-reduce, before the step
@@ -850,6 +1012,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             n = max(1, int(gd.shape[0]))
             self._pose_last_defocus_grad_rms = float((gd.square().sum() / n).sqrt().item())
             self._pose_last_defocus_grad_max = float(gd.abs().max().item())
+        if tilt and self._pose_dtheta.grad is not None:
+            self._pose_dtheta.grad[ref] = 0.0  # same gauge mask as the angle rows
+            self._pose_last_tilt_grad_max = float(self._pose_dtheta.grad.abs().max().item())
         if learning:
             self._pose_lr_before_step()
         self._optimizer.step()
@@ -860,6 +1025,10 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             with torch.no_grad():
                 for p, init, _acc in self._pose_angle_slots():
                     p[ref] = init[ref]  # re-pin the reference angle rows
+        if tilt:
+            with torch.no_grad():
+                self._pose_dtheta[ref] = self._pose_dtheta_init[ref]
+            self._stack_tilt_active = None
         if learning:
             self._pose_step_count += 1
             self._pose_lr_step()
@@ -868,6 +1037,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 self._pose_shifts_accum.zero_()
                 self._zero_pose_angle_accum()
                 self._zero_defocus_accum()
+                self._zero_pose_tilt_accum()
             self._pose_accum_count = 0
 
     def flush_pose_accum(self) -> None:
@@ -890,8 +1060,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """Learnable dataset groups: the base descan / scan-position groups plus ``pose_shifts``
-        (shifts), ``pose_angles`` (z1, z3) and ``pose_defocus`` (per-dataset defocus offset)
-        when learned. This dict is also the DDP surface (broadcast + all-reduce iterate it), so
+        (shifts), ``pose_angles`` (z1, z3), ``pose_defocus`` (per-dataset defocus offset) and
+        ``pose_tilt`` (per-dataset tilt offset) when learned. This dict is also the DDP surface (broadcast + all-reduce iterate it), so
         adding a group here is the whole multi-GPU integration."""
         groups = super().get_optimization_parameters()
         if self._learn_pose_shifts:
@@ -900,6 +1070,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             groups["pose_angles"] = [self._pose_z1, self._pose_z3]
         if self.learn_defocus:
             groups["pose_defocus"] = [self._defocus_offset_A]
+        if self.learn_pose_tilt:
+            groups["pose_tilt"] = [self._pose_dtheta]
         return groups
 
     def _normalize_optimizer_params(self, params):
@@ -918,14 +1090,16 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                     ("pose_shifts", getattr(self, "_learn_pose_shifts", False)),
                     ("pose_angles", getattr(self, "_learn_pose_angles", False)),
                     ("pose_defocus", self.learn_defocus),
+                    ("pose_tilt", self.learn_pose_tilt),
                 )
                 if on
             ]
             if not learnable and not isinstance(spec, OptimizerParams.NoneOptimizer):
                 warnings.warn(
                     f"{type(self).__name__}: an optimizer was requested but nothing is learnable "
-                    "(learn_descan, learn_scan_positions, learn_pose_shifts, learn_pose_angles "
-                    "and learn_defocus are all False); the optimizer will be removed.",
+                    "(learn_descan, learn_scan_positions, learn_pose_shifts, learn_pose_angles, "
+                    "learn_defocus and learn_pose_tilt are all False); the optimizer will be "
+                    "removed.",
                     stacklevel=2,
                 )
             return {key: replace(spec) for key in learnable} if learnable else {}
@@ -1072,8 +1246,8 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         obj_padding_px: np.ndarray | tuple[int, ...] | None,
         positions_mask: np.ndarray | None = None,
     ) -> None:
-        """Delegate per tilt, centre every tilt's block on the reference tilt's scan centre,
-        then concatenate into the inherited flat parameters.
+        """Delegate per tilt, add any loaded positions, centre every tilt's block on the
+        reference tilt's scan centre, then concatenate into the inherited flat parameters.
 
         The base raster class anchors each tilt's positions at its own top-left corner (min ->
         0 + padding), so tilts with different scan extents would sit off the rotation pivot by
@@ -1081,19 +1255,267 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         §Geometry), so each block is shifted by ``centre_ref - centre_i`` (px, per axis; the
         centre is the midpoint of the block's extent). The shift is exactly zero when all grids
         are equal, so equal-grid series are unchanged.
+
+        Loaded positions (``set_scan_positions_init``) are added to the regular grid as the
+        displacement ``(loaded - nominal) / sampling`` BEFORE the centring, and the centring
+        uses the NOMINAL (regular-grid) centres, so a few moved positions never move the pivot
+        and loading the regular grid itself gives the very same floats as loading nothing.
+        Runs again whenever the padding changes (the ``obj_padding_px`` setter) and the loaded
+        positions are re-applied each time; learned positions are replaced by the initial ones.
         """
         for ds in self.tilt_datasets:
             ds._set_initial_scan_positions_px(obj_padding_px, positions_mask)
         blocks = [ds.scan_positions_px.data.detach().cpu() for ds in self.tilt_datasets]
+        pad = torch.as_tensor(
+            np.zeros(2) if obj_padding_px is None else np.asarray(obj_padding_px, dtype=float),
+            dtype=blocks[0].dtype,
+        )
+        samp = torch.as_tensor(self._px_sampling(), dtype=blocks[0].dtype)
 
         def _centre(b: torch.Tensor) -> torch.Tensor:
             return (b.min(dim=0).values + b.max(dim=0).values) / 2.0
 
         c_ref = _centre(blocks[self.ref_tilt_index])
-        blocks = [b + (c_ref - _centre(b)) for b in blocks]
-        positions = torch.cat(blocks)
+        shifts = [c_ref - _centre(b) for b in blocks]
+        # the regular grid in the documented Å convention (anchor = the dataset's first /
+        # min-corner position), kept so the accessors and the load use identical floats
+        self._scan_nominal_A = [(b - pad) * samp for b in blocks]
+        loaded = self._loaded_scan_positions_A()
+        moved = []
+        for i, b in enumerate(blocks):
+            p = loaded[i]
+            if p is not None:
+                mask = self.tilt_datasets[i].positions_mask.detach().cpu().reshape(-1)
+                if not bool(mask.all()):
+                    p = p[mask]
+                b = b + (p - self._scan_nominal_A[i]) / samp
+            moved.append(b + shifts[i])
+        positions = torch.cat(moved)
+        self._scan_block_origin_px = torch.stack([pad + sh for sh in shifts]).to(torch.float64)
+        self._scan_pivot_px = c_ref.clone()
         self.scan_positions_px = positions
         self.initial_scan_positions_px = self.scan_positions_px.data.clone()
+        if any(p is not None for p in loaded) and self.constraints.clip_scan_positions:
+            full2d = torch.as_tensor(
+                np.asarray(self._obj_shape_full_2d(pad.numpy()), dtype=float),
+                dtype=positions.dtype,
+            )
+            if bool(((positions < 0) | (positions > full2d - 1)).any()):
+                warnings.warn(
+                    "some loaded scan positions fall outside the padded object grid and will "
+                    "be clamped by the dataset constraint clip_scan_positions (on by default); "
+                    "add object padding or set constraints={'dataset': "
+                    "{'clip_scan_positions': False}}",
+                    stacklevel=2,
+                )
+
+    # region --- per-scan-position correction (2026-11) ---
+    # Units and origin (the one convention every method below uses): positions are (row, col)
+    # in Å, in the beam frame of the object query (after any common CoM rotation / transpose),
+    # measured from the dataset's OWN anchor -- the corner the regular grid is anchored at,
+    # i.e. that dataset's first scan position. ``nominal_scan_positions_A[t]`` is the regular
+    # grid in this convention; with zero CoM rotation and no transpose it is simply
+    # ``(i * step_row, j * step_col)``. Rows follow the raster order of the diffraction
+    # patterns. The convention is independent of the padding and of the centring onto the
+    # reference scan centre (both are added on top). From a single-scan reconstruction with
+    # the same scan grid, rotation and transpose, ``(scan_positions_px - obj_padding_px) *
+    # obj_sampling`` is already in this convention.
+    _scan_nominal_A: "list[torch.Tensor] | None" = None
+    _scan_pivot_px: torch.Tensor | None = None
+
+    def _px_sampling(self) -> np.ndarray:
+        """Å per position pixel, ``(row, col)``, as the base raster class divides by it."""
+        samp = np.asarray(self.obj_sampling, dtype=float)
+        return samp[::-1].copy() if self.com_transpose else samp
+
+    def _has_scan_position_state(self) -> bool:
+        return "_scan_pos_load_A" in self._buffers
+
+    def _ensure_scan_position_state(self) -> None:
+        """Materialise the loaded-position buffers (lazy: a wrapper that never loads positions
+        keeps exactly its old state dict)."""
+        if self._has_scan_position_state():
+            return
+        real_dtype = self._pose_shifts.dtype
+        dev = self._pose_shifts.device
+        self.register_buffer(
+            "_scan_pos_load_A", torch.zeros(self.num_gpts, 2, dtype=real_dtype, device=dev)
+        )
+        self.register_buffer(
+            "_scan_pos_loaded", torch.zeros(self.num_tilts, dtype=torch.bool, device=dev)
+        )
+
+    def _loaded_scan_positions_A(self) -> "list[torch.Tensor | None]":
+        """Per dataset: the loaded ``(N_t, 2)`` Å positions (CPU), or None (regular grid)."""
+        if not self._has_scan_position_state():
+            return [None] * self.num_tilts
+        load = self._scan_pos_load_A.detach().cpu()
+        flags = self._scan_pos_loaded.detach().cpu().tolist()
+        offs = self._tilt_offsets.detach().cpu().tolist()
+        return [
+            load[offs[i] : offs[i + 1]].clone() if flags[i] else None
+            for i in range(self.num_tilts)
+        ]
+
+    def set_scan_positions_init(
+        self, positions_A: "Sequence[np.ndarray | torch.Tensor | None]"
+    ) -> None:
+        """Load measured scan positions, one ``(N_t, 2)`` array per dataset (or None to keep
+        that dataset's regular grid), in Å in the convention of this region's comment (beam
+        frame, measured from the dataset's own first scan position; ``N_t = prod(gpts)``, raster
+        order). They become the initial positions: the live positions start there and
+        ``reset()`` returns there. The pivot stays on the regular grid's centre. Passing a list
+        of Nones clears the load. Survives the re-derivation of the positions when the padding
+        changes. If the wrapper is already preprocessed the positions are rebuilt at once (any
+        learned positions are replaced)."""
+        vals = list(positions_A)
+        if len(vals) != self.num_tilts:
+            raise ValueError(f"got {len(vals)} position arrays for {self.num_tilts} datasets")
+        self._ensure_scan_position_state()
+        load = torch.zeros_like(self._scan_pos_load_A, device="cpu")
+        flags = torch.zeros(self.num_tilts, dtype=torch.bool)
+        offs = self._tilt_offsets.detach().cpu().tolist()
+        for i, v in enumerate(vals):
+            if v is None:
+                continue
+            arr = v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+            t = torch.as_tensor(np.asarray(arr, dtype=float), dtype=load.dtype)
+            n_i = offs[i + 1] - offs[i]
+            if t.shape != (n_i, 2):
+                raise ValueError(
+                    f"positions_A[{i}] must have shape ({n_i}, 2) (prod(gpts), row/col Å), got "
+                    f"{tuple(t.shape)}"
+                )
+            if not bool(torch.isfinite(t).all()):
+                raise ValueError(f"positions_A[{i}] contains non-finite values")
+            load[offs[i] : offs[i + 1]] = t
+            flags[i] = True
+        with torch.no_grad():
+            self._scan_pos_load_A.copy_(load.to(self._scan_pos_load_A.device))
+            self._scan_pos_loaded.copy_(flags.to(self._scan_pos_loaded.device))
+        if self.preprocessed:
+            pad = self._preprocessing_params.get("obj_padding_px", (0, 0))
+            self._set_initial_scan_positions_px(np.asarray(pad))
+
+    @property
+    def scan_positions_loaded(self) -> list[bool]:
+        """Per dataset: whether measured positions were loaded (``set_scan_positions_init``)."""
+        if not self._has_scan_position_state():
+            return [False] * self.num_tilts
+        return [bool(v) for v in self._scan_pos_loaded.detach().cpu().tolist()]
+
+    def _positions_to_A(self, flat_px: torch.Tensor) -> list[torch.Tensor]:
+        origin = self._scan_block_origin_px
+        if origin is None:
+            raise RuntimeError("scan positions not built yet; run preprocess() first")
+        samp = torch.as_tensor(self._px_sampling(), dtype=torch.float64)
+        flat = flat_px.detach().cpu().to(torch.float64)
+        offs = self._tilt_offsets.detach().cpu().tolist()
+        return [
+            ((flat[offs[i] : offs[i + 1]] - origin[i]) * samp).to(flat_px.dtype)
+            for i in range(self.num_tilts)
+        ]
+
+    @property
+    def scan_positions_A(self) -> list[torch.Tensor]:
+        """Live positions per dataset, ``(N_t, 2)`` Å in the loading convention (CPU copies)."""
+        return self._positions_to_A(self.scan_positions_px)
+
+    @property
+    def scan_positions_init_A(self) -> list[torch.Tensor]:
+        """Initial positions per dataset (loaded, else the regular grid), Å, loading convention."""
+        return self._positions_to_A(self.initial_scan_positions_px)
+
+    @property
+    def nominal_scan_positions_A(self) -> list[torch.Tensor]:
+        """The regular grid per dataset in the loading convention (Å). Loading exactly these
+        arrays reproduces the no-load positions bit for bit."""
+        if self._scan_nominal_A is None:
+            raise RuntimeError("scan positions not built yet; run preprocess() first")
+        return [t.clone() for t in self._scan_nominal_A]
+
+    @property
+    def scan_displacements_A(self) -> list[torch.Tensor]:
+        """Live minus initial positions per dataset, ``(N_t, 2)`` Å (CPU copies)."""
+        samp = torch.as_tensor(self._px_sampling(), dtype=torch.float64)
+        d = (
+            self.scan_positions_px.detach().cpu().to(torch.float64)
+            - self.initial_scan_positions_px.detach().cpu().to(torch.float64)
+        ) * samp
+        offs = self._tilt_offsets.detach().cpu().tolist()
+        return [
+            d[offs[i] : offs[i + 1]].to(self.scan_positions_px.dtype)
+            for i in range(self.num_tilts)
+        ]
+
+    def set_learn_scan_positions(
+        self,
+        enabled: bool,
+        remove_mean_displacement: bool = True,
+        max_displacement_A: float | None = None,
+    ) -> None:
+        """Learn every scan position (the base ``scan_positions`` optimizer group, LR in
+        px/step; wired like ``set_learn_pose_shifts``).
+
+        The positions step with the normal per-batch optimizer step, never through the pose
+        accumulation (``set_pose_accum``): each batch only carries the gradient of its own
+        positions. After every step the positions are projected (``_project_scan_positions``):
+        with ``remove_mean_displacement`` (default) each dataset's mean displacement from its
+        initial positions is removed, so a rigid shift of a whole scan stays in that dataset's
+        pose shift (``_pose_shifts``) instead of drifting into the positions; with
+        ``max_displacement_A`` every displacement is first clipped to that length (Å, radial;
+        the clip comes before the mean removal, so the mean is exactly zero and the bound holds
+        up to the mean of the clipped displacements). The gauge is relative to the INITIAL
+        positions: if the loaded positions carry a common offset error, learn the pose shift
+        too, so the offset has somewhere to go.
+        The DDP path needs nothing extra: the group is part of ``get_optimization_parameters``
+        (broadcast + all-reduce, like every other dataset group) and the projection is the
+        same deterministic operation on every rank.
+        """
+        enabled = bool(enabled)
+        if max_displacement_A is not None and not float(max_displacement_A) > 0:
+            raise ValueError(f"max_displacement_A must be > 0 Å or None, got {max_displacement_A}")
+        changed = enabled != self.learn_scan_positions
+        self.learn_scan_positions = enabled
+        self._scan_positions_px.requires_grad_(enabled)
+        self._scan_pos_remove_mean = bool(remove_mean_displacement)
+        self._scan_pos_max_disp_A = (
+            None if max_displacement_A is None else float(max_displacement_A)
+        )
+        self._sync_pose_optimizer(changed)
+
+    @property
+    def scan_position_constraints(self) -> dict[str, Any]:
+        """``{"remove_mean_displacement": bool, "max_displacement_A": float | None}``."""
+        return {
+            "remove_mean_displacement": bool(self._scan_pos_remove_mean),
+            "max_displacement_A": self._scan_pos_max_disp_A,
+        }
+
+    def _project_scan_positions(self) -> None:
+        """Post-step projection of learned positions (see ``set_learn_scan_positions``)."""
+        if not self.learn_scan_positions:
+            return
+        remove = bool(self._scan_pos_remove_mean)
+        max_d = self._scan_pos_max_disp_A
+        if not remove and max_d is None:
+            return
+        with torch.no_grad():
+            pos = self._scan_positions_px
+            init = self.initial_scan_positions_px.to(device=pos.device, dtype=pos.dtype)
+            samp = torch.as_tensor(self._px_sampling(), dtype=pos.dtype, device=pos.device)
+            disp = (pos - init) * samp  # Å
+            if max_d is not None:
+                r = disp.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                disp = disp * torch.clamp(max_d / r, max=1.0)
+            if remove:
+                offs = self._tilt_offsets.detach().cpu().tolist()
+                for i in range(self.num_tilts):
+                    blk = disp[offs[i] : offs[i + 1]]
+                    blk -= blk.mean(dim=0, keepdim=True)
+            pos.copy_(init + disp / samp)
+
+    # endregion --- per-scan-position correction ---
 
     # scan-centre (rotation pivot) definition; class-level default so a wrapper deserialized
     # from an older cache (bypasses __init__) reads the current default
@@ -1118,7 +1540,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
     ) -> torch.Tensor:
         """The pivot (px, padded grid) that ``mode`` implies for the CURRENT scan positions.
 
-        ``"positions"``: the midpoint of the reference tilt's block of ``scan_positions_px``;
+        ``"positions"``: the midpoint of the reference tilt's block of the regular-grid
+        positions (equal to the block of ``scan_positions_px`` unless positions were loaded or
+        learned);
         ``"grid"``: the legacy ``(full object grid - 1)/2`` at ``obj_padding_px`` (default: the
         padding recorded by ``preprocess``). This is the arithmetic of ``_set_scan_center`` made
         available without side effects, so a wrapper loaded from a cache can be VERIFIED against
@@ -1136,7 +1560,12 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
                 pad_px = obj_padding_px
             full2d = self._obj_shape_full_2d(pad_px)
             centre = [(int(full2d[0]) - 1) / 2.0, (int(full2d[1]) - 1) / 2.0]
-        else:
+        elif self._scan_pivot_px is not None:
+            # the regular grid's centre (stored by ``_set_initial_scan_positions_px``): equal to
+            # the centre of the positions themselves unless positions were loaded or learned,
+            # which must never move the pivot
+            centre = self._scan_pivot_px.tolist()
+        else:  # wrappers deserialized from caches older than 2026-11
             i0, i1 = (
                 int(self._tilt_offsets[self.ref_tilt_index]),
                 int(self._tilt_offsets[self.ref_tilt_index + 1]),
@@ -1227,11 +1656,16 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         probe z-offset (slab-window offset minus the per-dataset defocus offset) is stashed in
         ``_last_probe_dz_A`` for ``PtychoTomography.forward_operator``, which consumes it once;
         the defocus never enters the payload (it moves the probe, not the object query).
+
+        With a stack backend (``gathers_whole_pixels``) see ``_forward_whole_pixels`` instead.
         """
+        if self.gathers_whole_pixels:
+            # payload seam: the stack backend gets a PtychoTomoStackPatchData (same 4-tuple)
+            return cast("Any", self._forward_whole_pixels(batch_indices, obj_padding_px))
         if not self._implicit_object:
             raise RuntimeError(
-                "PtychoTomoDatasetRaster requires an implicit (coordinate-queried) object model; "
-                "pair it with an ObjectPtychoTomoBase subclass."
+                "PtychoTomoDatasetRaster requires an implicit (coordinate-queried) object model "
+                "or a stack backend; pair it with an ObjectPtychoTomoBase subclass."
             )
         self.apply_hard_constraints(obj_padding_px)
         bidx = torch.as_tensor(batch_indices).to(self._tilt_offsets.device)
@@ -1258,6 +1692,7 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         # transient per-batch stash for the reconstruction loop's probe pre-propagation
         # (PtychoTomography.forward_operator consumes it exactly once and clears it)
         self._last_probe_dz_A = probe_dz
+        self._stash_amp_scale(tilt_idx)
         payload = PtychoTomoPatchData(
             coords_yx_A=coords_A,
             rotations=rotations,
@@ -1266,6 +1701,162 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
             window_dz_A=window_dz,
         )
         return payload, positions_px, torch.zeros_like(positions_px), None
+
+    # region --- stack backend (2026-11): whole-pixel gathers + tilted propagator ---
+    @property
+    def gathers_whole_pixels(self) -> bool:
+        """Whether the paired object is a stack backend (``ObjectStackTomo``): ``forward`` then
+        returns rounded positions for an integer patch gather and the true fractional part for
+        the probe shift, and stashes the per-pattern small-tilt vector. Set by the
+        ``PtychoTomography`` wiring from the object model, like ``implicit_object``."""
+        return bool(getattr(self, "_whole_pixel_object", False))
+
+    @gathers_whole_pixels.setter
+    def gathers_whole_pixels(self, val: bool) -> None:
+        self._whole_pixel_object = bool(val)
+
+    @staticmethod
+    def small_tilt_tan(rotations: torch.Tensor) -> torch.Tensor:
+        """Small-tilt vector ``(tan_r, tan_c)`` ``(..., 2)`` from beam->specimen matrices.
+
+        The beam direction (beam-frame ``z``) seen in the specimen frame is the first column
+        ``R[:, 0] = (R_zz, R_yz, R_xz)``; per Å of specimen depth the beam moves laterally by
+        ``(R_yz, R_xz) / R_zz`` (rows, cols). That is the lateral slope the rotating backends
+        sample the volume along (first order in the tilt), so the stack backend and
+        ``ObjectVoxelTomo`` agree on the shear of a given ``(z1, tilt, z3)``. For a pure tilt
+        about x (scan columns), ``(tan_r, tan_c) = (-tan(tilt), 0)``: at a positive tilt the beam
+        moves toward NEGATIVE rows as it goes deeper. Only ``z1`` and the tilt enter (``z3`` is
+        an in-plane turn of the scan frame, which the stack does not model).
+        """
+        return rotations[..., 1:, 0] / rotations[..., 0:1, 0]
+
+    def _refresh_stack_tilt_active(self) -> bool:
+        active = (
+            self.learn_pose_tilt
+            or self.learn_pose_angles
+            or bool((self.small_tilt_tan(self.rotations().detach()) != 0).any().item())
+        )
+        self._stack_tilt_active = active
+        return active
+
+    def _forward_whole_pixels(
+        self,
+        batch_indices: np.ndarray | torch.Tensor,
+        obj_padding_px: np.ndarray | tuple[int, ...],
+    ) -> tuple["PtychoTomoStackPatchData", torch.Tensor, torch.Tensor, None]:
+        """Stack-backend forward: whole-pixel gather positions + sub-pixel probe shift.
+
+        The position of pattern ``b`` on the object grid is
+        ``pos = scan_positions_px - pose_shift / sampling`` (px): the pose shift is subtracted
+        exactly as the rotating backends subtract ``shifts_A`` from the query coordinates, so
+        the same shift table means the same specimen displacement for every backend. The
+        payload carries ``round(pos)`` for the integer patch gather; the returned fractional
+        positions ``pos - round(pos)`` go to the probe shift, so gradients reach the scan
+        positions and the pose shifts through the probe. The per-pattern small-tilt vector
+        (``small_tilt_tan`` of ``rotations()``) is stashed in ``_last_tilt_tan`` (None while
+        every tilt is zero and no angle is learned: the plain multislice path) and the
+        defocus offset in ``_last_probe_dz_A``, both consumed once by
+        ``PtychoTomography.forward_operator``.
+        """
+        if self.slab_window:
+            raise RuntimeError("slab-window mode is not supported with a stack backend")
+        self.apply_hard_constraints(obj_padding_px)
+        bidx = torch.as_tensor(batch_indices).to(self._tilt_offsets.device)
+        positions_px = self.scan_positions_px[bidx]
+        tilt_idx = self.tilt_index_of(bidx)
+        pos = positions_px
+        if self._pose_shifts_active:
+            samp = torch.as_tensor(self._px_sampling(), dtype=pos.dtype, device=pos.device)
+            pos = pos - self._pose_shifts[tilt_idx] / samp
+        rounded = torch.round(pos.detach())
+        frac = pos - rounded
+        active = self._stack_tilt_active
+        if active is None:
+            active = self._refresh_stack_tilt_active()
+        tilt_tan = self.small_tilt_tan(self.rotations()[tilt_idx]) if active else None
+        self._last_tilt_tan = tilt_tan
+        offset = self._defocus_offset_A[tilt_idx] if self._defocus_active else None
+        self._last_probe_dz_A = None if offset is None else -offset
+        self._stash_amp_scale(tilt_idx)
+        payload = PtychoTomoStackPatchData(
+            positions_px=rounded.long(),
+            tilt_indices=tilt_idx,
+            roi_shape=(int(self.roi_shape[0]), int(self.roi_shape[1])),
+            tilt_tan=tilt_tan,
+        )
+        return payload, positions_px, frac, None
+
+    def whole_pixel_patch_indices(
+        self, batch_indices: torch.Tensor, obj_shape_2d: "tuple[int, int] | np.ndarray"
+    ) -> torch.Tensor:
+        """``(B, Hroi, Wroi)`` flat object-grid indices at the rounded (pose-shifted) positions
+        of a batch, the gather the stack backend uses (for the probe-overlap / FOV mask)."""
+        bidx = torch.as_tensor(batch_indices).to(self._tilt_offsets.device)
+        pos = self.scan_positions_px[bidx].detach()
+        if self._pose_shifts_active:
+            samp = torch.as_tensor(self._px_sampling(), dtype=pos.dtype, device=pos.device)
+            pos = pos - self._pose_shifts.detach()[self.tilt_index_of(bidx)] / samp
+        return whole_pixel_patch_indices(
+            torch.round(pos).long(),
+            (int(self.roi_shape[0]), int(self.roi_shape[1])),
+            (int(obj_shape_2d[0]), int(obj_shape_2d[1])),
+        )
+
+    # endregion --- stack backend ---
+
+    # region --- per-dataset intensity scale (2026-11) ---
+    def set_intensity_scale(
+        self, values: "str | float | np.ndarray | torch.Tensor | list[Any]"
+    ) -> None:
+        """Fixed per-dataset intensity scale ``(num_tilts,)``: the probe amplitude of every
+        pattern of dataset ``t`` is multiplied by ``sqrt(values[t])``, for datasets recorded
+        with different dose (e.g. 3 ms vs 1 ms dwell). The default (never called, or all ones)
+        is today's model, bit for bit. Why it is needed: the patterns are not normalised per
+        dataset -- the probe intensity is set from ONE global mean (``mean_diffraction_intensity``,
+        the position-weighted mean over all datasets), so a dataset with 3x the dose is
+        otherwise fit with a 3x too weak probe. ``"auto"`` sets ``values[t] = (mean intensity of
+        dataset t) / (global mean)``; a scalar broadcasts. Not learned."""
+        dev = self._pose_shifts.device
+        real_dtype = self._pose_shifts.dtype
+        if isinstance(values, str):
+            if values != "auto":
+                raise ValueError(f"values must be 'auto' or numbers, got {values!r}")
+            if not self.preprocessed:
+                raise RuntimeError("set_intensity_scale('auto') needs a preprocessed wrapper")
+            glob = float(self.mean_diffraction_intensity)
+            vals = np.array(
+                [float(ds.mean_diffraction_intensity) / glob for ds in self.tilt_datasets]
+            )
+        else:
+            vals = np.asarray(values, dtype=float)
+            if vals.ndim == 0:
+                vals = np.full(self.num_tilts, float(vals))
+        if vals.shape != (self.num_tilts,):
+            raise ValueError(f"values must have shape ({self.num_tilts},), got {vals.shape}")
+        if not np.all(np.isfinite(vals)) or np.any(vals <= 0):
+            raise ValueError(f"intensity scales must be finite and > 0, got {vals}")
+        t = torch.as_tensor(vals, dtype=real_dtype, device=dev)
+        if "_intensity_scale" not in self._buffers:
+            self.register_buffer("_intensity_scale", torch.ones_like(t))
+        with torch.no_grad():
+            self._intensity_scale.copy_(t)
+        self._intensity_scale_active = bool(np.any(vals != 1.0))
+
+    @property
+    def intensity_scale(self) -> torch.Tensor:
+        """Per-dataset intensity scale ``(num_tilts,)`` (ones unless ``set_intensity_scale``)."""
+        buf = self._buffers.get("_intensity_scale")
+        if buf is None:
+            return torch.ones(self.num_tilts, dtype=self._pose_shifts.dtype)
+        return buf.detach().clone()
+
+    def _stash_amp_scale(self, tilt_idx: torch.Tensor) -> None:
+        if not getattr(self, "_intensity_scale_active", False):
+            self._last_amp_scale = None
+            return
+        self._last_amp_scale = torch.sqrt(self._intensity_scale)[tilt_idx]
+
+    # endregion --- per-dataset intensity scale ---
 
     @property
     def slab_window(self) -> bool:
@@ -1342,28 +1933,33 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         return torch.stack([rows_A, cols_A], dim=-1)  # (batch, Hroi, Wroi, 2), Å
 
     def reset(self) -> None:
-        """Restore positions/descan, zero the (frozen) ``_pose_dtheta`` and return the shifts,
-        the z1 / z3 angles and the defocus offsets to their baselines (``set_pose_shift_init`` /
-        ``set_pose_angle_init`` / ``set_defocus_init``, zeros by default). The learn flags,
-        reference tilt, accumulation and LR-schedule settings survive, like
-        ``set_slab_window``."""
+        """Restore positions (to the loaded ones, if any) and descan, and return the shifts,
+        the z1 / z3 angles, the tilt offset ``_pose_dtheta`` and the defocus offsets to their
+        baselines (``set_pose_shift_init`` / ``set_pose_angle_init`` / ``set_pose_tilt_init`` /
+        ``set_defocus_init``, zeros by default). The learn flags, reference tilt, accumulation,
+        LR-schedule and scan-position constraint settings survive, like ``set_slab_window``."""
         super().reset()
         self._ensure_pose_angle_state()
         self._ensure_defocus_state()
         with torch.no_grad():
             self._pose_z1.copy_(self._pose_z1_init)
-            self._pose_dtheta.zero_()
+            if self._has_pose_tilt_state():
+                self._pose_dtheta.copy_(self._pose_dtheta_init)
+            else:
+                self._pose_dtheta.zero_()
             self._pose_z3.copy_(self._pose_z3_init)
             self._pose_shifts.copy_(self._pose_shifts_init)
             self._defocus_offset_A.copy_(self._defocus_offset_init_A)
             self._pose_shifts_accum.zero_()
             self._zero_pose_angle_accum()
             self._zero_defocus_accum()
+            self._zero_pose_tilt_accum()
         self._pose_accum_count = 0
         self._pose_step_count = 0
         self._pose_lr_base = None
         self._refresh_pose_shifts_active()
         self._refresh_defocus_active()
+        self._stack_tilt_active = None
 
 
 PtychoTomoDatasetType = PtychoTomoDatasetRaster

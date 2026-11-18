@@ -19,6 +19,11 @@ Typical use::
     pt.reconstruct(num_iters=300, store_snapshots_every=25,
                    optimizer_params={"object": ..., "probe": ...})
     vol = pt.volume_cropped  # (D, h, w) specimen-frame density, rad/Å (padding cropped)
+
+Stack backend (2026-11, a few mrad between scans of one zone axis): pair the wrapper with
+``ObjectStackTomo`` (a single-scan multislice stack, optionally a DIP) and preprocess with the
+single-scan lateral padding, ``pt.preprocess(obj_padding_px=(p, p))``; each dataset's tilt is
+then applied as a tilted propagator in ``forward_operator`` (see there).
 """
 
 from copy import deepcopy
@@ -29,10 +34,13 @@ import numpy as np
 import torch
 
 from quantem.core import config
+from quantem.core.utils.utils import generate_batches
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.probe_models import ProbeModelType
+from quantem.diffractive_imaging.ptycho_utils import fourier_translation_operator, sum_patches
 from quantem.diffractive_imaging.ptychography import Ptychography
+from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
 from quantem.ptycho_tomography.object_models import ObjectPtychoTomoBase
 from quantem.ptycho_tomography.ptycho_tomography_visualizations import (
@@ -51,6 +59,31 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     _pose_metadata: "dict[str, Any] | None" = None
     # per-iteration learned-shift history (rank 0), appended by ``_record_iter``
     _pose_history: "list[dict[str, Any]] | None" = None
+    # cached (key, kr, kc) lateral frequency axes (1/Å) for the stack backend's tilt ramps
+    _tilt_k_cache: "tuple[tuple[int, int, float, float], torch.Tensor, torch.Tensor] | None" = None
+
+    @property
+    def obj_model(self):  # pyright: ignore[reportIncompatibleVariableOverride] -- same type, extra wiring
+        return self._obj_model
+
+    @obj_model.setter
+    def obj_model(self, model) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        """Base wiring (``implicit_object``) plus the stack-backend flag on the dataset."""
+        fset = PtychographyBase.obj_model.fset
+        assert fset is not None
+        fset(self, model)
+        if hasattr(self, "_dset"):
+            self._sync_whole_pixel_flag()
+
+    def _sync_whole_pixel_flag(self) -> None:
+        if hasattr(self.dset, "gathers_whole_pixels"):
+            whole = bool(getattr(self._obj_model, "gathers_whole_pixels", False))
+            cast(PtychoTomoDatasetRaster, self.dset).gathers_whole_pixels = whole  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+
+    @property
+    def _is_stack(self) -> bool:
+        """Whether the object backend is the multislice stack (``ObjectStackTomo``)."""
+        return bool(getattr(self._obj_model, "gathers_whole_pixels", False))
 
     @classmethod
     def from_models(  # pyright: ignore[reportIncompatibleMethodOverride] -- narrowed model types
@@ -119,6 +152,7 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             raise TypeError(f"loaded object is not a PtychoTomography, got {type(pt)}")
         if dset is not None:
             pt.dset.implicit_object = pt.obj_model.is_implicit
+            pt._sync_whole_pixel_flag()
             if pt._pose_metadata is not None:
                 pt._apply_pose_metadata(pt._pose_metadata)
         return pt
@@ -141,6 +175,18 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             "defocus_offset_A": dset.defocus_offset_A.cpu(),
             "defocus_offset_init_A": dset.defocus_offset_init_A.cpu(),
             "learn_defocus": bool(dset.learn_defocus),
+            # 2026-11: loaded / learned scan positions, the tilt offset and the intensity scale;
+            # older zips lack these keys and keep today's behaviour
+            "scan_positions_load_A": [
+                None if p is None else p.cpu() for p in dset._loaded_scan_positions_A()
+            ],
+            "scan_positions_px": dset.scan_positions_px.detach().cpu().clone(),
+            "learn_scan_positions": bool(dset.learn_scan_positions),
+            "scan_position_constraints": dict(dset.scan_position_constraints),
+            "pose_dtheta_deg": dset.pose_dtheta_deg.cpu(),
+            "pose_dtheta_init_deg": dset.pose_dtheta_init_deg.cpu(),
+            "learn_pose_tilt": bool(dset.learn_pose_tilt),
+            "intensity_scale": dset.intensity_scale.cpu(),
         }
 
     def _apply_pose_metadata(self, meta: "dict[str, Any]") -> None:
@@ -183,8 +229,42 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             with torch.no_grad():
                 p = dset._defocus_offset_A
                 p.copy_(df.to(p.device, p.dtype))
+        if "pose_dtheta_deg" in meta:
+            dth = torch.as_tensor(meta["pose_dtheta_deg"])
+            if tuple(dth.shape) != (dset.num_tilts,):
+                raise ValueError(
+                    f"saved tilt offsets have shape {tuple(dth.shape)} but the attached wrapper "
+                    f"has {dset.num_tilts} tilts"
+                )
+            dset.set_pose_tilt_init(meta["pose_dtheta_init_deg"])
+            with torch.no_grad():
+                p = dset._pose_dtheta
+                p.copy_(dth.to(p.device, p.dtype))
+        if "intensity_scale" in meta:
+            dset.set_intensity_scale(torch.as_tensor(meta["intensity_scale"]).numpy())
+        if "scan_positions_px" in meta:
+            pos = torch.as_tensor(meta["scan_positions_px"])
+            if tuple(pos.shape) != tuple(dset.scan_positions_px.shape):
+                raise ValueError(
+                    f"saved scan positions have shape {tuple(pos.shape)} but the attached "
+                    f"wrapper has {tuple(dset.scan_positions_px.shape)}"
+                )
+            loads = meta.get("scan_positions_load_A")
+            if loads is not None and any(v is not None for v in loads):
+                dset.set_scan_positions_init(list(loads))  # rebuilds the initial positions
+            with torch.no_grad():
+                dset._scan_positions_px.copy_(
+                    pos.to(dset._scan_positions_px.device, dset._scan_positions_px.dtype)
+                )
+            cons = dict(meta.get("scan_position_constraints") or {})
+            dset.set_learn_scan_positions(
+                bool(meta.get("learn_scan_positions", False)),
+                remove_mean_displacement=bool(cons.get("remove_mean_displacement", True)),
+                max_displacement_A=cons.get("max_displacement_A"),
+            )
         dset.set_learn_pose_shifts(bool(meta["learn_pose_shifts"]))
         dset.set_learn_pose_angles(bool(meta.get("learn_pose_angles", False)))
+        dset.set_learn_pose_tilt(bool(meta.get("learn_pose_tilt", False)))
         # last: the flag call refreshes the "gather in forward" switch from the live table
         dset.set_learn_defocus(bool(meta.get("learn_defocus", False)))
 
@@ -193,8 +273,10 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         """Per-iteration ``{iteration, loss, shifts_A (num_tilts, 2) Å, lr, pose_steps, grad_rms,
         grad_max}`` records (rank 0), recorded whenever a pose slot was being learned; when the
         angles are learned each record also carries ``z1_deg, z3_deg (num_tilts,), lr_angles,
-        angle_grad_rms, angle_grad_max``, and when the defocus is learned ``defocus_A
-        (num_tilts,), lr_defocus, defocus_grad_rms, defocus_grad_max``."""
+        angle_grad_rms, angle_grad_max``, when the defocus is learned ``defocus_A
+        (num_tilts,), lr_defocus, defocus_grad_rms, defocus_grad_max``, when the tilt offset is
+        learned ``dtheta_deg (num_tilts,), lr_tilt`` and when the scan positions are learned
+        ``scan_disp_rms_A, scan_disp_max_A`` (displacement from the initial positions)."""
         return list(self._pose_history or [])
 
     def _record_iter(self, iter_loss: float, autograd: bool) -> None:
@@ -202,10 +284,14 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
         learn_angles = bool(getattr(dset, "learn_pose_angles", False))
         learn_defocus = bool(getattr(dset, "learn_defocus", False))
+        learn_tilt = bool(getattr(dset, "learn_pose_tilt", False))
+        learn_positions = bool(getattr(dset, "learn_scan_positions", False))
         if (
             not getattr(dset, "learn_pose_shifts", False)
             and not learn_angles
             and not learn_defocus
+            and not learn_tilt
+            and not learn_positions
         ):
             return
         if self._pose_history is None:
@@ -230,6 +316,13 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
             record["lr_defocus"] = float(dset.pose_group_lr("pose_defocus"))
             record["defocus_grad_rms"] = float(dset.pose_last_defocus_grad_stats[0])
             record["defocus_grad_max"] = float(dset.pose_last_defocus_grad_stats[1])
+        if learn_tilt:
+            record["dtheta_deg"] = dset.pose_dtheta_deg.cpu()
+            record["lr_tilt"] = float(dset.pose_group_lr("pose_tilt"))
+        if learn_positions:
+            disp = torch.cat(dset.scan_displacements_A).norm(dim=-1)
+            record["scan_disp_rms_A"] = float(disp.square().mean().sqrt())
+            record["scan_disp_max_A"] = float(disp.max())
         self._pose_history.append(record)
 
     def _reset_iter_constraints(self) -> None:
@@ -296,8 +389,14 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
         Tilt-series specifics as before: a common (usually zero) CoM rotation is forced across
         tilts, and the 2D probe-overlap FOV mask is replaced by a trivial mask.
+
+        Stack backend (``ObjectStackTomo``): none of the box / margin / warp geometry applies.
+        The lateral grid is the single-scan one -- the reference dataset's object grid padded by
+        ``obj_padding_px`` (the native argument here, not deprecated) -- the thickness is the
+        stack's, and the probe-overlap FOV mask is built as in single-scan ptychography
+        (``batch_size`` bounds its batches).
         """
-        del batch_size, plot_rotation, plot_com, plot_probe_overlap  # unused (parity only)
+        del plot_rotation, plot_com, plot_probe_overlap  # unused (parity only)
         if padded_diffraction_intensities_shape is not None:
             raise NotImplementedError(
                 "padded_diffraction_intensities_shape is not supported for tilt series yet"
@@ -307,6 +406,29 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
                 "force_com_rotation / force_com_transpose must be explicit for a tilt series "
                 "(per-tilt solved rotations would break the shared geometry); use 0.0 / False "
                 "for simulated data."
+            )
+
+        if self._is_stack:
+            if specimen_box_A is not None or warp_box_frac is not None or z_padding_px:
+                raise ValueError(
+                    "the stack backend has no specimen box / warp / z padding: its lateral grid "
+                    "is the reference dataset's object grid padded by obj_padding_px, its "
+                    "thickness is num_slices x slice thickness"
+                )
+            if any(float(m) != 0.0 for m in box_margin_A):
+                raise ValueError("box_margin_A does not apply to the stack backend")
+            _p = obj_padding_px if obj_padding_px is not None else (0, 0)
+            return self._preprocess_stack(
+                pad_yx=(int(_p[0]), int(_p[1])),
+                val_ratio=val_ratio,
+                val_mode=val_mode,
+                vectorized=vectorized,
+                batch_size=batch_size,
+                com_fit_function=com_fit_function,
+                force_com_rotation=float(force_com_rotation),
+                force_com_transpose=bool(force_com_transpose),
+                probe_energy=probe_energy,
+                free_per_tilt_arrays=free_per_tilt_arrays,
             )
 
         # ---- deprecated pixel-padding arguments (legacy mapping keeps old runs reproducible)
@@ -424,6 +546,67 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         self.val_mode = val_mode
         return self
 
+    def _preprocess_stack(
+        self,
+        *,
+        pad_yx: tuple[int, int],
+        val_ratio: float,
+        val_mode: Literal["grid", "random"],
+        vectorized: bool,
+        batch_size: int | None,
+        com_fit_function: Literal["none", "plane", "parabola", "constant", "no_shift"],
+        force_com_rotation: float,
+        force_com_transpose: bool,
+        probe_energy: float | None,
+        free_per_tilt_arrays: bool,
+    ) -> Self:
+        """The single-scan preprocessing path for the stack backend (see ``preprocess``)."""
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        if dset_t.slab_window:
+            raise ValueError("slab-window mode does not apply to the stack backend")
+        if not self.dset.preprocessed:
+            self.vprint("Dataset was not preprocessed, proceeding with defaults.")
+            dset_t.preprocess(
+                com_fit_function=com_fit_function,
+                force_com_rotation=force_com_rotation,
+                force_com_transpose=force_com_transpose,
+                obj_padding_px=pad_yx,
+                probe_energy=probe_energy,
+                free_per_tilt_arrays=free_per_tilt_arrays,
+                vectorized=vectorized,
+            )
+            self._probe_model.set_initial_probe(
+                self.roi_shape,
+                self.reciprocal_sampling,
+                self.dset.mean_diffraction_intensity,
+                device=self._single_device,
+            )
+        self.obj_padding_px = pad_yx  # allocates the stack and re-derives the positions
+        dset_t._set_scan_center(self.obj_padding_px)
+        self.compute_propagator_arrays()
+        self._set_obj_fov_mask(batch_size=batch_size)
+        self._preprocessed = True
+        self.val_ratio = float(val_ratio)
+        self.val_mode = val_mode
+        return self
+
+    def _get_probe_overlap(self, max_batch_size: int | None = None) -> np.ndarray:
+        """Summed probe intensity on the object grid. Stack backend: the single-scan sum with
+        the patch indices computed per batch (the wrapper stores none)."""
+        if not self._is_stack:
+            return super()._get_probe_overlap(max_batch_size)
+        dset_t = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        prb = self.probe_model.probe[0]
+        num_dps = self.dset.num_positions
+        shape2d = (int(self.obj_shape_full[-2]), int(self.obj_shape_full[-1]))
+        batch = min(num_dps, 4096) if max_batch_size is None else int(max_batch_size)
+        overlap = torch.zeros(shape2d, dtype=self._dtype_real, device=self._single_device)
+        for start, end in generate_batches(num_dps, max_batch=batch):
+            idx = dset_t.whole_pixel_patch_indices(torch.arange(start, end), shape2d)
+            intensity = (torch.abs(prb) ** 2).expand(end - start, *prb.shape)
+            overlap += sum_patches(intensity, idx.to(overlap.device), shape2d)
+        return self._to_numpy(overlap)
+
     def _check_slab_coverage(self) -> None:
         """Warn if the beam-frame multislice slab cannot cover the rotated object support.
 
@@ -438,6 +621,8 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         obj = self.obj_model
         if not isinstance(obj, ObjectPtychoTomoBase):  # pragma: no cover - guarded by from_models
             return
+        if self._is_stack:
+            return  # the stack is laterally periodic and spans its own thickness
         from warnings import warn
 
         slab = obj.slab_thickness_A * obj.num_slices
@@ -483,7 +668,8 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Base forward operator plus the probe z-offset pre-propagation (2026-07-16 / 2026-09).
+        """Base forward operator plus the probe z-offset pre-propagation (2026-07-16 / 2026-09),
+        the per-dataset intensity scale and the stack backend's tilted propagator (2026-11).
 
         The dataset stashes ``_last_probe_dz_A`` (Å along the beam, per batch element) during
         ``dset.forward``: the slab-window offset minus the per-dataset learned defocus offset.
@@ -495,32 +681,115 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
         payload's ``window_dz_A``; the defocus part moves only the probe. The stash is consumed
         exactly once per batch step (train and validation both rebuild it via ``dset.forward``);
         it is ``None``, and nothing here runs, when neither mode is active.
-        """
-        dz = getattr(self.dset, "_last_probe_dz_A", None)
-        if dz is not None:
-            # consume-once: no staleness, clean serialization
-            cast(PtychoTomoDatasetRaster, self.dset)._last_probe_dz_A = None  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
-            shifted_input_probes = self._pre_propagate_probes(shifted_input_probes, dz)
-        return super().forward_operator(obj_patches, shifted_input_probes, descan)
 
-    def _pre_propagate_probes(self, probes: torch.Tensor, dz_A: torch.Tensor) -> torch.Tensor:
-        """Fresnel-propagate probes ``(P, B, H, W)`` by per-batch ``dz_A`` (B,) in Å."""
+        ``_last_amp_scale`` (per pattern ``sqrt(intensity scale)``, ``set_intensity_scale``)
+        multiplies the probe. ``_last_tilt_tan`` (stack backend, per pattern ``(tan_r,
+        tan_c)``) turns every inter-slice propagator into the tilted one
+        ``exp(-iπλ dz k²) · exp(-2πi dz (tan_r k_r + tan_c k_c))``, which shifts the wave by
+        ``+dz · tan`` per slice, and the incident probe is first shifted by
+        ``-(Z/2) · tan`` (``Z`` = sum of the slice spacings, i.e. first-to-last slice) so the
+        shear pivots about the middle of the stack: changing the tilt does not translate the
+        image. Same stash rule: None (the plain path, bit-identical) while every tilt is zero.
+        """
+        dset = cast(PtychoTomoDatasetRaster, self.dset)  # pyright: ignore[reportInvalidCast] -- sibling-class payload seam
+        dz = getattr(dset, "_last_probe_dz_A", None)
+        tilt = getattr(dset, "_last_tilt_tan", None)
+        amp = getattr(dset, "_last_amp_scale", None)
+        if dz is not None:
+            dset._last_probe_dz_A = None  # consume-once: no staleness, clean serialization
+        if tilt is not None:
+            dset._last_tilt_tan = None
+        if amp is not None:
+            dset._last_amp_scale = None
+            shifted_input_probes = shifted_input_probes * amp.to(
+                device=shifted_input_probes.device, dtype=self._dtype_real
+            ).view(1, -1, 1, 1)
+        pivot_shift = None
+        if tilt is not None and self.num_slices > 1:
+            z_half = 0.5 * float(np.sum(self.slice_thicknesses))
+            pivot_shift = -z_half * tilt
+        if dz is not None or pivot_shift is not None:
+            shifted_input_probes = self._pre_propagate_probes(
+                shifted_input_probes, dz, shift_A=pivot_shift
+            )
+        if tilt is None or self.num_slices == 1:
+            return super().forward_operator(obj_patches, shifted_input_probes, descan)
+        # tilted copy of the base operator (base: probe-tilt refresh, overlap, descan ramp)
+        if self.probe_model.learn_probe_tilt:
+            self.compute_propagator_arrays()
+        propagated_probes, overlap = self._overlap_projection_tilted(
+            obj_patches, shifted_input_probes, tilt
+        )
+        if descan is not None:
+            shifts = fourier_translation_operator(descan, tuple(self.roi_shape))
+            overlap = overlap * shifts[None]
+        return propagated_probes, overlap
+
+    def _lateral_k(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Row / column spatial frequencies (1/Å) of the probe ROI, the propagators' grid."""
+        h, w = int(self.roi_shape[0]), int(self.roi_shape[1])
+        samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]
+        key = (h, w, float(samp[0]), float(samp[1]))
+        cache = self._tilt_k_cache
+        if cache is None or cache[0] != key or cache[1].device != device:
+            kr = torch.fft.fftfreq(h, d=float(samp[0]), device=device).to(self._dtype_real)
+            kc = torch.fft.fftfreq(w, d=float(samp[1]), device=device).to(self._dtype_real)
+            cache = (key, kr, kc)
+            self._tilt_k_cache = cache
+        return cache[1], cache[2]
+
+    def _overlap_projection_tilted(
+        self, obj_patches: torch.Tensor, input_probe: torch.Tensor, tilt_tan: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``overlap_projection`` with a per-pattern tilted propagator: waves are ``(P, B, H,
+        W)``, so the ramp ``(1, B, H, W)`` broadcasts over mixed-dataset batches."""
+        kr, kc = self._lateral_k(input_probe.device)
+        t = tilt_tan.to(device=input_probe.device, dtype=self._dtype_real)
+        unit = t[:, 0, None, None] * kr[None, :, None] + t[:, 1, None, None] * kc[None, None, :]
+        dzs = [float(v) for v in np.asarray(self.slice_thicknesses, dtype=float).ravel()]
+        propagated_probes = [input_probe]
+        overlap = obj_patches[0] * input_probe
+        for s in range(1, self.num_slices):
+            ramp = torch.exp((-2.0j * torch.pi * dzs[s - 1]) * unit)[None]  # (1, B, H, W)
+            propagated_probe = self._propagate_array(overlap, self._propagators[s - 1] * ramp)
+            overlap = obj_patches[s] * propagated_probe
+            propagated_probes.append(propagated_probe)
+        return torch.stack(propagated_probes, dim=0), overlap
+
+    def _pre_propagate_probes(
+        self,
+        probes: torch.Tensor,
+        dz_A: torch.Tensor | None,
+        shift_A: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Fresnel-propagate probes ``(P, B, H, W)`` by per-batch ``dz_A`` (B,) in Å and/or
+        shift them laterally by ``shift_A`` (B, 2) Å (row, col), in one Fourier multiply."""
         from quantem.core.utils.utils import electron_wavelength_angstrom
 
-        h, w = int(self.roi_shape[0]), int(self.roi_shape[1])
-        samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]  # lateral (y, x)
-        key = (h, w, float(samp[0]), float(samp[1]))
-        cache = self._window_k2_cache
-        # device check: a deserialized cache comes back on CPU (plain attr, not moved by .to())
-        if cache is None or cache[0] != key or cache[1].device != probes.device:
-            kr = torch.fft.fftfreq(h, d=float(samp[0]), device=probes.device)
-            kc = torch.fft.fftfreq(w, d=float(samp[1]), device=probes.device)
-            k2 = (kr[:, None] ** 2 + kc[None, :] ** 2).to(self._dtype_real)
-            cache = (key, k2)
-            self._window_k2_cache = cache
-        lam = float(electron_wavelength_angstrom(self.probe_model.probe_params["energy"]))
-        dz = dz_A.to(device=probes.device, dtype=self._dtype_real)
-        phase = torch.exp(-1.0j * torch.pi * lam * dz.view(1, -1, 1, 1) * cache[1][None, None])
+        phase: torch.Tensor | None = None
+        if dz_A is not None:
+            h, w = int(self.roi_shape[0]), int(self.roi_shape[1])
+            samp = np.asarray(self.sampling, dtype=float).ravel()[-2:]  # lateral (y, x)
+            key = (h, w, float(samp[0]), float(samp[1]))
+            cache = self._window_k2_cache
+            # device check: a deserialized cache comes back on CPU (plain attr, not moved by .to())
+            if cache is None or cache[0] != key or cache[1].device != probes.device:
+                kr = torch.fft.fftfreq(h, d=float(samp[0]), device=probes.device)
+                kc = torch.fft.fftfreq(w, d=float(samp[1]), device=probes.device)
+                k2 = (kr[:, None] ** 2 + kc[None, :] ** 2).to(self._dtype_real)
+                cache = (key, k2)
+                self._window_k2_cache = cache
+            lam = float(electron_wavelength_angstrom(self.probe_model.probe_params["energy"]))
+            dz = dz_A.to(device=probes.device, dtype=self._dtype_real)
+            phase = torch.exp(-1.0j * torch.pi * lam * dz.view(1, -1, 1, 1) * cache[1][None, None])
+        if shift_A is not None:
+            kr, kc = self._lateral_k(probes.device)
+            d = shift_A.to(device=probes.device, dtype=self._dtype_real)
+            arg = d[:, 0, None, None] * kr[None, :, None] + d[:, 1, None, None] * kc[None, None, :]
+            ramp = torch.exp(-2.0j * torch.pi * arg)[None]  # shifts by +d
+            phase = ramp if phase is None else phase * ramp
+        if phase is None:
+            return probes
         return torch.fft.ifft2(torch.fft.fft2(probes) * phase)
 
     # endregion --- preprocessing ---
@@ -599,10 +868,13 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
     @property
     def sampling(self) -> np.ndarray:  # pyright: ignore[reportIncompatibleMethodOverride] -- 3D
         """``(z, y, x)`` voxel size of the reconstruction volume, Å. Cubic by construction:
-        y == x exactly (enforced), z equal to <0.1% (grid rounding over the box thickness)."""
+        y == x exactly (enforced), z equal to <0.1% (grid rounding over the box thickness).
+        Stack backend: the lateral ``(y, x)`` pixel only, as in single-scan ptychography."""
         obj = self.obj_model
         assert isinstance(obj, ObjectPtychoTomoBase)
         lat = np.asarray(self.dset.obj_sampling, dtype=float)
+        if self._is_stack:
+            return lat
         try:
             zv = obj.z_voxel_A
         except ValueError:  # volume grid not allocated yet (mid-construction, pre-preprocess)
@@ -611,9 +883,12 @@ class PtychoTomography(PtychoTomographyVisualizations, Ptychography):
 
     @property
     def obj_shape_crop(self) -> np.ndarray:
-        """``(D, h, w)`` of the specimen box (all support margins removed on all three axes)."""
+        """``(D, h, w)`` of the specimen box (all support margins removed on all three axes).
+        Stack backend: ``(num_slices, h, w)`` of the scan field of view (single-scan crop)."""
         obj = self.obj_model
         assert isinstance(obj, ObjectPtychoTomoBase)
+        if self._is_stack:
+            return PtychographyBase.obj_shape_crop.fget(self)  # pyright: ignore[reportOptionalCall]
         if obj.lateral_box_A is not None:
             sl = obj.crop_slices
             d, h, w = obj.volume_shape

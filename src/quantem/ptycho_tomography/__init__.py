@@ -4,12 +4,14 @@ object via a multislice-ptychography forward model with rotated coordinate queri
 from quantem.ptycho_tomography.dataset_models import PtychoTomoDatasetRaster
 from quantem.ptycho_tomography.geometry import (
     PtychoTomoPatchData,
+    PtychoTomoStackPatchData,
     rot_beam_to_spec,
     slab_z_centers,
 )
 from quantem.ptycho_tomography.object_models import (
     ObjectKPlanesTomo,
     ObjectPtychoTomoBase,
+    ObjectStackTomo,
     ObjectVoxelTomo,
     PtychoTomoObjConstraintParams,
     VoxelGrid,
@@ -21,10 +23,12 @@ __all__ = [
     "PtychoTomoDatasetRaster",
     "ObjectKPlanesTomo",
     "ObjectPtychoTomoBase",
+    "ObjectStackTomo",
     "ObjectVoxelTomo",
     "PtychoTomoObjConstraintParams",
     "VoxelGrid",
     "PtychoTomoPatchData",
+    "PtychoTomoStackPatchData",
     "rot_beam_to_spec",
     "slab_z_centers",
 ]

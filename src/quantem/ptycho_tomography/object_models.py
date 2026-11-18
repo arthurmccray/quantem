@@ -61,8 +61,19 @@ from quantem.core.ml.optimizer_mixin import (
 from quantem.core.utils.validators import validate_tensor
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.custom_normalizations import CustomNormalization
-from quantem.diffractive_imaging.object_models import ObjectBase, object_type
-from quantem.ptycho_tomography.geometry import PtychoTomoPatchData, slab_z_centers
+from quantem.diffractive_imaging.object_models import (
+    ObjectBase,
+    ObjectDIP,
+    ObjectPixelated,
+    PtychoObjConstraintParams,
+    object_type,
+)
+from quantem.ptycho_tomography.geometry import (
+    PtychoTomoPatchData,
+    PtychoTomoStackPatchData,
+    slab_z_centers,
+    whole_pixel_patch_indices,
+)
 
 
 def _axis_coords(n: int, device, dtype) -> torch.Tensor:
@@ -362,6 +373,14 @@ class ObjectPtychoTomoBase(  # pyright: ignore[reportUnsafeMultipleInheritance] 
         """True for all ptycho-tomo objects: the dataset must emit continuous coordinates for
         the rotated query (see class docstring — this does NOT mean the backend is an INR)."""
         return True
+
+    @property
+    def gathers_whole_pixels(self) -> bool:
+        """False for the rotating backends (rotated coordinate query); True for the stack
+        backend (:class:`ObjectStackTomo`), which gathers whole-pixel patches and leaves the
+        sub-pixel shift to the probe. Mirrored on the dataset by the ``PtychoTomography``
+        wiring."""
+        return False
 
     @property
     def num_slices(self) -> int:
@@ -1735,4 +1754,295 @@ class ObjectKPlanesTomo(ObjectPtychoTomoBase):
     # endregion --- pretraining ---
 
 
-ObjectPtychoTomoType = ObjectVoxelTomo | ObjectKPlanesTomo
+class ObjectStackTomo(ObjectPtychoTomoBase):
+    """Multislice-stack backend (2026-11): the single-scan multislice object, tilt applied to
+    the wave instead of the object.
+
+    Wraps an existing single-scan object model from :mod:`quantem.diffractive_imaging` --
+    :class:`ObjectPixelated` or :class:`ObjectDIP` (a CNN that outputs the stack) -- by
+    composition. Storage, parameters, optimizer groups, hard / soft constraints
+    (``PtychoObjConstraintParams.Raster``), ``obj``, snapshots and ``reset`` all go to the
+    wrapped model; this class only adds the per-batch patch gather and the flags the
+    ptycho-tomography wiring reads. ``forward`` returns the wrapped model's own patches
+    ``(num_slices, B, Hroi, Wroi)`` (complex transmission), gathered at whole pixels: the
+    integer patch indices are computed per batch from the payload with the single-scan formula
+    (a stored index buffer would be ~8 GB per 131k-position dataset), and the sub-pixel part of
+    each scan position goes to the probe shift. There is no interpolation of the object.
+
+    Each dataset's tilt enters in ``PtychoTomography.forward_operator`` as a tilted Fresnel
+    propagator: between slices the wave is shifted laterally by ``dz * (tan_r, tan_c)``, the
+    small-tilt vector derived from the dataset's existing pose angles
+    (``PtychoTomoDatasetRaster.small_tilt_tan``). Exact to first order in the tilt (the
+    lateral 1/cos(tilt) stretch and any in-plane rotation are not modelled -- fine for the few
+    mrad between scans of one zone axis; in-plane turns belong in the scan positions). The
+    lateral grid is the reference dataset's single-scan object grid (lateral padding
+    ``obj_padding_px``); the thickness is the stack's (``num_slices`` x slice thickness).
+    Autograd only.
+    """
+
+    DEFAULT_LRS = dict(ObjectBase.DEFAULT_LRS)
+    DEFAULT_CONSTRAINTS = PtychoObjConstraintParams.Raster()  # pyright: ignore[reportIncompatibleVariableOverride, reportAssignmentType] -- delegated to the wrapped single-scan model
+
+    def __init__(
+        self,
+        obj_model: "ObjectPixelated | ObjectDIP",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        _token: object | None = None,
+    ):
+        is_pix = isinstance(obj_model, ObjectPixelated) or "ObjectPixelated" in str(
+            type(obj_model)
+        )
+        is_dip = isinstance(obj_model, ObjectDIP) or "ObjectDIP" in str(type(obj_model))
+        if not (is_pix or is_dip):
+            raise TypeError(
+                f"ObjectStackTomo wraps an ObjectPixelated or ObjectDIP, got {type(obj_model)}"
+            )
+        # skip ObjectPtychoTomoBase.__init__ (its volume / slab geometry does not apply): go
+        # straight to the BaseConstraints -> ObjectBase chain, then set the few base attributes
+        # that inherited helpers read
+        super(ObjectPtychoTomoBase, self).__init__(
+            device=device, obj_type=obj_model.obj_type, rng=rng, _token=_token
+        )
+        self._model = obj_model.to(self._device)
+        self._lateral_box_A = None
+        self._box_margin_A = (0.0, 0.0, 0.0)
+        self._geometry_set = False
+        self._slab_extent_A = None
+        self._warp_box_frac = None
+        self._num_z_voxels = None
+        self._volume_shape_explicit = False
+        self._volume_shape = None
+        self._obj_shape = None
+        self._obj_cache = None
+
+    # region --- factories ---
+    @classmethod
+    def from_pixelated(
+        cls,
+        obj_model: "ObjectPixelated | ObjectDIP",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectStackTomo":
+        """Wrap an existing single-scan object model (``ObjectPixelated`` or ``ObjectDIP``;
+        e.g. a warm start from a single-scan reconstruction, or a DIP built with
+        ``ObjectDIP.from_pixelated``). Its ``num_slices`` / ``slice_thicknesses`` define the
+        stack; the lateral grid is set at preprocess and must match a pre-shaped model."""
+        return cls(obj_model=obj_model, device=obj_model.device, rng=rng, _token=cls._token)
+
+    @classmethod
+    def from_uniform(
+        cls,
+        num_slices: int = 1,
+        slice_thicknesses: "float | Sequence[float] | np.ndarray | None" = None,
+        obj_type: object_type = "potential",
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+    ) -> "ObjectStackTomo":
+        """Vacuum-initialised ``ObjectPixelated`` stack (allocated at preprocess)."""
+        inner = ObjectPixelated.from_uniform(
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            rng=rng,
+        )
+        return cls(obj_model=inner, device=device, rng=rng, _token=cls._token)
+
+    # endregion --- factories ---
+
+    # region --- delegation to the wrapped model ---
+    @property
+    def inner(self) -> "ObjectPixelated | ObjectDIP":
+        """The wrapped single-scan object model."""
+        return cast("ObjectPixelated | ObjectDIP", self._modules["_model"])
+
+    def _inner_or_none(self) -> "ObjectBase | None":
+        mods = self.__dict__.get("_modules")
+        return None if mods is None else mods.get("_model")
+
+    @property
+    def constraints(self) -> Any:  # pyright: ignore[reportIncompatibleVariableOverride] -- Raster, delegated
+        inner = self._inner_or_none()
+        return inner.constraints if inner is not None else self._constraints  # pyright: ignore[reportAttributeAccessIssue]
+
+    @constraints.setter
+    def constraints(self, constraints: Any) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        inner = self._inner_or_none()
+        if inner is not None:
+            inner.constraints = constraints  # pyright: ignore[reportAttributeAccessIssue]
+        else:  # during construction, before the wrapped model is attached
+            BaseConstraints.constraints.fset(self, constraints)  # pyright: ignore[reportOptionalCall, reportAttributeAccessIssue]
+
+    @property
+    def name(self) -> str:
+        return "ObjectStackTomo"
+
+    @property
+    def is_implicit(self) -> bool:
+        """False: the stack is gathered at integer patch indices like a single-scan object."""
+        return False
+
+    @property
+    def gathers_whole_pixels(self) -> bool:
+        return True
+
+    @property
+    def num_slices(self) -> int:
+        return self.inner.num_slices
+
+    @property
+    def obj_type(self) -> object_type:  # pyright: ignore[reportIncompatibleVariableOverride]
+        inner = self._inner_or_none()
+        return cast(object_type, inner.obj_type if inner is not None else self._obj_type)
+
+    @obj_type.setter
+    def obj_type(self, t: str | None) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        inner = self._inner_or_none()
+        if inner is not None:
+            inner.obj_type = t
+            self._obj_type = inner.obj_type
+        else:
+            self._obj_type = self._process_obj_type(t)
+
+    @property
+    def dtype(self) -> "torch.dtype":
+        return self.inner.dtype
+
+    @property
+    def slice_thicknesses(self) -> torch.Tensor | None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        inner = self._inner_or_none()
+        return None if inner is None else inner.slice_thicknesses
+
+    @slice_thicknesses.setter
+    def slice_thicknesses(  # pyright: ignore[reportIncompatibleVariableOverride]
+        self, val: "float | Sequence[float] | torch.Tensor | np.ndarray | None"
+    ) -> None:
+        self.inner.slice_thicknesses = val
+
+    @property
+    def mask(self) -> torch.Tensor:  # pyright: ignore[reportIncompatibleVariableOverride]
+        return self.inner.mask
+
+    @mask.setter
+    def mask(self, mask: "torch.Tensor | np.ndarray") -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
+        self.inner.mask = mask
+
+    @property
+    def model(self) -> nn.Module:
+        """The wrapped model (its ``state_dict`` is what the snapshots store)."""
+        return self.inner
+
+    @property
+    def params(self) -> list[nn.Parameter]:
+        return self.inner.params
+
+    @property
+    def obj(self) -> torch.Tensor:
+        """The stack ``(num_slices, H, W)`` in the wrapped model's representation."""
+        return self.inner.obj
+
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        return self.inner.get_optimization_parameters()
+
+    def _normalize_optimizer_params(self, params):
+        return self.inner._normalize_optimizer_params(params)
+
+    def project_parameters(self) -> None:
+        self.inner.project_parameters()
+
+    def reset(self) -> None:
+        self.inner.reset()
+
+    def apply_hard_constraints(
+        self, raw: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.inner.apply_hard_constraints(raw, mask=mask)
+
+    def apply_soft_constraints(
+        self, obj: torch.Tensor | None = None, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The wrapped model's soft constraints on its stack (as single-scan ptychography)."""
+        inner = self.inner
+        return inner.apply_soft_constraints(
+            inner.obj if obj is None else obj, mask=inner.mask if mask is None else mask
+        )
+
+    @property
+    def soft_constraint_loss(self) -> dict[str, torch.Tensor | float]:
+        return self.inner.soft_constraint_loss
+
+    def get_iter_constraint_losses(self) -> dict[str, float]:
+        return self.inner.get_iter_constraint_losses()
+
+    def reset_iter_constraint_losses(self) -> None:
+        self.inner.reset_iter_constraint_losses()
+
+    def _invalidate_obj_cache(self) -> None:
+        return
+
+    def backward(self, *args, **kwargs):
+        raise NotImplementedError(
+            "ObjectStackTomo supports autograd only (the tilted propagator has no analytic "
+            "gradient path); use reconstruct(..., autograd=True)"
+        )
+
+    # endregion --- delegation ---
+
+    # region --- geometry ---
+    def _initialize_obj(
+        self,
+        shape: "tuple[int, int, int] | np.ndarray",
+        sampling: "tuple[float, float] | np.ndarray | None" = None,
+    ) -> None:
+        """Lateral grid handshake from the ``obj_padding_px`` setter (single-scan semantics):
+        ``shape = (num_slices, H, W)`` is the reference dataset's padded object grid."""
+        shape_t = tuple(int(x) for x in np.asarray(shape).ravel())
+        if len(shape_t) != 3 or shape_t[0] != self.num_slices:
+            raise ValueError(
+                f"shape {shape_t} must be (num_slices={self.num_slices}, H, W) for the stack"
+            )
+        samp = None
+        if sampling is not None:
+            samp = np.asarray(sampling, dtype=float).ravel()[-2:]
+            self.sampling = samp
+        self._obj_shape = cast("tuple[int, int, int]", shape_t)
+        self._volume_shape = self._obj_shape
+        self.inner._initialize_obj(shape_t, samp)
+
+    @property
+    def thickness_A(self) -> float:
+        """Stack thickness (Å): the slice spacings plus one more slice (``num_slices x dz``
+        for uniform slices); 0 for a single slice."""
+        dz = self.slice_thicknesses
+        if dz is None or dz.numel() == 0:
+            return 0.0
+        return float(dz.sum().item() + dz[-1].item())
+
+    @property
+    def box_thickness_A(self) -> float:
+        return self.thickness_A
+
+    @property
+    def slab_thickness_A(self) -> float:
+        dz = self.slice_thicknesses
+        return 0.0 if dz is None or dz.numel() == 0 else float(dz.mean().item())
+
+    @property
+    def z_voxel_A(self) -> float:
+        return self.slab_thickness_A
+
+    # endregion --- geometry ---
+
+    def forward(self, patch_data: PtychoTomoStackPatchData, /) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride] -- payload seam
+        """Whole-pixel patches ``(num_slices, B, Hroi, Wroi)`` of the wrapped model at the
+        payload's rounded positions (complex transmission, as single-scan ``forward``)."""
+        if self._obj_shape is None:
+            raise RuntimeError("object grid not set; run PtychoTomography.preprocess() first")
+        pos = patch_data.positions_px
+        idx = whole_pixel_patch_indices(
+            pos, patch_data.roi_shape, (self._obj_shape[1], self._obj_shape[2])
+        )
+        return self.inner.forward(idx)
+
+
+ObjectPtychoTomoType = ObjectVoxelTomo | ObjectKPlanesTomo | ObjectStackTomo
