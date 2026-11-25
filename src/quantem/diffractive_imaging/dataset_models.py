@@ -871,6 +871,8 @@ class DatasetConstraints(
         return descan
 
     def apply_hard_constraints(self, obj_padding_px: np.ndarray | tuple) -> None:
+        if not (self.constraints.clip_scan_positions or self.constraints.center_scan_positions):
+            return
         positions = self.scan_positions_px
         obj_shape = torch.tensor(self._obj_shape_full_2d(obj_padding_px), device=positions.device)
         if self.constraints.clip_scan_positions:
@@ -880,7 +882,7 @@ class DatasetConstraints(
             positions = positions - positions.mean(dim=0, keepdim=True)
             positions = positions + obj_shape / 2
 
-        self.scan_positions_px = positions
+        self.scan_positions_px = positions.detach()
 
 
 class PtychographyDatasetRaster(DatasetConstraints):

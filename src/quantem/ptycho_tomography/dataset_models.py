@@ -1231,7 +1231,9 @@ class PtychoTomoDatasetRaster(DatasetConstraints):
         ref = self.tilt_datasets[0]
         self._pattern_crop_mask = ref._pattern_crop_mask
         self._pattern_crop_mask_shape = ref._pattern_crop_mask_shape
-        self.com_rotation_rad = float(force_com_rotation)
+        # force_com_rotation is in DEGREES (as for the per-tilt datasets above, which convert
+        # with np.deg2rad); the wrapper's object-grid shape and obj_cropped read this in radians
+        self.com_rotation_rad = float(np.deg2rad(force_com_rotation))
         self.com_transpose = bool(force_com_transpose)
 
         self._set_initial_scan_positions_px(obj_padding_px)
